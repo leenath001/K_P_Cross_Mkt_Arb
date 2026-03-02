@@ -10,6 +10,9 @@ API_KEY = os.getenv('ODDS_API_KEY')
 BASE_URL = 'https://api.the-odds-api.com/v4'
 
 def pinnacle_odds(sport: str, lookahead_hrs:int):
+    """
+    sport: americanfootball_ncaaf, basketball_nba, basketball_ncaab (see 1. List In-Season Sports)
+    """
     global API_KEY, BASE_URL
     now_utc = datetime.now(timezone.utc)
     soon = now_utc + timedelta(hours=lookahead_hrs)
