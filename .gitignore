@@ -1,2 +1,5 @@
 .env
+*.pem
+KALSHI/kalshi_private.pem
+
 
