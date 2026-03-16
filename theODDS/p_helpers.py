@@ -54,6 +54,7 @@ def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFram
                     fair_probs = [p / sum(implied) for p in implied]
                     for o, imp, fair in zip(outcomes, implied, fair_probs):
                         rows.append({
+                            'sport': str(sport),
                             'event_id': event['id'],
                             'home': event['home_team'],
                             'away': event['away_team'],
@@ -71,7 +72,6 @@ def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFram
     if df.empty or df[df['bookmaker'] == 'pinnacle'].empty:
         raise ValueError("No events found. Pinnacle odds may not be live.")
 
-    pinnacle = df[df['bookmaker'] == 'pinnacle'][['home', 'away', 'commence', 'outcome', 'decimal_odds', 'fair_prob', 'vig_pct']].copy()
-    pinnacle['commence'] = pinnacle['commence'].dt.tz_convert('America/New_York')
+    df['commence'] = df['commence'].dt.tz_convert('America/New_York')
     
-    return pinnacle
+    return df
