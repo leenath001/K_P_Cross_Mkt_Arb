@@ -99,7 +99,7 @@ def load_all_mkts(SERIES_TICKER: str):
     
     return z   
 
-def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6) -> pd.DataFrame:
+def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6, fees: float = .01) -> pd.DataFrame:
     """
     Takes a Pinnacle odds DataFrame and returns a merged DataFrame pairing each
     outcome row with its corresponding Kalshi market's bid/ask prices.
@@ -145,11 +145,13 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6) -> pd.DataFrame:
                 'yes_ask':        k_row['yes_ask'],
                 'no_bid':         k_row['no_bid'],
                 'no_ask':         k_row['no_ask'],
+                'volume':         k_row['volume'],
+                'OI':             k_row['open_int'],
                 'match_score':    round(score, 3),
+                'signal':         p_row['fair_prob'] > k_row['yes_ask'] + fees,
             })
 
     return pd.DataFrame(rows)
-
     
 
 """
