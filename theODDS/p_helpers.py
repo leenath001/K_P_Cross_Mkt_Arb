@@ -4,11 +4,18 @@ import pandas as pd
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
 import json
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.getcwd()), '.env'))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'))
 import warnings
 
 API_KEY = os.getenv('ODDS_API_KEY')
 BASE_URL = 'https://api.the-odds-api.com/v4'
+
+# Tracks usage from the most recent API call — read via get_api_usage()
+_api_usage: dict[str, int] = {'used': 0, 'remaining': 500}
+
+def get_api_usage() -> tuple[int, int]:
+    """Return (requests_used, requests_remaining) from the last Pinnacle call."""
+    return _api_usage['used'], _api_usage['remaining']
 
 def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFrame:
     """
@@ -36,7 +43,8 @@ def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFram
         resp_odds = requests.get(f'{BASE_URL}/sports/{sport}/odds', params=params)
         resp_odds.raise_for_status()
 
-        print(f'\nRequests used: {resp_odds.headers.get("x-requests-used")} / {resp_odds.headers.get("x-requests-remaining")} remaining')
+        _api_usage['used']      = int(resp_odds.headers.get('x-requests-used', 0))
+        _api_usage['remaining'] = int(resp_odds.headers.get('x-requests-remaining', 500))
 
         events = resp_odds.json()
         if not events:

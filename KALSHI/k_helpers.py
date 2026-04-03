@@ -13,21 +13,26 @@ from typing import Optional
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.getcwd()), '.env'))
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
+load_dotenv(dotenv_path=_env_path, override=True)
 
 # -- Global Variables -------
 SPORTS = config.SPORTS
 SPORTS_C = config.SPORTS_CONFIG
-KALSHI_KEY_ID   = os.getenv('KALSHI_KEY_ID')
-KALSHI_KEY_PATH = os.getenv('KALSHI_PRIVATE_KEY_PATH')
+API_KEY         = os.getenv('API_KEY')
+API_PRIVATE     = os.getenv('API_PRIVATE')
 BASE_URL        = 'https://api.elections.kalshi.com/trade-api/v2'
 PATH = '/trade-api/v2/markets'
 
-assert KALSHI_KEY_PATH
+assert API_PRIVATE, f'API_PRIVATE not found in .env (looked at {_env_path})'
 
-_pem_path = os.path.join(os.path.dirname(os.getcwd()), KALSHI_KEY_PATH)
-with open(_pem_path, 'rb') as f:
-    _private_key = serialization.load_pem_private_key(f.read(), password=None)
+# API_PRIVATE is a raw base64-encoded DER key — wrap in PEM headers to load it
+_pem_bytes = (
+    b'-----BEGIN RSA PRIVATE KEY-----\n' +
+    API_PRIVATE.strip().encode() +
+    b'\n-----END RSA PRIVATE KEY-----\n'
+)
+_private_key = serialization.load_pem_private_key(_pem_bytes, password=None)
 # ---------------------------
 
 _DRAW_ALIASES = {'draw', 'tie', 'draw/tie', 'x'}
@@ -70,7 +75,7 @@ def kalshi_headers(method: str, path: str) -> dict:
         hashes.SHA256()
     )
     return {
-        'KALSHI-ACCESS-KEY':       KALSHI_KEY_ID,
+        'KALSHI-ACCESS-KEY':       API_KEY,
         'KALSHI-ACCESS-TIMESTAMP': ts,
         'KALSHI-ACCESS-SIGNATURE': base64.b64encode(sig).decode(),
     }
