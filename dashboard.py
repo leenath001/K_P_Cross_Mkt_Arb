@@ -1,0 +1,169 @@
+"""
+dashboard.py — Live terminal dashboard for K/P arbitrage positions.
+
+Displays a live-updating table of every open/closed position and an
+API request usage bar. Designed to be used as a context manager:
+
+    with Dashboard() as dash:
+        run_all_signals(df, bankroll=bankroll, dashboard=dash)
+"""
+
+import threading
+from datetime import datetime
+from rich.live import Live
+from rich.table import Table
+from rich.panel import Panel
+from rich.console import Group
+from rich.text import Text
+from rich import box
+
+# Colour per order status
+_STATUS_STYLE = {
+    'resting':               'yellow',
+    'executed':              'bold green',
+    'filled':                'bold green',
+    'canceled':              'red',
+    'signal_flipped':        'red',
+    'max_duration_exceeded': 'dim white',
+    'event_imminent':        'dim white',
+    'skipped':               'dim white',
+    'unknown':               'dim white',
+}
+
+
+class Dashboard:
+    """
+    Thread-safe Rich live dashboard.
+
+    Methods
+    -------
+    add_position(order_id, ...)   — register a new order row
+    update(order_id, ...)         — update status / latest fair prob
+    set_api_usage(used, remaining)— update the API bar
+    """
+
+    def __init__(self, api_limit: int = 500):
+        self._lock          = threading.Lock()
+        self._positions: dict[str, dict] = {}   # order_id → row data
+        self._api_used      = 0
+        self._api_limit     = api_limit
+        self._live          = Live(
+            self._render(),
+            refresh_per_second=4,
+            screen=True,
+        )
+
+    def __enter__(self):
+        self._live.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        self._live.__exit__(*args)
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    def add_position(self, order_id: str, ticker: str, outcome: str,
+                     contracts: int, yes_price_cents: int,
+                     fair_prob: float, edge: float):
+        with self._lock:
+            self._positions[order_id] = {
+                'ticker':       ticker,
+                'outcome':      outcome,
+                'contracts':    contracts,
+                'entry_price':  yes_price_cents,  # our order price (fixed)
+                'market_ask':   None,              # live Kalshi market ask
+                'fair_entry':   fair_prob,
+                'fair_last':    fair_prob,
+                'edge_last':    edge,
+                'status':       'resting',
+                'last_ping':    datetime.now().strftime('%H:%M:%S'),
+            }
+            self._refresh()
+
+    def update(self, order_id: str, status: str | None = None,
+               fair_prob: float | None = None, edge: float | None = None,
+               contracts: int | None = None, market_ask: int | None = None):
+        with self._lock:
+            pos = self._positions.get(order_id)
+            if pos is None:
+                return
+            if status is not None:
+                pos['status'] = status
+            if fair_prob is not None:
+                pos['fair_last'] = fair_prob
+                pos['last_ping'] = datetime.now().strftime('%H:%M:%S')
+            if edge is not None:
+                pos['edge_last'] = edge
+            if contracts is not None:
+                pos['contracts'] = contracts
+            if market_ask is not None:
+                pos['market_ask'] = market_ask
+            self._refresh()
+
+    def set_api_usage(self, used: int, remaining: int):
+        with self._lock:
+            self._api_used  = used
+            self._api_limit = used + remaining
+            self._refresh()
+
+    # ── Rendering ────────────────────────────────────────────────────────────
+
+    def _refresh(self):
+        self._live.update(self._render())
+
+    def _render(self) -> Panel:
+        table = Table(
+            box=box.SIMPLE_HEAD,
+            expand=True,
+            show_footer=False,
+            padding=(0, 1),
+        )
+        table.add_column('Ticker',       style='cyan',    no_wrap=True, max_width=36)
+        table.add_column('Outcome',      style='white',   width=10)
+        table.add_column('Cts / Price',  justify='right', width=14)
+        table.add_column('Last Mkt Ask', justify='right', width=12)
+        table.add_column('Fair (entry)', justify='right', width=12)
+        table.add_column('Fair (last)',  justify='right', width=11)
+        table.add_column('Edge',         justify='right', width=7)
+        table.add_column('Status',       width=22)
+        table.add_column('Last Ping',    width=10)
+
+        for pos in self._positions.values():
+            style    = _STATUS_STYLE.get(pos['status'], 'white')
+            edge_c   = 'green' if pos['edge_last'] > 0 else 'red'
+            mkt_ask  = f"{pos['market_ask']}¢" if pos['market_ask'] is not None else '—'
+            table.add_row(
+                pos['ticker'][-36:],
+                pos['outcome'],
+                f"{pos['contracts']} @ {pos['entry_price']}¢",
+                mkt_ask,
+                f"{pos['fair_entry']:.3f}",
+                f"{pos['fair_last']:.3f}",
+                f"[{edge_c}]{pos['edge_last']:+.3f}[/{edge_c}]",
+                f"[{style}]{pos['status']}[/{style}]",
+                pos['last_ping'],
+            )
+
+        api_bar = self._api_bar()
+        return Panel(
+            Group(table, Text(''), api_bar),
+            title='[bold blue]K/P Cross-Market Arbitrage[/bold blue]  [dim]Ctrl+C to cancel all & quit[/dim]',
+            border_style='blue',
+        )
+
+    def _api_bar(self) -> Text:
+        used      = self._api_used
+        limit     = self._api_limit
+        remaining = limit - used
+        width     = 40
+        filled    = int(width * used / max(limit, 1))
+
+        pct = used / max(limit, 1)
+        color = 'green' if pct < 0.7 else ('yellow' if pct < 0.9 else 'red')
+
+        bar  = '█' * filled + '░' * (width - filled)
+        text = Text()
+        text.append('API  ')
+        text.append(bar, style=color)
+        text.append(f'  {used} used / {remaining} remaining', style='dim white')
+        return text
