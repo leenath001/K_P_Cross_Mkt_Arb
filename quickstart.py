@@ -16,13 +16,14 @@ from bot import get_balance, kelly_contracts
 # ── Args ────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--live',      action='store_true', help='Place real orders (default: dry run)')
-parser.add_argument('--bankroll',  type=float, default=None, help='Override balance in dollars (default: fetch from Kalshi)')
-parser.add_argument('--hrs',       type=int,   default=72,   help='Look-ahead window in hours (default: 72)')
-parser.add_argument('--taker-fee',   type=float, default=0.07,  help='Taker fee rate as fraction of winnings (default: 0.07)')
-parser.add_argument('--maker-fee',   type=float, default=0.03,  help='Maker fee rate as fraction of winnings (default: 0.03)')
-parser.add_argument('--limit-only',  action='store_true',        help='Never cross the book — always rest at bid (default: cross if profitable)')
-parser.add_argument('--threshold', type=float, default=0.85, help='Min fuzzy-match score (default: 0.85)')
+parser.add_argument('--live',       action='store_true',                          help='Place real orders (default: dry run)')
+parser.add_argument('--bankroll',   type=float, default=None,                     help='Override balance in dollars (default: fetch from Kalshi)')
+parser.add_argument('--hrs',        type=int,   default=config.LOOKAHEAD_HRS,     help=f'Look-ahead window in hours (default: {config.LOOKAHEAD_HRS} from config)')
+parser.add_argument('--fetch-live', action='store_true', default=config.LIVE,     help=f'Fetch live games instead of upcoming (default: {config.LIVE} from config)')
+parser.add_argument('--taker-fee',  type=float, default=0.07,                     help='Taker fee rate as fraction of winnings (default: 0.07)')
+parser.add_argument('--maker-fee',  type=float, default=0.03,                     help='Maker fee rate as fraction of winnings (default: 0.03)')
+parser.add_argument('--limit-only', action='store_true',                          help='Never cross the book — always rest at bid')
+parser.add_argument('--threshold',  type=float, default=0.85,                     help='Min fuzzy-match score (default: 0.85)')
 args = parser.parse_args()
 
 # ── Fetch bankroll ───────────────────────────────────────────────────────────
@@ -42,7 +43,7 @@ print('=' * 60)
 print(f'  Sports : {config.SPORTS}')
 print(f'  Window : next {args.hrs}h\n')
 
-pinnacle_df = pinnacle_odds(config.SPORTS, hrs=args.hrs)
+pinnacle_df = pinnacle_odds(config.SPORTS, hrs=args.hrs, live=args.fetch_live)
 used, remaining = get_api_usage()
 print(f'  {len(pinnacle_df)} outcome rows fetched  '
       f'(API: {used} used / {remaining} remaining)')
@@ -116,10 +117,31 @@ else:
     print(f'  Orders   : resting YES limit @ ask, max 30 min, cancel 5 min before start')
     print(f'  Monitor  : re-check Pinnacle every 2 min\n')
 
-    confirm = input('  Confirm live trading? [y/N] ').strip().lower()
-    if confirm != 'y':
-        print('  Aborted.')
+    print('  Approve each signal:  y = trade  |  n = skip  |  q = abort all\n')
+    approved_rows = []
+    for _, row in signals.iterrows():
+        tev   = _ev(row['fair_prob'], row['yes_ask'], args.taker_fee)
+        bid   = row['yes_bid'] if row['yes_bid'] else None
+        price = row['yes_ask'] if tev > 0 else bid
+        mode  = 'cross' if tev > 0 else 'rest'
+        if price is None:
+            print(f"  [skip — no bid]  {row['outcome']}")
+            continue
+        n    = kelly_contracts(row['fair_prob'], price, bankroll, args.taker_fee if tev > 0 else args.maker_fee)
+        cost = n * price
+        ans  = input(f"  [{mode}] {row['outcome']:30s}  {n}x @ {round(price*100)}¢  cost=${cost:.2f}  ev={tev:+.3f}  [y/n/q] ").strip().lower()
+        if ans == 'q':
+            print('  Aborted.')
+            raise SystemExit(0)
+        if ans == 'y':
+            approved_rows.append(row)
+
+    if not approved_rows:
+        print('  No signals approved.')
         raise SystemExit(0)
+
+    approved_df = pd.DataFrame(approved_rows)
+    print(f'\n  {len(approved_df)} signal(s) approved — launching...\n')
 
     import threading
     from bot import run_all_signals
@@ -130,7 +152,7 @@ else:
     try:
         with Dashboard(api_limit=used + remaining) as dash:
             dash.set_api_usage(used, remaining)
-            results = run_all_signals(matched_df, bankroll=bankroll,
+            results = run_all_signals(approved_df, bankroll=bankroll,
                                       taker_fee=args.taker_fee, maker_fee=args.maker_fee,
                                       limit_only=args.limit_only, dashboard=dash,
                                       stop_event=stop_event)

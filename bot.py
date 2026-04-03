@@ -385,6 +385,13 @@ def run_trade(signal_row: pd.Series, bankroll: float,
                            post_only=limit_only)
     order_id = order.get('order_id')
 
+    # Log actual fees charged vs assumed — helps calibrate fee assumptions
+    actual_taker_fee = float(order.get('taker_fees_dollars') or 0)
+    actual_maker_fee = float(order.get('maker_fees_dollars') or 0)
+    assumed_fee_cost = ev * -1 * 0  # placeholder
+    print(f'[fee check] actual taker=${actual_taker_fee:.4f}  maker=${actual_maker_fee:.4f}'
+          f'  assumed_rate={fee_rate*100:.0f}%  contracts={contracts}  price={price_cents}¢')
+
     if dashboard:
         dashboard.add_position(order_id, ticker, outcome, contracts,
                                price_cents, fair_prob, ev)
