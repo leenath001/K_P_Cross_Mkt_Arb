@@ -148,6 +148,7 @@ else:
     from dashboard import Dashboard
 
     stop_event = threading.Event()
+    results    = []
 
     try:
         with Dashboard(api_limit=used + remaining) as dash:

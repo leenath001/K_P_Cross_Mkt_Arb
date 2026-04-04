@@ -346,8 +346,8 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         order_price = yes_ask
         fee_rate    = taker_fee
         order_type  = 'cross'
-    elif yes_bid is not None and _ev(fair_prob, yes_bid, maker_fee) > 0:
-        order_price = yes_bid
+    elif yes_bid is not None and _ev(fair_prob, round(yes_bid + 0.01, 2), maker_fee) > 0:
+        order_price = round(yes_bid + 0.01, 2)
         fee_rate    = maker_fee
         order_type  = 'rest'
     else:
