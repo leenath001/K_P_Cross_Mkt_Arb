@@ -8,7 +8,7 @@ SPORTS_CONFIG = dict(dict(event)): dictionaries host mapping of theODDS group ke
 SPORTS = ["soccer_argentina_primera_division", "basketball_ncaab","soccer_mexico_ligamx","soccer_argentina_primera_division","soccer_brazil_campeonato"] # "basketball_nba", "lacrosse_ncaa",
 
 # Pinnacle fetch window
-LOOKAHEAD_HRS = 24    # how many hours ahead to search for upcoming events
+LOOKAHEAD_HRS = 72    # how many hours ahead to search for upcoming events
 LIVE          = False # True = fetch currently live games, False = fetch upcoming
 
 SPORTS_CONFIG = {

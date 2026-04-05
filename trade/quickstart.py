@@ -2,9 +2,15 @@
 quickstart.py — Run the full arbitrage pipeline end-to-end.
 
 Usage:
-    python quickstart.py               # dry run (no orders placed)
-    python quickstart.py --live        # live trading with dashboard
+    python trade/quickstart.py               # dry run (no orders placed)
+    python trade/quickstart.py --live        # live trading with dashboard
 """
+
+import os, sys
+_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_TRADE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, _TRADE)
 
 import argparse
 import pandas as pd
@@ -58,7 +64,7 @@ print(f'  Match threshold : {args.threshold}')
 print(f'  Taker fee       : {args.taker_fee * 100:.0f}% of winnings')
 print(f'  Maker fee       : {args.maker_fee * 100:.0f}% of winnings\n')
 
-matched_df = kalshi_odds(pinnacle_df, threshold=args.threshold)
+matched_df = kalshi_odds(pinnacle_df, threshold=args.threshold, fees=args.taker_fee)
 signals    = matched_df[matched_df['signal']]
 print(f'  {len(matched_df)} rows matched  |  {len(signals)} signal(s) found\n')
 

@@ -15,9 +15,10 @@ from datetime import datetime, timezone, timedelta
 from math import floor
 from typing import Optional
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from KALSHI.k_helpers import kalshi_headers
 from theODDS.p_helpers import pinnacle_odds, get_api_usage
+from logger import log_trade
 
 BASE_URL          = 'https://api.elections.kalshi.com/trade-api/v2'
 TAKER_FEE         = 0.07   # 7% of winnings — fee when crossing the book
@@ -380,9 +381,12 @@ def run_trade(signal_row: pd.Series, bankroll: float,
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
 
     # Step 6: Place order
+    # Rest orders always use post_only=True — guarantees maker fee treatment.
+    # If the order would cross (market moved), the exchange rejects it rather
+    # than filling at taker rate (which we didn't size for).
     order    = place_order(ticker, price_cents, contracts,
                            int(expiry_dt.timestamp()),
-                           post_only=limit_only)
+                           post_only=(order_type == 'rest' or limit_only))
     order_id = order.get('order_id')
 
     # Log actual fees charged vs assumed — helps calibrate fee assumptions
@@ -406,7 +410,26 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         dashboard=dashboard, stop_event=stop_event,
     )
 
-    final = get_order_status(order_id)
+    final        = get_order_status(order_id)
+    final_status = final.get('status', 'unknown')
+
+    log_trade(
+        order_id          = order_id,
+        sport             = sport,
+        outcome           = outcome,
+        k_ticker          = ticker,
+        commence          = commence,
+        order_type        = order_type,
+        fair_prob         = fair_prob,
+        yes_ask_at_signal = yes_ask,
+        entry_price       = order_price,
+        fee_rate          = fee_rate,
+        ev_per_contract   = ev,
+        contracts         = contracts,
+        final_status      = final_status,
+        close_reason      = reason,
+    )
+
     return {
         'order_id':   order_id,
         'ticker':     ticker,
@@ -416,7 +439,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         'fair_prob':  fair_prob,
         'ev':         round(ev, 4),
         'order_type': order_type,
-        'status':     final.get('status'),
+        'status':     final_status,
         'reason':     reason,
     }
 
