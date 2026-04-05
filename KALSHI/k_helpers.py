@@ -156,7 +156,11 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6, fees: float = .01) -> 
                 'signal':         p_row['fair_prob'] > k_row['yes_ask'] + fees,
             })
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # A single Kalshi market should never appear twice — drop dupes defensively
+    # (can occur if a sport key appears multiple times in config.SPORTS)
+    df = df.drop_duplicates(subset='k_ticker')
+    return df
     
 
 """

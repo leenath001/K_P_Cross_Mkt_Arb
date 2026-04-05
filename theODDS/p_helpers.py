@@ -17,6 +17,19 @@ def get_api_usage() -> tuple[int, int]:
     """Return (requests_used, requests_remaining) from the last Pinnacle call."""
     return _api_usage['used'], _api_usage['remaining']
 
+def fetch_usage() -> tuple[int, int]:
+    """
+    Make a live request to /v4/sports to get fresh usage counters from headers.
+    Costs 1 request. Returns (used, remaining).
+    """
+    resp = requests.get(f'{BASE_URL}/sports', params={'apiKey': API_KEY})
+    resp.raise_for_status()
+    used      = int(resp.headers.get('x-requests-used', 0))
+    remaining = int(resp.headers.get('x-requests-remaining', 0))
+    _api_usage['used']      = used
+    _api_usage['remaining'] = remaining
+    return used, remaining
+
 def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFrame:
     """
     sport: americanfootball_ncaaf, basketball_nba, basketball_ncaab (see 1. List In-Season Sports)
