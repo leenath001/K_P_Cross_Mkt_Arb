@@ -59,6 +59,10 @@ def _best_match(query: str, candidates: pd.Series) -> tuple:
         if norm_query == '__DRAW__' or norm_val == '__DRAW__':
             continue
         score = SequenceMatcher(None, norm_query, norm_val).ratio()
+        # Boost score when Kalshi uses city-only names (e.g. "Atlanta" vs "Atlanta Hawks")
+        q_words, v_words = set(norm_query.split()), set(norm_val.split())
+        if q_words and v_words and (q_words.issubset(v_words) or v_words.issubset(q_words)):
+            score = max(score, 0.95)
         if score > best_score:
             best_score, best_idx = score, idx
     return best_idx, best_score

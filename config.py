@@ -5,7 +5,7 @@ SPORTS = list(str): theODDS group keys (see api_POC.ipynb cell 1. List In-Szn)
 SPORTS_CONFIG = dict(dict(event)): dictionaries host mapping of theODDS group keys to KALSHI Event Codes (Manual)
 """
 
-SPORTS = ["soccer_brazil_campeonato", "soccer_argentina_primera_division"] # , "lacrosse_ncaa", "basketball_ncaab",
+SPORTS = ["soccer_brazil_campeonato", "soccer_argentina_primera_division", "soccer_mexico_ligamx", "basketball_ncaab", "basketball_nba"] # , "lacrosse_ncaa", "basketball_ncaab",
 
 # Pinnacle fetch window
 LOOKAHEAD_HRS = 72    # how many hours ahead to search for upcoming events
@@ -34,7 +34,7 @@ SPORTS_CONFIG = {
     },    
     "basketball_nba": {
         "label": "NBA",
-        "ticker": "KXNBAGAME"
+        "ticker": "KXNBAGAME" # review, suspected incorrect
     },
     "lacrosse_ncaa": {
         "label": "NCAA Men's Lacrosse",
