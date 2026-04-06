@@ -80,6 +80,21 @@ print(f'  Taker fee       : {args.taker_fee * 100:.0f}% of winnings')
 print(f'  Maker fee       : {args.maker_fee * 100:.0f}% of winnings\n')
 
 matched_df = kalshi_odds(pinnacle_df, threshold=args.threshold, fees=args.taker_fee)
+
+# ── Filter out tickers with open (PENDING) bets ──────────────────────────────
+LOG_PATH = os.path.join(_TRADE, 'logs', 'trades.csv')
+already_bet = set()
+if os.path.exists(LOG_PATH):
+    log_df      = pd.read_csv(LOG_PATH)
+    already_bet = set(log_df.loc[log_df['result'] == 'PENDING', 'k_ticker'])
+    if already_bet:
+        matched_df = matched_df[~matched_df['k_ticker'].isin(already_bet)]
+        print(f'  Excluded {len(already_bet)} ticker(s) with open bets: {already_bet}')
+
+if matched_df.empty or 'signal' not in matched_df.columns:
+    print('\n  No matches. Try increasing --hrs or lowering --threshold.')
+    raise SystemExit(0)
+
 signals    = matched_df[matched_df['signal']]
 print(f'  {len(matched_df)} rows matched  |  {len(signals)} signal(s) found\n')
 
@@ -87,10 +102,6 @@ pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 120)
 pd.set_option('display.float_format', '{:.3f}'.format)
 print(matched_df[['sport', 'outcome', 'fair_prob', 'yes_ask', 'match_score', 'signal']].to_string(index=False))
-
-if matched_df.empty:
-    print('\n  No matches. Try increasing --hrs or lowering --threshold.')
-    raise SystemExit(0)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 

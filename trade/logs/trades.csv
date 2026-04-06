@@ -1,2 +1,3 @@
 logged_at,order_id,sport,outcome,k_ticker,commence,order_type,fair_prob,yes_ask_at_signal,entry_price,entry_price_cents,fee_rate,ev_per_contract,edge,contracts,total_cost,ev_total,final_status,close_reason,result,actual_pnl
-2026-04-05 04:51:37 UTC,affd5c4f-24f4-45df-8a4c-836ba74f1775,soccer_argentina_primera_division,Draw,KXLIGAMXGAME-26APR05CDGPUM-TIE,2026-04-05 19:30:00-04:00,cross,0.3187,0.2,0.2,20,0.07,0.1009,0.1187,4,0.8,0.4034,executed,order_executed,PENDING,
+2026-04-05 04:51:37 UTC,affd5c4f-24f4-45df-8a4c-836ba74f1775,soccer_argentina_primera_division,Draw,KXLIGAMXGAME-26APR05CDGPUM-TIE,2026-04-05 19:30:00-04:00,cross,0.3187,0.2,0.2,20,0.07,0.1009,0.1187,4,0.8,0.4034,executed,order_executed,WIN,2.976
+2026-04-05 15:42:29 UTC,19b107ed-1ecb-4c3a-93c8-16de75876e3f,soccer_argentina_primera_division,Draw,KXLIGAMXGAME-26APR05CDGPUM-TIE,2026-04-05 19:30:00-04:00,cross,0.3338,0.2,0.2,20,0.07,0.1151,0.1338,4,0.8,0.4604,executed,order_executed,WIN,2.976

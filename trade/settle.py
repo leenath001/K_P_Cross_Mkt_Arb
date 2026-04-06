@@ -38,8 +38,11 @@ def fetch_market_result(ticker: str) -> str | None:
         return None
     market = resp.json().get('market', {})
     result = market.get('result')          # 'yes' | 'no' | 'void' | null
-    status = market.get('status', '')      # 'settled' when done
-    if status == 'settled' and result:
+    status = market.get('status', '')      # 'settled' or 'finalized' when done
+    if result and status in ('settled', 'finalized'):
+        return result.lower()
+    # Fallback: a non-null result field is itself proof of resolution
+    if result:
         return result.lower()
     return None
 
