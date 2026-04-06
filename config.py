@@ -5,7 +5,7 @@ SPORTS = list(str): theODDS group keys (see api_POC.ipynb cell 1. List In-Szn)
 SPORTS_CONFIG = dict(dict(event)): dictionaries host mapping of theODDS group keys to KALSHI Event Codes (Manual)
 """
 
-SPORTS = ["soccer_brazil_campeonato", "soccer_argentina_primera_division", "soccer_mexico_ligamx", "basketball_ncaab", "basketball_nba"] # , "lacrosse_ncaa", "basketball_ncaab",
+SPORTS = ["soccer_italy_serie_a", "soccer_uefa_europa_league", "soccer_uefa_champs_league", "soccer_spain_la_liga", "soccer_italy_serie_a"]
 
 # Pinnacle fetch window
 LOOKAHEAD_HRS = 72    # how many hours ahead to search for upcoming events
@@ -34,10 +34,30 @@ SPORTS_CONFIG = {
     },    
     "basketball_nba": {
         "label": "NBA",
-        "ticker": "KXNBAGAME" # review, suspected incorrect
+        "ticker": "KXNBAGAME"
     },
     "lacrosse_ncaa": {
         "label": "NCAA Men's Lacrosse",
         "ticker": "KXNCAAMLAXGAME"
+    },
+    "soccer_italy_serie_a": {
+        "label": "Serie A",
+        "ticker": "KXSERIEAGAME"
+    },
+    "soccer_uefa_europa_league": {
+        "label": "UEFA Europa League",
+        "ticker": "KXUELGAME"
+    },
+    "soccer_uefa_champs_league": {
+        "label": "UEFA Champions League",
+        "ticker": "KXUCLGAME"
+    },
+    "soccer_spain_la_liga": {
+        "label": "La Liga",
+        "ticker": "KXLALIGAGAME"
+    },
+    "soccer_italy_serie_b": {
+        "label": "Serie B",
+        "ticker": "KXSERIEBGAME"
     },
 }

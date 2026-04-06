@@ -120,13 +120,13 @@ class Dashboard:
         )
         table.add_column('Ticker',       style='cyan',    no_wrap=True, max_width=36)
         table.add_column('Outcome',      style='white',   width=10)
-        table.add_column('Cts / Price',  justify='right', width=14)
-        table.add_column('Last Mkt Ask', justify='right', width=12)
-        table.add_column('Fair (entry)', justify='right', width=12)
-        table.add_column('Fair (last)',  justify='right', width=11)
+        table.add_column('Cts / Price',  style='white',   justify='right', width=14)
+        table.add_column('Last Mkt Ask', style='white',   justify='right', width=12)
+        table.add_column('Fair (entry)', style='white',   justify='right', width=12)
+        table.add_column('Fair (last)',  style='white',   justify='right', width=11)
         table.add_column('Edge',         justify='right', width=7)
         table.add_column('Status',       width=22)
-        table.add_column('Last Ping',    width=10)
+        table.add_column('Last Ping',    style='white',   width=10)
 
         for pos in self._positions.values():
             style    = _STATUS_STYLE.get(pos['status'], 'white')
