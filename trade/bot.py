@@ -380,6 +380,19 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         return {'status': 'skipped', 'reason': 'event_too_soon',
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
 
+    # For cross trades, refresh yes_ask right before placing to minimise slippage.
+    # If the live ask has moved up and EV is gone, skip rather than overpay.
+    if order_type == 'cross':
+        live_ask_cents = get_market_price(ticker)
+        if live_ask_cents is not None:
+            order_price = live_ask_cents / 100
+            ev          = _ev(fair_prob, order_price, fee_rate)
+            if ev <= 0:
+                return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
+                        'ticker': ticker, 'order_id': None, 'contracts': 0}
+            price_cents = live_ask_cents
+            contracts   = kelly_contracts(fair_prob, order_price, bankroll, fee_rate)
+
     # Step 6: Place order
     # Rest orders always use post_only=True — guarantees maker fee treatment.
     # If the order would cross (market moved), the exchange rejects it rather
