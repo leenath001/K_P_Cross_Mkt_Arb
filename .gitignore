@@ -2,5 +2,5 @@
 *.pem
 KALSHI/kalshi_private.pem
 stuff.md
-trade/logs/trades.csv 
+trade/logs
 

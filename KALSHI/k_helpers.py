@@ -108,10 +108,18 @@ def load_all_mkts(SERIES_TICKER: str):
     
     return z   
 
-def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6, fees: float = .01) -> pd.DataFrame:
+def _taker_ev(fair_prob: float, price: float, taker_fee: float) -> float:
+    """EV per contract for a taker (cross) fill at `price` with fee on winnings."""
+    return fair_prob * (1 - price) * (1 - taker_fee) - (1 - fair_prob) * price
+
+
+def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6, fees: float = 0.07) -> pd.DataFrame:
     """
     Takes a Pinnacle odds DataFrame and returns a merged DataFrame pairing each
     outcome row with its corresponding Kalshi market's bid/ask prices.
+
+    `fees` is the taker fee rate (fraction of winnings). The signal column is
+    True only when EV > 0 at that rate — i.e. fair_prob * (1-ask) * (1-fee) > (1-fair_prob) * ask.
     """
     pinnacle_df = df.copy()
 
@@ -157,7 +165,7 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6, fees: float = .01) -> 
                 'volume':         k_row['volume'],
                 'OI':             k_row['open_int'],
                 'match_score':    round(score, 3),
-                'signal':         p_row['fair_prob'] > k_row['yes_ask'] + fees,
+                'signal':         _taker_ev(p_row['fair_prob'], k_row['yes_ask'], fees) > 0,
             })
 
     df = pd.DataFrame(rows)
