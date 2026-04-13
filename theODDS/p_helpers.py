@@ -21,15 +21,22 @@ API_KEY = _secret('ODDS_API_KEY')
 BASE_URL = 'https://api.the-odds-api.com/v4'
 
 # Tracks usage from the most recent API call — read via get_api_usage()
-_api_usage: dict[str, int] = {'used': 0, 'remaining': 500}
+_api_usage:     dict = {'used': 0, 'remaining': 500}
+# sport_key -> True/False (None = not yet fetched)
+_active_sports: dict = {}
 
 def get_api_usage() -> tuple:
     """Return (requests_used, requests_remaining) from the last Pinnacle call."""
     return _api_usage['used'], _api_usage['remaining']
 
+def get_active_sports() -> dict:
+    """Return {sport_key: bool} populated by the most recent fetch_usage() call."""
+    return dict(_active_sports)
+
 def fetch_usage() -> tuple:
     """
     Make a live request to /v4/sports to get fresh usage counters from headers.
+    Also captures each sport's `active` flag into _active_sports at no extra cost.
     Costs 1 request. Returns (used, remaining).
     """
     resp = requests.get(f'{BASE_URL}/sports', params={'apiKey': API_KEY})
@@ -38,6 +45,8 @@ def fetch_usage() -> tuple:
     remaining = int(resp.headers.get('x-requests-remaining', 0))
     _api_usage['used']      = used
     _api_usage['remaining'] = remaining
+    for entry in resp.json():
+        _active_sports[entry['key']] = bool(entry.get('active', False))
     return used, remaining
 
 def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFrame:

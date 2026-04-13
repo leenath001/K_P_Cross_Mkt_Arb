@@ -13,11 +13,26 @@ sys.path.insert(0, _TRADE)
 
 import streamlit as st
 import pandas as pd
+from datetime import datetime
 import config
-from theODDS.p_helpers import pinnacle_odds, fetch_usage, get_api_usage
+from theODDS.p_helpers import pinnacle_odds, fetch_usage, get_api_usage, get_active_sports
 from KALSHI.k_helpers   import kalshi_odds
 from bot                import get_balance, run_all_signals
 from settle             import fetch_market_result, compute_pnl
+
+def _in_season(key: str) -> bool:
+    """
+    True if the sport is currently in season.
+    Uses live active flags from theOdds API if a usage refresh has been done,
+    otherwise falls back to config.SEASON_MONTHS.
+    """
+    live = get_active_sports()
+    if key in live:
+        return live[key]
+    months = config.SEASON_MONTHS.get(key)
+    if months is not None:
+        return datetime.now().month in months
+    return True  # unknown — assume in season
 
 LOG_PATH = os.path.join(_TRADE, 'logs', 'trades.csv')
 
@@ -115,7 +130,9 @@ with tab_trade:
         with cols[i % 3]:
             st.markdown(f'**{cat}**')
             for key, label in grouped[cat]:
-                if st.checkbox(label, value=(key in config.SPORTS), key=f'sport_{key}'):
+                active = _in_season(key)
+                dot    = '🟢' if active else '🔴'
+                if st.checkbox(f'{dot} {label}', value=active, key=f'sport_{key}'):
                     selected_sports.append(key)
 
     if 'Soccer' in grouped:
@@ -123,7 +140,9 @@ with tab_trade:
         soccer_cols = st.columns(4)
         for i, (key, label) in enumerate(grouped['Soccer']):
             with soccer_cols[i % 4]:
-                if st.checkbox(label, value=(key in config.SPORTS), key=f'sport_{key}'):
+                active = _in_season(key)
+                dot    = '🟢' if active else '🔴'
+                if st.checkbox(f'{dot} {label}', value=active, key=f'sport_{key}'):
                     selected_sports.append(key)
 
     st.caption(f'{len(selected_sports)} sport(s) selected')
@@ -386,21 +405,29 @@ with tab_review:
                 ax.tick_params(colors='black')
                 for sp in ax.spines.values(): sp.set_edgecolor('#ccc')
 
-                # 2. Cumulative EV vs PnL
+                # 2. Edge vs Luck decomposition (strips direct bet exposure)
+                # actual_pnl = edge (EV) + luck (actual − EV)
+                # Plotting cumulative EV (skill) and cumulative luck (variance) separately
+                # so the two lines are comparable on the same scale.
                 ax = axes[1]
-                cum_ev = filled_sorted['ev_total'].cumsum().values
-                ax.plot(range(len(cum_ev)), cum_ev, color='steelblue', linewidth=2,
-                        label='Projected EV', marker='o', markersize=3)
                 if not settled.empty:
-                    settled_sorted = settled.sort_values('logged_at')
-                    cum_pnl = settled_sorted['actual_pnl'].cumsum().values
-                    settled_idx = [i for i, (_, r) in enumerate(filled_sorted.iterrows())
-                                   if r['result'] in ('WIN', 'LOSS')]
-                    ax.plot(settled_idx[:len(cum_pnl)], cum_pnl, color='#2ecc71',
-                            linewidth=2, label='Actual PnL', marker='s', markersize=3)
-                ax.axhline(0, color='black', linewidth=0.5, linestyle='--')
-                ax.set_title('Cumulative EV vs Actual PnL', color='black')
-                ax.set_xlabel('Trade #', color='black')
+                    settled_sorted = settled.sort_values('logged_at').copy()
+                    settled_sorted['luck'] = settled_sorted['actual_pnl'] - settled_sorted['ev_total']
+                    n = len(settled_sorted)
+                    xs = range(n)
+                    cum_ev_s   = settled_sorted['ev_total'].cumsum().values
+                    cum_luck   = settled_sorted['luck'].cumsum().values
+                    luck_colors = ['#2ecc71' if v >= 0 else '#e74c3c' for v in cum_luck]
+                    ax.plot(xs, cum_ev_s, color='steelblue', linewidth=2,
+                            label='Cumulative edge (EV)', marker='o', markersize=3, zorder=3)
+                    ax.bar(xs, cum_luck, color=luck_colors, alpha=0.5,
+                           label='Cumulative luck (actual − EV)', zorder=2)
+                    ax.axhline(0, color='black', linewidth=0.5, linestyle='--')
+                else:
+                    ax.text(0.5, 0.5, 'No settled trades yet', ha='center', va='center',
+                            transform=ax.transAxes, color='gray')
+                ax.set_title('Edge vs Luck (exposure stripped)', color='black')
+                ax.set_xlabel('Settled trade #', color='black')
                 ax.set_ylabel('$', color='black')
                 ax.legend(fontsize=8)
                 ax.set_facecolor('white')
