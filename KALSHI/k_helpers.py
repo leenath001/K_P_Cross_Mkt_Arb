@@ -135,13 +135,19 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6, fees: float = 0.07) ->
     pinnacle_df = df.copy()
 
     # 1. Map sports to Kalshi series tickers
-    kalshi_series = set()
+    sport_to_series = {}
     for sport in pinnacle_df['sport'].unique():
         if sport in SPORTS_C:
-            kalshi_series.add(SPORTS_C[sport]['ticker'])
+            sport_to_series[sport] = SPORTS_C[sport]['ticker']
 
-    # 2. Load all Kalshi markets for those series
-    all_k = pd.concat([load_all_mkts(s) for s in kalshi_series], axis=0, ignore_index=True)
+    # 2. Load all Kalshi markets, tagging each row with its series ticker
+    series_dfs = []
+    for series in set(sport_to_series.values()):
+        mkt_df = load_all_mkts(series)
+        mkt_df['series_ticker'] = series
+        series_dfs.append(mkt_df)
+
+    all_k = pd.concat(series_dfs, axis=0, ignore_index=True)
 
     # 3. Parse dates from event_ticker
     all_k['k_date'] = all_k['event_ticker'].apply(_parse_ticker_date)
@@ -149,8 +155,12 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6, fees: float = 0.07) ->
     # 4. Match each Pinnacle outcome to a Kalshi market
     rows = []
     for event_id, group in pinnacle_df.groupby('event_id'):
+        sport     = group['sport'].iloc[0]
+        series    = sport_to_series.get(sport)
         game_date = group['commence'].iloc[0].date()
-        day_k = all_k[all_k['k_date'] == game_date]
+
+        # Filter by both date AND the correct series for this sport
+        day_k = all_k[(all_k['k_date'] == game_date) & (all_k['series_ticker'] == series)]
         if day_k.empty:
             continue
 

@@ -301,7 +301,6 @@ with tab_settle:
                     else:
                         log_df.to_csv(LOG_PATH, index=False)
                         settle_status.update(label=f'Updated {updates} row(s)', state='complete')
-                        st.session_state['log_refreshed'] = True
 
         # Show full log
         with st.expander('Full trade log'):
@@ -315,7 +314,7 @@ with tab_settle:
 with tab_review:
     st.subheader('Trade Review')
 
-    log_df2 = _load_log()
+    log_df2 = _load_log()  # reuses the same helper defined in the Settle tab
 
     if log_df2.empty:
         st.info('No trade log found yet.')
