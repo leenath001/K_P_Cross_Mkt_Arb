@@ -66,6 +66,10 @@ def run(dry_run: bool = False):
         console.print('[yellow]No trade log found.[/yellow]')
         return
 
+    if os.path.getsize(LOG_PATH) == 0:
+        console.print('[green]No pending trades to settle.[/green]')
+        return
+
     df = pd.read_csv(LOG_PATH)
     pending = df[
         (df['result'] == 'PENDING') &
