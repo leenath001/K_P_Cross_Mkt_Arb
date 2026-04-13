@@ -131,8 +131,8 @@ def show_charts(df: pd.DataFrame):
     settled['actual_pnl'] = pd.to_numeric(settled['actual_pnl'], errors='coerce')
     settled  = settled.sort_values('logged_at')
 
-    fig = plt.figure(figsize=(14, 10))
-    fig.suptitle('K/P Cross-Market Arbitrage — Edge Realization', fontsize=14, fontweight='bold')
+    fig = plt.figure(figsize=(14, 10), facecolor='white')
+    fig.suptitle('K/P Cross-Market Arbitrage — Edge Realization', fontsize=14, fontweight='bold', color='black')
     gs  = gridspec.GridSpec(2, 2, hspace=0.4, wspace=0.35)
 
     # ── 1. Edge distribution ─────────────────────────────────────────────────
@@ -140,7 +140,7 @@ def show_charts(df: pd.DataFrame):
     if not filled.empty:
         colors = ['#2ecc71' if v > 0 else '#e74c3c' for v in filled['edge']]
         ax1.bar(range(len(filled)), filled['edge'].values, color=colors, width=0.8)
-        ax1.axhline(0, color='white', linewidth=0.8, linestyle='--')
+        ax1.axhline(0, color='black', linewidth=0.8, linestyle='--')
         ax1.set_title('Edge per Trade (fair_prob − entry_price)')
         ax1.set_xlabel('Trade #')
         ax1.set_ylabel('Edge')
@@ -154,14 +154,14 @@ def show_charts(df: pd.DataFrame):
         ax1.text(0.5, 0.5, 'No filled orders yet', ha='center', va='center',
                  transform=ax1.transAxes, color='gray')
         ax1.set_title('Edge per Trade')
-    fig.patch.set_facecolor('#0f0f23')
-    ax1.set_facecolor('#1a1a2e')
-    ax1.tick_params(colors='white')
-    ax1.title.set_color('white')
-    ax1.xaxis.label.set_color('white')
-    ax1.yaxis.label.set_color('white')
+    fig.patch.set_facecolor('white')
+    ax1.set_facecolor('white')
+    ax1.tick_params(colors='black')
+    ax1.title.set_color('black')
+    ax1.xaxis.label.set_color('black')
+    ax1.yaxis.label.set_color('black')
     for spine in ax1.spines.values():
-        spine.set_edgecolor('#333')
+        spine.set_edgecolor('#ccc')
 
     # ── 2. Cumulative EV vs actual PnL ───────────────────────────────────────
     ax2 = fig.add_subplot(gs[0, 1])
@@ -179,7 +179,7 @@ def show_charts(df: pd.DataFrame):
             ax2.plot(settled_indices[:len(cum_pnl)], cum_pnl,
                      color='#2ecc71', linewidth=2, label='Actual PnL',
                      marker='s', markersize=4)
-        ax2.axhline(0, color='white', linewidth=0.5, linestyle='--')
+        ax2.axhline(0, color='black', linewidth=0.5, linestyle='--')
         ax2.set_title('Cumulative EV vs Actual PnL')
         ax2.set_xlabel('Trade #')
         ax2.set_ylabel('$')
@@ -188,19 +188,19 @@ def show_charts(df: pd.DataFrame):
         ax2.text(0.5, 0.5, 'No filled orders yet', ha='center', va='center',
                  transform=ax2.transAxes, color='gray')
         ax2.set_title('Cumulative EV vs Actual PnL')
-    ax2.set_facecolor('#1a1a2e')
-    ax2.tick_params(colors='white')
-    ax2.title.set_color('white')
-    ax2.xaxis.label.set_color('white')
-    ax2.yaxis.label.set_color('white')
+    ax2.set_facecolor('white')
+    ax2.tick_params(colors='black')
+    ax2.title.set_color('black')
+    ax2.xaxis.label.set_color('black')
+    ax2.yaxis.label.set_color('black')
     for spine in ax2.spines.values():
-        spine.set_edgecolor('#333')
+        spine.set_edgecolor('#ccc')
 
     # ── 3. EV per contract histogram ─────────────────────────────────────────
     ax3 = fig.add_subplot(gs[1, 0])
     if not filled.empty:
         ax3.hist(filled['ev_per_contract'], bins=max(5, len(filled) // 3),
-                 color='#9b59b6', edgecolor='#0f0f23', linewidth=0.5)
+                 color='#9b59b6', edgecolor='white', linewidth=0.5)
         ax3.axvline(0, color='red', linewidth=1, linestyle='--')
         ax3.axvline(filled['ev_per_contract'].mean(), color='yellow',
                     linewidth=1, linestyle=':', label=f"mean={filled['ev_per_contract'].mean():+.3f}")
@@ -212,13 +212,13 @@ def show_charts(df: pd.DataFrame):
         ax3.text(0.5, 0.5, 'No filled orders yet', ha='center', va='center',
                  transform=ax3.transAxes, color='gray')
         ax3.set_title('EV per Contract Distribution')
-    ax3.set_facecolor('#1a1a2e')
-    ax3.tick_params(colors='white')
-    ax3.title.set_color('white')
-    ax3.xaxis.label.set_color('white')
-    ax3.yaxis.label.set_color('white')
+    ax3.set_facecolor('white')
+    ax3.tick_params(colors='black')
+    ax3.title.set_color('black')
+    ax3.xaxis.label.set_color('black')
+    ax3.yaxis.label.set_color('black')
     for spine in ax3.spines.values():
-        spine.set_edgecolor('#333')
+        spine.set_edgecolor('#ccc')
 
     # ── 4. Win rate by order type ─────────────────────────────────────────────
     ax4 = fig.add_subplot(gs[1, 1])
@@ -242,18 +242,18 @@ def show_charts(df: pd.DataFrame):
             avg_fp = sub['fair_prob'].mean()
             ax4.text(i, max(wins[i], losses[i]) + 0.1,
                      f'WR={wr:.0%}\nfair={avg_fp:.2f}',
-                     ha='center', fontsize=7, color='white')
+                     ha='center', fontsize=7, color='black')
     else:
         ax4.text(0.5, 0.5, 'No settled trades yet\n(update result column in CSV)',
                  ha='center', va='center', transform=ax4.transAxes, color='gray')
         ax4.set_title('Win / Loss by Order Type')
-    ax4.set_facecolor('#1a1a2e')
-    ax4.tick_params(colors='white')
-    ax4.title.set_color('white')
-    ax4.xaxis.label.set_color('white')
-    ax4.yaxis.label.set_color('white')
+    ax4.set_facecolor('white')
+    ax4.tick_params(colors='black')
+    ax4.title.set_color('black')
+    ax4.xaxis.label.set_color('black')
+    ax4.yaxis.label.set_color('black')
     for spine in ax4.spines.values():
-        spine.set_edgecolor('#333')
+        spine.set_edgecolor('#ccc')
 
     plt.tight_layout()
     plt.show()

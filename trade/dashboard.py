@@ -9,6 +9,7 @@ API request usage bar. Designed to be used as a context manager:
 """
 
 import threading
+from typing import Optional
 from datetime import datetime
 from rich.live import Live
 from rich.table import Table
@@ -80,9 +81,9 @@ class Dashboard:
             }
             self._refresh()
 
-    def update(self, order_id: str, status: str | None = None,
-               fair_prob: float | None = None, edge: float | None = None,
-               contracts: int | None = None, market_ask: int | None = None):
+    def update(self, order_id: str, status: Optional[str] = None,
+               fair_prob: Optional[float] = None, edge: Optional[float] = None,
+               contracts: Optional[int] = None, market_ask: Optional[int] = None):
         with self._lock:
             pos = self._positions.get(order_id)
             if pos is None:

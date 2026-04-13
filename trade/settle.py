@@ -13,6 +13,7 @@ How it works:
 """
 
 import os, sys, argparse
+from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,7 +28,7 @@ BASE_URL  = 'https://api.elections.kalshi.com/trade-api/v2'
 console = Console()
 
 
-def fetch_market_result(ticker: str) -> str | None:
+def fetch_market_result(ticker: str) -> Optional[str]:
     """
     Returns 'yes', 'no', 'void', or None (not yet settled).
     """

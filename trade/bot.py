@@ -87,7 +87,7 @@ def kelly_contracts(fair_prob: float, price: float, bankroll: float,
 # ---------------------------------------------------------------------------
 
 def place_order(ticker: str, yes_price_cents: int, count: int,
-                expiration_ts: int | None = None,
+                expiration_ts: Optional[int] = None,
                 post_only: bool = False) -> dict:
     """
     Place a YES limit buy order on Kalshi.
@@ -146,7 +146,7 @@ def cancel_order(order_id: str) -> bool:
     return resp.status_code in (200, 204)
 
 
-def get_market_price(ticker: str) -> int | None:
+def get_market_price(ticker: str) -> Optional[int]:
     """
     Fetch the current yes_ask for a Kalshi market in cents.
     Returns None if unavailable.
@@ -195,7 +195,7 @@ def get_order_status(order_id: str) -> dict:
 
 def _recheck_signal(event_id: str, sport: str, outcome: str,
                     order_price: float, fee_rate: float,
-                    dashboard=None, order_id: str | None = None) -> tuple[bool, float | None]:
+                    dashboard=None, order_id: Optional[str] = None) -> tuple:
     """
     Re-fetch Pinnacle odds and check if EV at the original order price
     is still positive given the fee rate.
@@ -238,7 +238,7 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
              max_duration: int = MAX_DURATION,
              pre_event_buffer: int = PRE_EVENT_BUFFER,
              dashboard=None,
-             stop_event: threading.Event | None = None) -> str:
+             stop_event: Optional[threading.Event] = None) -> str:
     """
     Two independent polling rates:
       - Kalshi  : every `kalshi_poll`   seconds — status, live price, remaining cts
@@ -323,7 +323,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
               max_duration: int = MAX_DURATION,
               pre_event_buffer: int = PRE_EVENT_BUFFER,
               dashboard=None,
-              stop_event: threading.Event | None = None) -> dict:
+              stop_event: Optional[threading.Event] = None) -> dict:
     """
     Execute a single trade for one signaled row from kalshi_odds().
 
@@ -466,7 +466,7 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
                     maker_fee: float = MAKER_FEE,
                     limit_only: bool = False,
                     dashboard=None,
-                    stop_event: threading.Event | None = None) -> list[dict]:
+                    stop_event: Optional[threading.Event] = None) -> list:
     """
     Run trades in parallel (one thread per signal).
     Deduplicates on k_ticker — each Kalshi market is traded at most once.

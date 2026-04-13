@@ -13,11 +13,11 @@ BASE_URL = 'https://api.the-odds-api.com/v4'
 # Tracks usage from the most recent API call — read via get_api_usage()
 _api_usage: dict[str, int] = {'used': 0, 'remaining': 500}
 
-def get_api_usage() -> tuple[int, int]:
+def get_api_usage() -> tuple:
     """Return (requests_used, requests_remaining) from the last Pinnacle call."""
     return _api_usage['used'], _api_usage['remaining']
 
-def fetch_usage() -> tuple[int, int]:
+def fetch_usage() -> tuple:
     """
     Make a live request to /v4/sports to get fresh usage counters from headers.
     Costs 1 request. Returns (used, remaining).
