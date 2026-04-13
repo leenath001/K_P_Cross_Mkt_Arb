@@ -85,8 +85,8 @@ matched_df = kalshi_odds(pinnacle_df, threshold=args.threshold, fees=args.taker_
 LOG_PATH = os.path.join(_TRADE, 'logs', 'trades.csv')
 already_bet = set()
 if os.path.exists(LOG_PATH):
-    log_df      = pd.read_csv(LOG_PATH)
-    already_bet = set(log_df.loc[log_df['result'] == 'PENDING', 'k_ticker'])
+    log_df      = pd.read_csv(LOG_PATH) if os.path.getsize(LOG_PATH) > 0 else pd.DataFrame()
+    already_bet = set(log_df.loc[log_df['result'] == 'PENDING', 'k_ticker']) if not log_df.empty else set()
     if already_bet:
         matched_df = matched_df[~matched_df['k_ticker'].isin(already_bet)]
         print(f'  Excluded {len(already_bet)} ticker(s) with open bets: {already_bet}')
