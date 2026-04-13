@@ -16,15 +16,26 @@ from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
 load_dotenv(dotenv_path=_env_path, override=True)
 
+def _secret(key: str) -> Optional[str]:
+    """Read from env first, fall back to st.secrets (Streamlit Cloud)."""
+    val = os.getenv(key)
+    if not val:
+        try:
+            import streamlit as st
+            val = st.secrets.get(key)
+        except Exception:
+            pass
+    return val
+
 # -- Global Variables -------
 SPORTS = config.SPORTS
 SPORTS_C = config.SPORTS_CONFIG
-API_KEY         = os.getenv('API_KEY')
-API_PRIVATE     = os.getenv('API_PRIVATE')
-BASE_URL        = 'https://api.elections.kalshi.com/trade-api/v2'
-PATH = '/trade-api/v2/markets'
+API_KEY     = _secret('API_KEY')
+API_PRIVATE = _secret('API_PRIVATE')
+BASE_URL    = 'https://api.elections.kalshi.com/trade-api/v2'
+PATH        = '/trade-api/v2/markets'
 
-assert API_PRIVATE, f'API_PRIVATE not found in .env (looked at {_env_path})'
+assert API_PRIVATE, f'API_PRIVATE not found — set it in .env or Streamlit Cloud secrets'
 
 # API_PRIVATE is a raw base64-encoded DER key — wrap in PEM headers to load it
 _pem_bytes = (

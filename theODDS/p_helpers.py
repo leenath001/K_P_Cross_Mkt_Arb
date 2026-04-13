@@ -7,7 +7,17 @@ import json
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'))
 import warnings
 
-API_KEY = os.getenv('ODDS_API_KEY')
+def _secret(key: str):
+    val = os.getenv(key)
+    if not val:
+        try:
+            import streamlit as st
+            val = st.secrets.get(key)
+        except Exception:
+            pass
+    return val
+
+API_KEY = _secret('ODDS_API_KEY')
 BASE_URL = 'https://api.the-odds-api.com/v4'
 
 # Tracks usage from the most recent API call — read via get_api_usage()
