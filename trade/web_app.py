@@ -36,6 +36,11 @@ def _in_season(key: str) -> bool:
 
 LOG_PATH = os.path.join(_TRADE, 'logs', 'trades.csv')
 
+def _load_log():
+    if not os.path.exists(LOG_PATH) or os.path.getsize(LOG_PATH) == 0:
+        return pd.DataFrame()
+    return pd.read_csv(LOG_PATH)
+
 # ── Page config ──────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title='K/P Arb Dashboard', page_icon='📊', layout='wide')
@@ -176,14 +181,17 @@ with tab_trade:
 
                 st.session_state['matched_df'] = matched_df
                 status.update(label='Done', state='complete')
+                st.rerun()
             except ValueError as e:
                 status.update(label='No data', state='error')
                 st.warning(str(e))
                 st.session_state['matched_df'] = pd.DataFrame()
+                st.rerun()
             except Exception as e:
                 status.update(label='Error', state='error')
                 st.error(str(e))
                 st.session_state['matched_df'] = pd.DataFrame()
+                st.rerun()
 
     # ── Results ──────────────────────────────────────────────────────────────
     matched_df = st.session_state.get('matched_df', pd.DataFrame())
@@ -224,8 +232,7 @@ with tab_trade:
                 column_config={'Execute': st.column_config.CheckboxColumn('Execute', default=True)},
             )
 
-            # Never execute tickers that already have a pending trade
-            approved_mask    = edited['Execute'].values & ~already_traded.values
+            approved_mask    = edited['Execute'].values
             approved_signals = signals.iloc[approved_mask].copy()
             n_approved       = int(approved_mask.sum())
             st.caption(f'{n_approved} signal(s) selected for execution')
@@ -280,11 +287,6 @@ with tab_trade:
 
 with tab_settle:
     st.subheader('Settle Pending Trades')
-
-    def _load_log():
-        if not os.path.exists(LOG_PATH) or os.path.getsize(LOG_PATH) == 0:
-            return pd.DataFrame()
-        return pd.read_csv(LOG_PATH)
 
     log_df = _load_log()
 
