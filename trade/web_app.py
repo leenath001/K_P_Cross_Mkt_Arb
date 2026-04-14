@@ -122,6 +122,17 @@ with tab_trade:
         grouped.setdefault(_category(key), []).append((key, cfg['label']))
 
     cat_order = sorted([c for c in grouped if c != 'Soccer']) + (['Soccer'] if 'Soccer' in grouped else [])
+
+    # Select / Deselect All Active buttons
+    _all_keys = list(config.SPORTS_CONFIG.keys())
+    _b1, _b2, _ = st.columns([1, 1, 6])
+    if _b1.button('Select all active'):
+        for k in _all_keys:
+            st.session_state[f'sport_{k}'] = _in_season(k)
+    if _b2.button('Deselect all'):
+        for k in _all_keys:
+            st.session_state[f'sport_{k}'] = False
+
     selected_sports = []
 
     non_soccer = [c for c in cat_order if c != 'Soccer']
@@ -188,21 +199,33 @@ with tab_trade:
 
         if not signals.empty:
             st.markdown('#### Signals')
+
+            # Tickers already traded and still pending — block re-execution
+            _log = _load_log()
+            _pending_tickers = set()
+            if not _log.empty and 'result' in _log.columns and 'k_ticker' in _log.columns:
+                _pending_tickers = set(
+                    _log.loc[_log['result'] == 'PENDING', 'k_ticker'].tolist()
+                )
+
             display_cols = [c for c in ['sport', 'home', 'away', 'commence', 'outcome',
                                         'fair_prob', 'yes_ask', 'match_score', 'k_ticker']
                             if c in signals.columns]
 
             editable = signals[display_cols].copy().reset_index(drop=True)
-            editable.insert(0, 'Execute', True)
+            already_traded = editable['k_ticker'].isin(_pending_tickers)
+            editable.insert(0, 'Execute', (~already_traded))
+            editable.insert(1, 'Status', already_traded.map({True: '⚠️ pending', False: ''}))
             edited = st.data_editor(
                 editable,
                 use_container_width=True,
                 hide_index=True,
-                disabled=display_cols,
+                disabled=display_cols + ['Status'],
                 column_config={'Execute': st.column_config.CheckboxColumn('Execute', default=True)},
             )
 
-            approved_mask    = edited['Execute'].values
+            # Never execute tickers that already have a pending trade
+            approved_mask    = edited['Execute'].values & ~already_traded.values
             approved_signals = signals.iloc[approved_mask].copy()
             n_approved       = int(approved_mask.sum())
             st.caption(f'{n_approved} signal(s) selected for execution')
@@ -231,12 +254,16 @@ with tab_trade:
             last_results = st.session_state.get('last_results')
             if last_results:
                 st.markdown('#### Trade Results')
-                results_df = pd.DataFrame(last_results)
+                results_df = pd.DataFrame([r for r in last_results if r is not None])
                 if not results_df.empty:
-                    show_cols = [c for c in ['k_ticker', 'outcome', 'final_status',
-                                             'close_reason', 'contracts', 'entry_price', 'ev_total']
+                    show_cols = [c for c in ['ticker', 'outcome', 'order_type', 'status',
+                                             'reason', 'contracts', 'yes_price', 'ev']
                                  if c in results_df.columns]
                     st.dataframe(results_df[show_cols], use_container_width=True, hide_index=True)
+                    errors = results_df[results_df['status'] == 'error']
+                    if not errors.empty:
+                        for _, err in errors.iterrows():
+                            st.error(f"{err.get('ticker')} — {err.get('reason')}")
         else:
             st.info('No signals — all Kalshi asks are fairly priced vs Pinnacle at current fees.')
 
@@ -405,28 +432,31 @@ with tab_review:
                 ax.tick_params(colors='black')
                 for sp in ax.spines.values(): sp.set_edgecolor('#ccc')
 
-                # 2. Edge vs Luck decomposition (strips direct bet exposure)
-                # actual_pnl = edge (EV) + luck (actual − EV)
-                # Plotting cumulative EV (skill) and cumulative luck (variance) separately
-                # so the two lines are comparable on the same scale.
+                # 2. Projected EV / Realized PnL / Luck
+                # Projected EV  = cumulative ev_total (edge at entry, from Pinnacle − Kalshi ask)
+                # Realized PnL  = cumulative actual_pnl for settled trades
+                # Luck          = Realized PnL − Projected EV (random outcome variance)
                 ax = axes[1]
                 if not settled.empty:
                     settled_sorted = settled.sort_values('logged_at').copy()
                     settled_sorted['luck'] = settled_sorted['actual_pnl'] - settled_sorted['ev_total']
-                    n = len(settled_sorted)
+                    n  = len(settled_sorted)
                     xs = range(n)
-                    cum_ev_s   = settled_sorted['ev_total'].cumsum().values
-                    cum_luck   = settled_sorted['luck'].cumsum().values
-                    luck_colors = ['#2ecc71' if v >= 0 else '#e74c3c' for v in cum_luck]
-                    ax.plot(xs, cum_ev_s, color='steelblue', linewidth=2,
-                            label='Cumulative edge (EV)', marker='o', markersize=3, zorder=3)
-                    ax.bar(xs, cum_luck, color=luck_colors, alpha=0.5,
-                           label='Cumulative luck (actual − EV)', zorder=2)
+                    cum_proj_ev  = settled_sorted['ev_total'].cumsum().values
+                    cum_real_ev  = settled_sorted['actual_pnl'].cumsum().values
+                    cum_luck     = settled_sorted['luck'].cumsum().values
+                    luck_colors  = ['#2ecc71' if v >= 0 else '#e74c3c' for v in cum_luck]
+                    ax.plot(xs, cum_proj_ev, color='steelblue', linewidth=2,
+                            label='Projected EV', marker='o', markersize=3, zorder=3)
+                    ax.plot(xs, cum_real_ev, color='#9b59b6', linewidth=2,
+                            label='Realized PnL', marker='s', markersize=3, zorder=3)
+                    ax.bar(xs, cum_luck, color=luck_colors, alpha=0.4,
+                           label='Luck (realized − projected)', zorder=2)
                     ax.axhline(0, color='black', linewidth=0.5, linestyle='--')
                 else:
                     ax.text(0.5, 0.5, 'No settled trades yet', ha='center', va='center',
                             transform=ax.transAxes, color='gray')
-                ax.set_title('Edge vs Luck (exposure stripped)', color='black')
+                ax.set_title('Projected EV vs Realized PnL vs Luck', color='black')
                 ax.set_xlabel('Settled trade #', color='black')
                 ax.set_ylabel('$', color='black')
                 ax.legend(fontsize=8)

@@ -480,10 +480,20 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
     lock    = threading.Lock()
 
     def _trade(row, idx):
-        result = run_trade(row, bankroll=bankroll,
-                           taker_fee=taker_fee, maker_fee=maker_fee,
-                           limit_only=limit_only, dashboard=dashboard,
-                           stop_event=stop_event)
+        try:
+            result = run_trade(row, bankroll=bankroll,
+                               taker_fee=taker_fee, maker_fee=maker_fee,
+                               limit_only=limit_only, dashboard=dashboard,
+                               stop_event=stop_event)
+        except Exception as exc:
+            result = {
+                'status':  'error',
+                'ticker':  row.get('k_ticker', ''),
+                'outcome': row.get('outcome', ''),
+                'reason':  str(exc),
+                'order_id': None,
+                'contracts': 0,
+            }
         with lock:
             results[idx] = result
 
