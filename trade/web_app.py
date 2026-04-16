@@ -197,7 +197,9 @@ with tab_trade:
     matched_df = st.session_state.get('matched_df', pd.DataFrame())
 
     if not matched_df.empty:
-        signals = matched_df[matched_df['signal']]
+        _sig_col = 'signal_no' if st.session_state.get('_trade_side') == 'no' else 'signal'
+        _sig_col = _sig_col if _sig_col in matched_df.columns else 'signal'
+        signals = matched_df[matched_df[_sig_col]]
 
         st.subheader('Results')
         m1, m2, m3 = st.columns(3)
@@ -237,7 +239,12 @@ with tab_trade:
             n_approved       = int(approved_mask.sum())
             st.caption(f'{n_approved} signal(s) selected for execution')
 
-            limit_only = st.checkbox('Limit orders only (never cross book)', value=False)
+            trade_side = st.radio('Contract side', ['--yes (cross/rest YES)', '--no (rest NO, maker)'],
+                                  index=0, horizontal=True)
+            side       = 'no' if trade_side.startswith('--no') else 'yes'
+            st.session_state['_trade_side'] = side
+            limit_only = st.checkbox('Limit orders only (never cross book)', value=False,
+                                     disabled=(side == 'no'))
 
             if st.button(f'Execute {n_approved} Signal(s)', type='primary', disabled=n_approved == 0):
                 if balance is None:
@@ -251,6 +258,7 @@ with tab_trade:
                                 taker_fee=taker_fee,
                                 maker_fee=maker_fee,
                                 limit_only=limit_only,
+                                side=side,
                             )
                             exec_status.update(label='Done', state='complete')
                             st.session_state['last_results'] = results

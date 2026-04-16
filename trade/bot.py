@@ -86,23 +86,25 @@ def kelly_contracts(fair_prob: float, price: float, bankroll: float,
 # Step 6 — Order Placement, Cancellation, Status
 # ---------------------------------------------------------------------------
 
-def place_order(ticker: str, yes_price_cents: int, count: int,
+def place_order(ticker: str, price_cents: int, count: int,
+                side: str = 'yes',
                 expiration_ts: Optional[int] = None,
                 post_only: bool = False) -> dict:
     """
-    Place a YES limit buy order on Kalshi.
-    post_only=True guarantees the order rests in the book —
-    if it would cross immediately, the exchange rejects it instead of filling.
+    Place a limit buy order on Kalshi for YES or NO contracts.
+    post_only=True guarantees the order rests (maker fee) — rejected if it would cross.
+    `price_cents` is interpreted as yes_price for side='yes', no_price for side='no'.
     """
     path = '/trade-api/v2/portfolio/orders'
+    price_field = 'yes_price' if side == 'yes' else 'no_price'
     body: dict = {
         'ticker':          ticker,
         'client_order_id': str(uuid.uuid4()),
         'type':            'limit',
         'action':          'buy',
-        'side':            'yes',
+        'side':            side,
         'count':           count,
-        'yes_price':       yes_price_cents,
+        price_field:       price_cents,
     }
     if expiration_ts:
         body['expiration_ts'] = expiration_ts
@@ -320,6 +322,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
               taker_fee: float = TAKER_FEE,
               maker_fee: float = MAKER_FEE,
               limit_only: bool = False,
+              side: str = 'yes',
               max_duration: int = MAX_DURATION,
               pre_event_buffer: int = PRE_EVENT_BUFFER,
               dashboard=None,
@@ -327,21 +330,92 @@ def run_trade(signal_row: pd.Series, bankroll: float,
     """
     Execute a single trade for one signaled row from kalshi_odds().
 
-    Cross-or-rest logic:
+    side='yes' (default): Cross-or-rest YES logic unchanged.
       1. Check EV at yes_ask with taker_fee — if positive, cross the book.
-      2. Else check EV at yes_bid with maker_fee — if positive, rest at bid.
-      3. Else skip — no edge after fees either way.
+      2. Else check EV at yes_bid+1¢ with maker_fee — if positive, rest.
+      3. Else skip.
+
+    side='no': Resting NO order at no_ask, always maker (post_only=True).
+      Signal: EV > 0 using (1-fair_prob) vs no_ask at maker_fee.
+      No cross attempt — NO orders always rest.
     """
     ticker    = signal_row['k_ticker']
     fair_prob = float(signal_row['fair_prob'])
     yes_ask   = float(signal_row['yes_ask'])
     yes_bid   = float(signal_row['yes_bid']) if signal_row['yes_bid'] is not None else None
+    no_ask    = float(signal_row['no_ask'])  if signal_row.get('no_ask') is not None else None
+    no_bid    = float(signal_row['no_bid'])  if signal_row.get('no_bid') is not None else None
     commence  = signal_row['commence']
     event_id  = signal_row['event_id']
     sport     = signal_row['sport']
     outcome   = signal_row['outcome']
 
-    # Determine price and fee_rate (cross vs rest)
+    # ── NO side: resting limit at no_ask, maker fee ──────────────────────────
+    if side == 'no':
+        if no_ask is None:
+            return {'status': 'skipped', 'reason': 'no_ask_unavailable',
+                    'ticker': ticker, 'order_id': None, 'contracts': 0}
+        fair_prob_no = 1 - fair_prob
+        ev = _ev(fair_prob_no, no_ask, maker_fee)
+        if ev <= 0:
+            return {'status': 'skipped', 'reason': 'no_edge_after_fees',
+                    'ticker': ticker, 'order_id': None, 'contracts': 0}
+        order_price = no_ask
+        fee_rate    = maker_fee
+        order_type  = 'no_rest'
+        price_cents = round(order_price * 100)
+        contracts   = kelly_contracts(fair_prob_no, order_price, bankroll, fee_rate)
+
+        now_utc      = datetime.now(timezone.utc)
+        commence_utc = pd.Timestamp(commence).tz_convert('UTC').to_pydatetime()
+        expiry_dt    = min(now_utc + timedelta(seconds=max_duration),
+                           commence_utc - timedelta(seconds=pre_event_buffer))
+        if expiry_dt <= now_utc:
+            return {'status': 'skipped', 'reason': 'event_too_soon',
+                    'ticker': ticker, 'order_id': None, 'contracts': 0}
+
+        order    = place_order(ticker, price_cents, contracts, side='no',
+                               expiration_ts=int(expiry_dt.timestamp()),
+                               post_only=True)
+        order_id = order.get('order_id')
+        print(f'[no order] {ticker}  no_ask={no_ask}  contracts={contracts}  ev={ev:.4f}')
+
+        if dashboard:
+            dashboard.add_position(order_id, ticker, f'NO:{outcome}', contracts,
+                                   price_cents, fair_prob_no, ev)
+
+        reason = _monitor(
+            order_id=order_id, ticker=ticker, event_id=event_id,
+            sport=sport, outcome=outcome,
+            order_price=order_price, fee_rate=fee_rate,
+            commence_utc=commence_utc,
+            max_duration=max_duration, pre_event_buffer=pre_event_buffer,
+            dashboard=dashboard, stop_event=stop_event,
+        )
+        final        = get_order_status(order_id)
+        final_status = final.get('status', 'unknown')
+        log_trade(
+            order_id=order_id, sport=sport, outcome=f'NO:{outcome}',
+            k_ticker=ticker, commence=commence, order_type=order_type,
+            fair_prob=fair_prob_no, yes_ask_at_signal=yes_ask,
+            entry_price=order_price, fee_rate=fee_rate,
+            ev_per_contract=ev, contracts=contracts,
+            final_status=final_status, close_reason=reason,
+        )
+        return {
+            'order_id':   order_id,
+            'ticker':     ticker,
+            'outcome':    f'NO:{outcome}',
+            'contracts':  contracts,
+            'no_price':   price_cents,
+            'fair_prob':  fair_prob_no,
+            'ev':         round(ev, 4),
+            'order_type': order_type,
+            'status':     final_status,
+            'reason':     reason,
+        }
+
+    # ── YES side (default): cross-or-rest ────────────────────────────────────
     taker_ev = _ev(fair_prob, yes_ask, taker_fee)
     if not limit_only and taker_ev > 0:
         order_price = yes_ask
@@ -365,7 +439,6 @@ def run_trade(signal_row: pd.Series, bankroll: float,
     price_cents   = round(order_price * 100)
     contracts     = kelly_contracts(fair_prob, order_price, bankroll, fee_rate)
 
-    # Compute server-side expiry
     now_utc      = datetime.now(timezone.utc)
     commence_utc = pd.Timestamp(commence).tz_convert('UTC').to_pydatetime()
     expiry_dt    = min(now_utc + timedelta(seconds=max_duration),
@@ -380,8 +453,6 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         return {'status': 'skipped', 'reason': 'event_too_soon',
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
 
-    # For cross trades, refresh yes_ask right before placing to minimise slippage.
-    # If the live ask has moved up and EV is gone, skip rather than overpay.
     if order_type == 'cross':
         live_ask_cents = get_market_price(ticker)
         if live_ask_cents is not None:
@@ -393,19 +464,13 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             price_cents = live_ask_cents
             contracts   = kelly_contracts(fair_prob, order_price, bankroll, fee_rate)
 
-    # Step 6: Place order
-    # Rest orders always use post_only=True — guarantees maker fee treatment.
-    # If the order would cross (market moved), the exchange rejects it rather
-    # than filling at taker rate (which we didn't size for).
-    order    = place_order(ticker, price_cents, contracts,
-                           int(expiry_dt.timestamp()),
+    order    = place_order(ticker, price_cents, contracts, side='yes',
+                           expiration_ts=int(expiry_dt.timestamp()),
                            post_only=(order_type == 'rest' or limit_only))
     order_id = order.get('order_id')
 
-    # Log actual fees charged vs assumed — helps calibrate fee assumptions
     actual_taker_fee = float(order.get('taker_fees_dollars') or 0)
     actual_maker_fee = float(order.get('maker_fees_dollars') or 0)
-    assumed_fee_cost = ev * -1 * 0  # placeholder
     print(f'[fee check] actual taker=${actual_taker_fee:.4f}  maker=${actual_maker_fee:.4f}'
           f'  assumed_rate={fee_rate*100:.0f}%  contracts={contracts}  price={price_cents}¢')
 
@@ -413,7 +478,6 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         dashboard.add_position(order_id, ticker, outcome, contracts,
                                price_cents, fair_prob, ev)
 
-    # Steps 7 & 8: Monitor — always run, status comes live from Kalshi
     reason = _monitor(
         order_id=order_id, ticker=ticker, event_id=event_id,
         sport=sport, outcome=outcome,
@@ -465,6 +529,7 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
                     taker_fee: float = TAKER_FEE,
                     maker_fee: float = MAKER_FEE,
                     limit_only: bool = False,
+                    side: str = 'yes',
                     dashboard=None,
                     stop_event: Optional[threading.Event] = None) -> list:
     """
@@ -472,7 +537,8 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
     Deduplicates on k_ticker — each Kalshi market is traded at most once.
     Pass a threading.Event as stop_event to cancel all orders on demand.
     """
-    active = (signals_df[signals_df['signal']]
+    signal_col = 'signal_no' if side == 'no' else 'signal'
+    active = (signals_df[signals_df.get(signal_col, signals_df['signal'])]
               .drop_duplicates(subset='k_ticker')
               .copy())
 
@@ -483,8 +549,8 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
         try:
             result = run_trade(row, bankroll=bankroll,
                                taker_fee=taker_fee, maker_fee=maker_fee,
-                               limit_only=limit_only, dashboard=dashboard,
-                               stop_event=stop_event)
+                               limit_only=limit_only, side=side,
+                               dashboard=dashboard, stop_event=stop_event)
         except Exception as exc:
             result = {
                 'status':  'error',

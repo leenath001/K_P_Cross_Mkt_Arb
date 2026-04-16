@@ -123,14 +123,20 @@ def _taker_ev(fair_prob: float, price: float, taker_fee: float) -> float:
     """EV per contract for a taker (cross) fill at `price` with fee on winnings."""
     return fair_prob * (1 - price) * (1 - taker_fee) - (1 - fair_prob) * price
 
+def _maker_ev(fair_prob: float, price: float, maker_fee: float) -> float:
+    """EV per contract for a maker (resting) fill at `price` with fee on winnings."""
+    return fair_prob * (1 - price) * (1 - maker_fee) - (1 - fair_prob) * price
 
-def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6, fees: float = 0.07) -> pd.DataFrame:
+
+def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
+                fees: float = 0.07, maker_fees: float = 0.03) -> pd.DataFrame:
     """
     Takes a Pinnacle odds DataFrame and returns a merged DataFrame pairing each
     outcome row with its corresponding Kalshi market's bid/ask prices.
 
-    `fees` is the taker fee rate (fraction of winnings). The signal column is
-    True only when EV > 0 at that rate — i.e. fair_prob * (1-ask) * (1-fee) > (1-fair_prob) * ask.
+    `fees`       — taker fee rate (7%). signal     = YES EV > 0 at taker rate.
+    `maker_fees` — maker fee rate (3%). signal_no  = NO EV > 0 at maker rate
+                   (resting NO buy at no_ask, using 1-fair_prob as NO probability).
     """
     pinnacle_df = df.copy()
 
@@ -187,6 +193,10 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6, fees: float = 0.07) ->
                 'OI':             k_row['open_int'],
                 'match_score':    round(score, 3),
                 'signal':         _taker_ev(p_row['fair_prob'], k_row['yes_ask'], fees) > 0,
+                # NO signal: Pinnacle implies event is LESS likely than Kalshi prices
+                # Resting NO buy at no_ask → maker fee (3%)
+                'signal_no':      (k_row['no_ask'] is not None and
+                                   _maker_ev(1 - p_row['fair_prob'], k_row['no_ask'], maker_fees) > 0),
             })
 
     df = pd.DataFrame(rows)
