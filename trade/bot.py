@@ -8,7 +8,7 @@ Implements strategy steps 6-9:
   9. Size with partial Kelly, fraction scaled by edge magnitude
 """
 
-import os, sys, time, uuid, threading
+import os, sys, time, uuid, signal, threading
 import requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -96,7 +96,9 @@ def place_order(ticker: str, price_cents: int, count: int,
     `price_cents` is interpreted as yes_price for side='yes', no_price for side='no'.
     """
     path = '/trade-api/v2/portfolio/orders'
-    price_field = 'yes_price' if side == 'yes' else 'no_price'
+    # Kalshi always uses yes_price regardless of side.
+    # For NO orders the yes_price is the complement: 100 - no_price_cents.
+    yes_price = (100 - price_cents) if side == 'no' else price_cents
     body: dict = {
         'ticker':          ticker,
         'client_order_id': str(uuid.uuid4()),
@@ -104,18 +106,22 @@ def place_order(ticker: str, price_cents: int, count: int,
         'action':          'buy',
         'side':            side,
         'count':           count,
-        price_field:       price_cents,
+        'yes_price':       yes_price,
     }
     if expiration_ts:
         body['expiration_ts'] = expiration_ts
     if post_only:
         body['post_only'] = True
+    print(f'[place_order] body={body}')
     resp = requests.post(
         f'{BASE_URL}/portfolio/orders',
         headers={**kalshi_headers('POST', path), 'Content-Type': 'application/json'},
         json=body,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise requests.HTTPError(
+            f'{resp.status_code} {resp.reason} — {resp.text}', response=resp
+        )
     return resp.json().get('order', {})
 
 
@@ -311,7 +317,12 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
                     dashboard.update(order_id, status='signal_flipped')
                 return 'signal_flipped'
 
-        time.sleep(kalshi_poll)
+        # Interruptible sleep — wakes immediately when stop_event is set
+        if stop_event:
+            if stop_event.wait(kalshi_poll):
+                continue
+        else:
+            time.sleep(kalshi_poll)
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +337,8 @@ def run_trade(signal_row: pd.Series, bankroll: float,
               max_duration: int = MAX_DURATION,
               pre_event_buffer: int = PRE_EVENT_BUFFER,
               dashboard=None,
-              stop_event: Optional[threading.Event] = None) -> dict:
+              stop_event: Optional[threading.Event] = None,
+              order_registry: Optional[list] = None) -> dict:
     """
     Execute a single trade for one signaled row from kalshi_odds().
 
@@ -350,17 +362,22 @@ def run_trade(signal_row: pd.Series, bankroll: float,
     sport     = signal_row['sport']
     outcome   = signal_row['outcome']
 
-    # ── NO side: resting limit at no_ask, maker fee ──────────────────────────
+    # ── NO side: resting limit just below no_ask (top of book), maker fee ───
     if side == 'no':
         if no_ask is None:
             return {'status': 'skipped', 'reason': 'no_ask_unavailable',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
         fair_prob_no = 1 - fair_prob
-        ev = _ev(fair_prob_no, no_ask, maker_fee)
-        if ev <= 0:
+        # Signal gate at no_ask (worst-case resting price)
+        if _ev(fair_prob_no, no_ask, maker_fee) <= 0:
             return {'status': 'skipped', 'reason': 'no_edge_after_fees',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
-        order_price = no_ask
+        # Rest 1¢ below no_ask — joins top of bid without crossing
+        order_price = round(no_ask - 0.01, 2)
+        if order_price < 0.01:
+            return {'status': 'skipped', 'reason': 'no_ask_too_low',
+                    'ticker': ticker, 'order_id': None, 'contracts': 0}
+        ev          = _ev(fair_prob_no, order_price, maker_fee)
         fee_rate    = maker_fee
         order_type  = 'no_rest'
         price_cents = round(order_price * 100)
@@ -378,6 +395,8 @@ def run_trade(signal_row: pd.Series, bankroll: float,
                                expiration_ts=int(expiry_dt.timestamp()),
                                post_only=True)
         order_id = order.get('order_id')
+        if order_registry is not None and order_id:
+            order_registry.append(order_id)
         print(f'[no order] {ticker}  no_ask={no_ask}  contracts={contracts}  ev={ev:.4f}')
 
         if dashboard:
@@ -401,6 +420,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             entry_price=order_price, fee_rate=fee_rate,
             ev_per_contract=ev, contracts=contracts,
             final_status=final_status, close_reason=reason,
+            side='no',
         )
         return {
             'order_id':   order_id,
@@ -468,6 +488,8 @@ def run_trade(signal_row: pd.Series, bankroll: float,
                            expiration_ts=int(expiry_dt.timestamp()),
                            post_only=(order_type == 'rest' or limit_only))
     order_id = order.get('order_id')
+    if order_registry is not None and order_id:
+        order_registry.append(order_id)
 
     actual_taker_fee = float(order.get('taker_fees_dollars') or 0)
     actual_maker_fee = float(order.get('maker_fees_dollars') or 0)
@@ -525,6 +547,24 @@ def run_trade(signal_row: pd.Series, bankroll: float,
 # Batch Runner (threaded — one thread per signal)
 # ---------------------------------------------------------------------------
 
+def _force_cancel_all(order_ids: list) -> int:
+    """Cancel any order_id in the list that isn't already in a terminal state."""
+    canceled = 0
+    for oid in list(order_ids):
+        if not oid:
+            continue
+        try:
+            status = get_order_status(oid).get('status', 'unknown')
+            if status in _CLOSED_STATUSES:
+                continue
+            if cancel_order(oid):
+                canceled += 1
+        except Exception:
+            # Best-effort — try remaining orders even if one fails
+            pass
+    return canceled
+
+
 def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
                     taker_fee: float = TAKER_FEE,
                     maker_fee: float = MAKER_FEE,
@@ -535,13 +575,21 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
     """
     Run trades in parallel (one thread per signal).
     Deduplicates on k_ticker — each Kalshi market is traded at most once.
-    Pass a threading.Event as stop_event to cancel all orders on demand.
+
+    Ctrl+C behavior: sets stop_event, waits for monitors to cancel their own
+    orders, then runs a force-cancel pass over any tracked order_id that is
+    still open. A second Ctrl+C during cleanup is ignored so cancellation
+    always completes.
     """
     signal_col = 'signal_no' if side == 'no' else 'signal'
     active = (signals_df[signals_df.get(signal_col, signals_df['signal'])]
               .drop_duplicates(subset='k_ticker')
               .copy())
 
+    # Owned by run_all_signals — every order this run places gets tracked here
+    if stop_event is None:
+        stop_event = threading.Event()
+    order_registry: list = []
     results = [None] * len(active)
     lock    = threading.Lock()
 
@@ -550,7 +598,8 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
             result = run_trade(row, bankroll=bankroll,
                                taker_fee=taker_fee, maker_fee=maker_fee,
                                limit_only=limit_only, side=side,
-                               dashboard=dashboard, stop_event=stop_event)
+                               dashboard=dashboard, stop_event=stop_event,
+                               order_registry=order_registry)
         except Exception as exc:
             result = {
                 'status':  'error',
@@ -574,12 +623,20 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
         for t in threads:
             t.join()
     except KeyboardInterrupt:
-        # Signal all monitors to cancel their orders
-        if stop_event:
+        print('\n[shutdown] Ctrl+C received — canceling orders...')
+        # Block further SIGINTs so cleanup always completes
+        prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
             stop_event.set()
-        # Wait for every thread to finish canceling before returning
-        for t in threads:
-            t.join()
+            for t in threads:
+                t.join(timeout=15)
+        finally:
+            signal.signal(signal.SIGINT, prev_handler)
         raise
+    finally:
+        # Safety net: cancel any order this run placed that isn't already closed
+        n = _force_cancel_all(order_registry)
+        if n > 0:
+            print(f'[shutdown] force-canceled {n} open order(s)')
 
     return results

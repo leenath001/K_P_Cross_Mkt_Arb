@@ -29,6 +29,7 @@ parser.add_argument('--fetch-live', action='store_true', default=config.LIVE,   
 parser.add_argument('--taker-fee',  type=float, default=0.07,                     help='Taker fee rate as fraction of winnings (default: 0.07)')
 parser.add_argument('--maker-fee',  type=float, default=0.03,                     help='Maker fee rate as fraction of winnings (default: 0.03)')
 parser.add_argument('--limit-only', action='store_true',                          help='Never cross the book — always rest at bid')
+parser.add_argument('--side',       choices=['yes', 'no'], default='yes',         help='Contract side: yes (cross/rest YES) or no (rest NO, maker)')
 parser.add_argument('--threshold',  type=float, default=0.85,                     help='Min fuzzy-match score (default: 0.85)')
 parser.add_argument('--usage',      action='store_true',                          help='Print The Odds API usage and exit')
 args = parser.parse_args()
@@ -79,7 +80,9 @@ print(f'  Match threshold : {args.threshold}')
 print(f'  Taker fee       : {args.taker_fee * 100:.0f}% of winnings')
 print(f'  Maker fee       : {args.maker_fee * 100:.0f}% of winnings\n')
 
-matched_df = kalshi_odds(pinnacle_df, threshold=args.threshold, fees=args.taker_fee)
+matched_df = kalshi_odds(pinnacle_df, threshold=args.threshold,
+                         fees=args.taker_fee, maker_fees=args.maker_fee)
+signal_col = 'signal_no' if args.side == 'no' else 'signal'
 
 # ── Filter out tickers with open (PENDING) bets ──────────────────────────────
 LOG_PATH = os.path.join(_TRADE, 'logs', 'trades.csv')
@@ -91,12 +94,12 @@ if os.path.exists(LOG_PATH):
         matched_df = matched_df[~matched_df['k_ticker'].isin(already_bet)]
         print(f'  Excluded {len(already_bet)} ticker(s) with open bets: {already_bet}')
 
-if matched_df.empty or 'signal' not in matched_df.columns:
+if matched_df.empty or signal_col not in matched_df.columns:
     print('\n  No matches. Try increasing --hrs or lowering --threshold.')
     raise SystemExit(0)
 
-signals    = matched_df[matched_df['signal']]
-print(f'  {len(matched_df)} rows matched  |  {len(signals)} signal(s) found\n')
+signals    = matched_df[matched_df[signal_col]]
+print(f'  Side: {args.side.upper()}  |  {len(matched_df)} rows matched  |  {len(signals)} signal(s) found\n')
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 120)
@@ -226,8 +229,8 @@ else:
             dash.set_api_usage(used, remaining)
             results = run_all_signals(approved_df, bankroll=bankroll,
                                       taker_fee=args.taker_fee, maker_fee=args.maker_fee,
-                                      limit_only=args.limit_only, dashboard=dash,
-                                      stop_event=stop_event)
+                                      limit_only=args.limit_only, side=args.side,
+                                      dashboard=dash, stop_event=stop_event)
     except KeyboardInterrupt:
         print('\n  All orders canceled.')
 

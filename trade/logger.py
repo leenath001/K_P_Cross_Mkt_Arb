@@ -5,13 +5,17 @@ Each filled/executed order gets one row. Skipped orders are not logged.
 The `result` and `actual_pnl` columns start as PENDING and can be updated
 manually (or via a settle script) after the event resolves.
 
-Log location: trade/logs/trades.csv
+Log locations:
+    trade/logs/trades.csv     — YES-side trades
+    trade/logs/no_trades.csv  — NO-side trades (resting, maker)
 """
 
 import csv, os
 from datetime import datetime, timezone
 
-LOG_PATH = os.path.join(os.path.dirname(__file__), 'logs', 'trades.csv')
+LOG_DIR      = os.path.join(os.path.dirname(__file__), 'logs')
+LOG_PATH     = os.path.join(LOG_DIR, 'trades.csv')
+NO_LOG_PATH  = os.path.join(LOG_DIR, 'no_trades.csv')
 
 FIELDS = [
     'logged_at',
@@ -42,13 +46,17 @@ def log_trade(*, order_id: str, sport: str, outcome: str, k_ticker: str,
               commence, order_type: str, fair_prob: float,
               yes_ask_at_signal: float, entry_price: float, fee_rate: float,
               ev_per_contract: float, contracts: int,
-              final_status: str, close_reason: str) -> dict:
+              final_status: str, close_reason: str,
+              side: str = 'yes') -> dict:
     """
-    Append one row to trade/logs/trades.csv.
+    Append one row to the appropriate log file based on `side`:
+      side='yes' → trades.csv
+      side='no'  → no_trades.csv
     Returns the row dict that was written.
     """
-    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-    write_header = not os.path.exists(LOG_PATH)
+    path = NO_LOG_PATH if side == 'no' else LOG_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_header = not os.path.exists(path)
 
     row = {
         'logged_at':         datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
@@ -74,7 +82,7 @@ def log_trade(*, order_id: str, sport: str, outcome: str, k_ticker: str,
         'actual_pnl':        '',
     }
 
-    with open(LOG_PATH, 'a', newline='') as f:
+    with open(path, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
         if write_header:
             writer.writeheader()

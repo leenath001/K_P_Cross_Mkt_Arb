@@ -168,3 +168,66 @@ class Dashboard:
         text.append(bar, style=color)
         text.append(f'  {used} used / {remaining} remaining', style='dim white')
         return text
+
+
+class StreamlitDashboard:
+    """
+    Thread-safe state store with the same interface as `Dashboard`, but
+    designed for rendering from the Streamlit main loop instead of Rich.
+
+    The bot's worker threads call add_position / update / set_api_usage.
+    The Streamlit script reads state via snapshot() and renders a table.
+    """
+
+    def __init__(self, api_limit: int = 500):
+        self._lock = threading.Lock()
+        self._positions: dict[str, dict] = {}
+        self._api_used  = 0
+        self._api_limit = api_limit
+
+    # Same signatures as Dashboard so run_trade can use either
+    def add_position(self, order_id: str, ticker: str, outcome: str,
+                     contracts: int, yes_price_cents: int,
+                     fair_prob: float, edge: float):
+        with self._lock:
+            self._positions[order_id] = {
+                'ticker':      ticker,
+                'outcome':     outcome,
+                'contracts':   contracts,
+                'entry_price': yes_price_cents,
+                'market_ask':  None,
+                'fair_entry':  fair_prob,
+                'fair_last':   fair_prob,
+                'edge_last':   edge,
+                'status':      'resting',
+                'last_ping':   datetime.now().strftime('%H:%M:%S'),
+            }
+
+    def update(self, order_id: str, status: Optional[str] = None,
+               fair_prob: Optional[float] = None, edge: Optional[float] = None,
+               contracts: Optional[int] = None, market_ask: Optional[int] = None):
+        with self._lock:
+            pos = self._positions.get(order_id)
+            if pos is None:
+                return
+            if status is not None:     pos['status']     = status
+            if fair_prob is not None:
+                pos['fair_last']  = fair_prob
+                pos['last_ping']  = datetime.now().strftime('%H:%M:%S')
+            if edge is not None:       pos['edge_last']  = edge
+            if contracts is not None:  pos['contracts']  = contracts
+            if market_ask is not None: pos['market_ask'] = market_ask
+
+    def set_api_usage(self, used: int, remaining: int):
+        with self._lock:
+            self._api_used  = used
+            self._api_limit = used + remaining
+
+    def snapshot(self) -> dict:
+        """Return a deep-ish copy safe to render outside the lock."""
+        with self._lock:
+            return {
+                'positions': {k: dict(v) for k, v in self._positions.items()},
+                'api_used':  self._api_used,
+                'api_limit': self._api_limit,
+            }

@@ -5,7 +5,18 @@ SPORTS = list(str): theODDS group keys (see api_POC.ipynb cell 1. List In-Szn)
 SPORTS_CONFIG = dict(dict(event)): dictionaries host mapping of theODDS group keys to KALSHI Event Codes (Manual)
 """
 
-SPORTS = []
+SPORTS = [
+    "basketball_nba",              # NBA playoffs
+    "icehockey_nhl",               # NHL playoffs
+    "baseball_mlb",                # MLB regular season
+    "mma_mixed_martial_arts",      # year-round
+    "soccer_uefa_champs_league",   # semifinals
+    "soccer_uefa_europa_league",   # semifinals
+    "soccer_epl",                  # end of season
+    "soccer_italy_serie_a",        # end of season
+    "soccer_spain_la_liga",        # end of season
+    "soccer_usa_mls",              # active
+]
 
 # Month numbers (1=Jan…12=Dec) when each sport typically has games.
 # Used in the dashboard to show an in-season indicator per sport.

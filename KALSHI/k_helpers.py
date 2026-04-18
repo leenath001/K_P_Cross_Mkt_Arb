@@ -128,15 +128,53 @@ def _maker_ev(fair_prob: float, price: float, maker_fee: float) -> float:
     return fair_prob * (1 - price) * (1 - maker_fee) - (1 - fair_prob) * price
 
 
+def _match_event(group: pd.DataFrame, day_k: pd.DataFrame,
+                 threshold: float) -> Optional[str]:
+    """
+    Find the Kalshi `event_ticker` where ALL Pinnacle outcomes in `group`
+    match a market, i.e. every leg of the game lines up with the same Kalshi
+    event. Returns the event_ticker with the highest aggregate match score,
+    or None if no event passes.
+
+    This prevents mismatches where a single outcome fuzzy-matches a market
+    in the wrong Kalshi game on the same day.
+    """
+    outcomes = [str(o) for o in group['outcome'].tolist()]
+    best_ticker = None
+    best_total  = 0.0
+    for ev_ticker, ev_k in day_k.groupby('event_ticker'):
+        total = 0.0
+        passes = True
+        for outcome in outcomes:
+            _, score = _best_match(outcome, ev_k['yes_sub_title'])
+            if score < threshold:
+                passes = False
+                break
+            total += score
+        if passes and total > best_total:
+            best_total, best_ticker = total, ev_ticker
+    return best_ticker
+
+
 def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
-                fees: float = 0.07, maker_fees: float = 0.03) -> pd.DataFrame:
+                fees: float = 0.07, maker_fees: float = 0.03,
+                max_delta: float = 0.25) -> pd.DataFrame:
     """
     Takes a Pinnacle odds DataFrame and returns a merged DataFrame pairing each
     outcome row with its corresponding Kalshi market's bid/ask prices.
 
-    `fees`       — taker fee rate (7%). signal     = YES EV > 0 at taker rate.
-    `maker_fees` — maker fee rate (3%). signal_no  = NO EV > 0 at maker rate
-                   (resting NO buy at no_ask, using 1-fair_prob as NO probability).
+    `fees`       — taker fee rate. signal     = YES EV > 0 at taker rate.
+    `maker_fees` — maker fee rate. signal_no  = NO EV > 0 at maker rate.
+    `max_delta`  — drop signals where |fair_prob − price| exceeds this. A big
+                   delta is almost always a fuzzy-match failure, not real edge.
+                   Set to 1.0 to disable.
+
+    Match safety:
+      1. Event-level verification — every Pinnacle outcome in a game must
+         resolve to a market under the SAME Kalshi event_ticker. If any leg
+         fails, the whole event is dropped.
+      2. Delta sanity — signals with an unrealistically large gap between
+         fair_prob and the Kalshi price are flagged false.
     """
     pinnacle_df = df.copy()
 
@@ -158,23 +196,42 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
     # 3. Parse dates from event_ticker
     all_k['k_date'] = all_k['event_ticker'].apply(_parse_ticker_date)
 
-    # 4. Match each Pinnacle outcome to a Kalshi market
+    # 4. Match each Pinnacle outcome to a Kalshi market — event-locked
     rows = []
     for event_id, group in pinnacle_df.groupby('event_id'):
         sport     = group['sport'].iloc[0]
         series    = sport_to_series.get(sport)
         game_date = group['commence'].iloc[0].date()
 
-        # Filter by both date AND the correct series for this sport
         day_k = all_k[(all_k['k_date'] == game_date) & (all_k['series_ticker'] == series)]
         if day_k.empty:
             continue
 
+        # Event-level verification: pick the Kalshi event whose markets cover
+        # every Pinnacle outcome above threshold. If none pass, skip the game.
+        locked_event = _match_event(group, day_k, threshold)
+        if locked_event is None:
+            continue
+        event_k = day_k[day_k['event_ticker'] == locked_event]
+
         for _, p_row in group.iterrows():
-            idx, score = _best_match(p_row['outcome'], day_k['yes_sub_title'])
+            idx, score = _best_match(p_row['outcome'], event_k['yes_sub_title'])
             if score < threshold:
                 continue
-            k_row = day_k.loc[idx]
+            k_row = event_k.loc[idx]
+
+            # Sanity: a huge gap is a mismatch, not edge
+            yes_ask    = k_row['yes_ask']
+            no_ask     = k_row['no_ask']
+            delta_yes  = abs(p_row['fair_prob'] - yes_ask) if yes_ask is not None else 0
+            delta_no   = abs((1 - p_row['fair_prob']) - no_ask) if no_ask is not None else 0
+            mismatched = (delta_yes > max_delta) or (delta_no > max_delta)
+
+            signal    = (not mismatched and yes_ask is not None and
+                         _taker_ev(p_row['fair_prob'], yes_ask, fees) > 0)
+            signal_no = (not mismatched and no_ask is not None and
+                         _maker_ev(1 - p_row['fair_prob'], no_ask, maker_fees) > 0)
+
             rows.append({
                 'sport':          p_row['sport'],
                 'event_id':       event_id,
@@ -186,22 +243,19 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
                 'k_event_ticker': k_row['event_ticker'],
                 'k_ticker':       k_row['ticker'],
                 'yes_bid':        k_row['yes_bid'],
-                'yes_ask':        k_row['yes_ask'],
+                'yes_ask':        yes_ask,
                 'no_bid':         k_row['no_bid'],
-                'no_ask':         k_row['no_ask'],
+                'no_ask':         no_ask,
                 'volume':         k_row['volume'],
                 'OI':             k_row['open_int'],
                 'match_score':    round(score, 3),
-                'signal':         _taker_ev(p_row['fair_prob'], k_row['yes_ask'], fees) > 0,
-                # NO signal: Pinnacle implies event is LESS likely than Kalshi prices
-                # Resting NO buy at no_ask → maker fee (3%)
-                'signal_no':      (k_row['no_ask'] is not None and
-                                   _maker_ev(1 - p_row['fair_prob'], k_row['no_ask'], maker_fees) > 0),
+                'price_delta':    round(max(delta_yes, delta_no), 3),
+                'mismatched':     mismatched,
+                'signal':         signal,
+                'signal_no':      signal_no,
             })
 
     df = pd.DataFrame(rows)
-    # A single Kalshi market should never appear twice — drop dupes defensively
-    # (can occur if a sport key appears multiple times in config.SPORTS)
     df = df.drop_duplicates(subset='k_ticker')
     return df
     

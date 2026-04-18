@@ -22,8 +22,10 @@ import pandas as pd
 from rich.console import Console
 from KALSHI.k_helpers import kalshi_headers
 
-LOG_PATH = os.path.join(os.path.dirname(__file__), 'logs', 'trades.csv')
-BASE_URL  = 'https://api.elections.kalshi.com/trade-api/v2'
+LOG_DIR     = os.path.join(os.path.dirname(__file__), 'logs')
+LOG_PATH    = os.path.join(LOG_DIR, 'trades.csv')
+NO_LOG_PATH = os.path.join(LOG_DIR, 'no_trades.csv')
+BASE_URL    = 'https://api.elections.kalshi.com/trade-api/v2'
 
 console = Console()
 
@@ -49,43 +51,52 @@ def fetch_market_result(ticker: str) -> Optional[str]:
 
 
 def compute_pnl(result: str, contracts: int,
-                entry_price: float, fee_rate: float) -> float:
+                entry_price: float, fee_rate: float,
+                side: str = 'yes') -> float:
     """
-    WIN  (result='yes'): receive (1 - entry_price) per contract, minus fee on winnings.
-    LOSS (result='no') : lose entry_price per contract.
-    VOID               : stake returned, no gain or loss.
+    WIN  : receive (1 - entry_price) per contract, minus fee on winnings.
+    LOSS : lose entry_price per contract.
+    VOID : stake returned, no gain or loss.
+
+    For side='yes': WIN when Kalshi result='yes'.
+    For side='no' : WIN when Kalshi result='no'.
     """
-    if result == 'yes':
+    winning_result = 'no' if side == 'no' else 'yes'
+    losing_result  = 'yes' if side == 'no' else 'no'
+    if result == winning_result:
         return round(contracts * (1 - entry_price) * (1 - fee_rate), 4)
-    if result == 'no':
+    if result == losing_result:
         return round(-contracts * entry_price, 4)
     return 0.0   # void
 
 
-def run(dry_run: bool = False):
-    if not os.path.exists(LOG_PATH):
-        console.print('[yellow]No trade log found.[/yellow]')
-        return
+def _settle_file(path: str, side: str, dry_run: bool) -> int:
+    """Settle one log file. Returns number of rows updated."""
+    label = os.path.basename(path)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        console.print(f'[dim]{label}: no log[/dim]')
+        return 0
 
-    if os.path.getsize(LOG_PATH) == 0:
-        console.print('[green]No pending trades to settle.[/green]')
-        return
-
-    df = pd.read_csv(LOG_PATH)
+    df = pd.read_csv(path)
     pending = df[
         (df['result'] == 'PENDING') &
         (df['final_status'].isin(['executed', 'filled']))
     ]
 
     if pending.empty:
-        console.print('[green]No pending trades to settle.[/green]')
-        return
+        console.print(f'[dim]{label}: no pending trades[/dim]')
+        return 0
 
-    console.print(f'Checking [cyan]{len(pending)}[/cyan] pending trade(s)...\n')
+    console.print(f'\n[bold]{label}[/bold] ({side.upper()} side) — checking [cyan]{len(pending)}[/cyan] pending\n')
+
+    # For NO trades the winning Kalshi result is 'no', not 'yes'
+    win_result  = 'no' if side == 'no' else 'yes'
+    loss_result = 'yes' if side == 'no' else 'no'
+    label_map   = {win_result: 'WIN', loss_result: 'LOSS', 'void': 'VOID'}
 
     updates = 0
     for idx, row in pending.iterrows():
-        ticker  = row['k_ticker']
+        ticker = row['k_ticker']
         console.print(f'  {ticker}  {row["outcome"]}', end='  ')
 
         k_result = fetch_market_result(ticker)
@@ -94,11 +105,16 @@ def run(dry_run: bool = False):
             console.print('[dim]not settled yet[/dim]')
             continue
 
-        result_label = {'yes': 'WIN', 'no': 'LOSS', 'void': 'VOID'}[k_result]
+        if k_result not in label_map:
+            console.print(f'[yellow]unknown result={k_result!r} — skipping[/yellow]')
+            continue
+
+        result_label = label_map[k_result]
         pnl = compute_pnl(k_result,
                           int(row['contracts']),
                           float(row['entry_price']),
-                          float(row['fee_rate']))
+                          float(row['fee_rate']),
+                          side=side)
         pnl_c = 'green' if pnl >= 0 else 'red'
 
         console.print(
@@ -112,15 +128,20 @@ def run(dry_run: bool = False):
             df.at[idx, 'actual_pnl'] = pnl
         updates += 1
 
-    if updates == 0:
-        console.print('\n[yellow]No markets have settled yet.[/yellow]')
-        return
+    if updates and not dry_run:
+        df.to_csv(path, index=False)
+        console.print(f'[green]Updated {updates} row(s) in {label}[/green]')
+    elif updates:
+        console.print(f'[dim]{updates} row(s) would be updated (dry run)[/dim]')
+    return updates
 
-    if not dry_run:
-        df.to_csv(LOG_PATH, index=False)
-        console.print(f'\n[green]Updated {updates} row(s) in trades.csv[/green]')
-    else:
-        console.print(f'\n[dim]{updates} row(s) would be updated (dry run)[/dim]')
+
+def run(dry_run: bool = False):
+    total = 0
+    total += _settle_file(LOG_PATH,    side='yes', dry_run=dry_run)
+    total += _settle_file(NO_LOG_PATH, side='no',  dry_run=dry_run)
+    if total == 0:
+        console.print('\n[yellow]No markets have settled yet.[/yellow]')
 
 
 if __name__ == '__main__':
