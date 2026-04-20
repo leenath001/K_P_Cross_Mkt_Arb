@@ -203,11 +203,13 @@ def get_order_status(order_id: str) -> dict:
 
 def _recheck_signal(event_id: str, sport: str, outcome: str,
                     order_price: float, fee_rate: float,
-                    dashboard=None, order_id: Optional[str] = None) -> tuple:
+                    dashboard=None, order_id: Optional[str] = None,
+                    side: str = 'yes') -> tuple:
     """
-    Re-fetch Pinnacle odds and check if EV at the original order price
-    is still positive given the fee rate.
-    Returns (signal_valid, fresh_fair_prob).
+    Re-fetch Pinnacle odds and check if EV at the order price is still
+    positive. For side='no', the relevant probability is (1 − fair_prob)
+    and the price is a NO price — so we flip both inputs.
+    Returns (signal_valid, fresh_fair_prob_of_our_side).
     Conservative: any fetch error returns (False, None).
     """
     try:
@@ -224,13 +226,14 @@ def _recheck_signal(event_id: str, sport: str, outcome: str,
         if match.empty:
             return False, None
 
-        fresh_fair = float(match.iloc[0]['fair_prob'])
-        fresh_ev   = _ev(fresh_fair, order_price, fee_rate)
+        fresh_yes_fair = float(match.iloc[0]['fair_prob'])
+        our_fair       = (1 - fresh_yes_fair) if side == 'no' else fresh_yes_fair
+        fresh_ev       = _ev(our_fair, order_price, fee_rate)
 
         if dashboard is not None and order_id is not None:
-            dashboard.update(order_id, fair_prob=fresh_fair, edge=fresh_ev)
+            dashboard.update(order_id, fair_prob=our_fair, edge=fresh_ev)
 
-        return fresh_ev > 0, fresh_fair
+        return fresh_ev > 0, our_fair
     except Exception:
         return False, None
 
@@ -241,6 +244,7 @@ def _recheck_signal(event_id: str, sport: str, outcome: str,
 
 def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str,
              order_price: float, fee_rate: float, commence_utc: datetime,
+             side: str = 'yes',
              kalshi_poll: int = KALSHI_POLL,
              pinnacle_poll: int = PINNACLE_POLL,
              max_duration: int = MAX_DURATION,
@@ -309,7 +313,7 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
         if now - last_pinnacle >= pinnacle_poll:
             valid, _ = _recheck_signal(event_id, sport, outcome, order_price,
                                        fee_rate, dashboard=dashboard,
-                                       order_id=order_id)
+                                       order_id=order_id, side=side)
             last_pinnacle = time.time()
             if not valid:
                 cancel_order(order_id)
@@ -407,7 +411,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             order_id=order_id, ticker=ticker, event_id=event_id,
             sport=sport, outcome=outcome,
             order_price=order_price, fee_rate=fee_rate,
-            commence_utc=commence_utc,
+            commence_utc=commence_utc, side='no',
             max_duration=max_duration, pre_event_buffer=pre_event_buffer,
             dashboard=dashboard, stop_event=stop_event,
         )

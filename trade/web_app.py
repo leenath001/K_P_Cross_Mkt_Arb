@@ -72,7 +72,7 @@ with st.sidebar:
     used      = st.session_state.get('api_used',      0)
     remaining = st.session_state.get('api_remaining', 500)
     limit     = used + remaining
-    pct       = used / max(limit, 1)
+    pct       = min(max(used / max(limit, 1), 0.0), 1.0)
     st.progress(pct, text=f'{used} / {limit} requests used  ({remaining} remaining)')
     if pct >= 0.9:
         st.error('API quota nearly exhausted')
@@ -371,7 +371,7 @@ with tab_trade:
                     # API bar
                     au, al = snap['api_used'], snap['api_limit']
                     ar = max(al - au, 0)
-                    pct = au / max(al, 1)
+                    pct = min(max(au / max(al, 1), 0.0), 1.0)
                     st.progress(pct, text=f'API  {au} / {al} used  ({ar} remaining)')
 
                     if not thread.is_alive():
