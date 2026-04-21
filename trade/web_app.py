@@ -105,7 +105,8 @@ with st.sidebar:
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 
-tab_trade, tab_settle, tab_review = st.tabs(['Trade', 'Settle', 'Review'])
+tab_trade, tab_settle, tab_review, tab_nothing = st.tabs(
+    ['Trade', 'Settle', 'Review', 'Nothing'])
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — TRADE
@@ -699,3 +700,192 @@ with tab_review:
 
             except ImportError:
                 st.warning('Install matplotlib to see charts: `pip install matplotlib`')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 4 — NOTHING EVER HAPPENS
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab_nothing:
+    import nothing as _nothing
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    st.subheader('"Nothing Ever Happens" — NO-side event bot')
+    st.caption('Buys 1 NO contract per qualifying market. Caps total spend at '
+               'a fraction of Kalshi cash so the K/P bot keeps capital.')
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        series_raw = st.text_input('Kalshi series tickers (space-separated)',
+                                   key='nothing_series', placeholder='KXSERIES1 KXSERIES2')
+    with c2:
+        tickers_raw = st.text_input('Explicit market tickers (space-separated)',
+                                    key='nothing_tickers', placeholder='MKT-ABC MKT-DEF')
+    with c3:
+        budget_pct = st.slider('Budget % of Kalshi cash', 1, 50, 10,
+                               key='nothing_budget_pct') / 100
+
+    c4, c5, c6, c7 = st.columns(4)
+    with c4:
+        max_no_price = st.slider('Max NO price', 0.05, 0.95, 0.50, step=0.01,
+                                 key='nothing_max_no_price')
+    with c5:
+        ttl_min = st.number_input('TTL (min)', 5, 1440, 60,
+                                  key='nothing_ttl_min')
+    with c6:
+        rest_mode = st.toggle('Rest (maker, post_only)', value=False,
+                              key='nothing_rest')
+    with c7:
+        allow_multi = st.toggle('Allow multi-market events', value=False,
+                                key='nothing_multi')
+
+    series  = [s.strip() for s in series_raw.split()  if s.strip()]
+    tickers = [t.strip() for t in tickers_raw.split() if t.strip()]
+
+    preview_col, execute_col, cancel_col = st.columns(3)
+    preview = preview_col.button('Preview', key='nothing_preview',
+                                 use_container_width=True)
+    execute = execute_col.button('Execute (LIVE)', key='nothing_execute',
+                                 type='primary', use_container_width=True)
+    cancel  = cancel_col.button('Cancel all tracked', key='nothing_cancel',
+                                use_container_width=True)
+
+    if cancel:
+        with st.spinner('Canceling tracked orders...'):
+            try:
+                _nothing.cancel_all_tracked()
+                st.success('Cancel pass complete — check stdout.')
+            except Exception as exc:
+                st.error(f'Cancel failed: {exc}')
+
+    if (preview or execute) and not (series or tickers):
+        st.warning('Enter at least one series or ticker.')
+
+    if (preview or execute) and (series or tickers):
+        with st.spinner('Fetching markets...'):
+            markets = []
+            for s in series:
+                if s in _nothing.SPORTS_SERIES:
+                    st.warning(f'Skipping {s} — sports series blocklisted')
+                    continue
+                try:
+                    fetched = _nothing.fetch_series_markets(s)
+                    for m in fetched:
+                        m['_series'] = s
+                    markets.extend(fetched)
+                except Exception as exc:
+                    st.error(f'{s}: {exc}')
+            for t in tickers:
+                m = _nothing.fetch_ticker(t)
+                if m is None:
+                    st.warning(f'{t} — not found')
+                    continue
+                m['_series'] = (m.get('event_ticker') or '').split('-')[0]
+                markets.append(m)
+
+        kept = _nothing.filter_markets(markets, max_no_price=max_no_price,
+                                       single_event_only=not allow_multi)
+        st.caption(f'fetched={len(markets)} · kept={len(kept)} · '
+                   f'single_event={not allow_multi}')
+
+        # Resolve budget
+        try:
+            cash = _nothing.get_balance()
+        except Exception as exc:
+            st.error(f'Balance fetch failed: {exc}')
+            cash = 0.0
+        budget = round(cash * budget_pct, 2)
+        st.metric('Budget',
+                  f'${budget:.2f}',
+                  delta=f'{budget_pct*100:.0f}% of ${cash:.2f} cash')
+
+        plans, skipped = _nothing.size_one_each(kept, budget, rest=rest_mode)
+        if not plans:
+            st.info('No plans — budget cannot afford a single contract.')
+        else:
+            total_cost = sum(n * (c / 100) for _, n, c, _ in plans)
+            fee_rate   = _nothing.MAKER_FEE if rest_mode else _nothing.TAKER_FEE
+
+            plan_rows = []
+            for m, n, cents, mode in plans:
+                entry_p = cents / 100
+                plan_rows.append({
+                    'ticker':      m['ticker'],
+                    'title':       (m.get('title') or '')[:60],
+                    'mode':        mode,
+                    'no_price':    f'{cents}¢',
+                    'contracts':   n,
+                    'cost':        round(n * entry_p, 2),
+                    'max_payout':  round(n * (1 - entry_p) * (1 - fee_rate), 2),
+                    'event':       m.get('event_ticker', ''),
+                })
+            st.dataframe(pd.DataFrame(plan_rows), use_container_width=True,
+                         hide_index=True)
+            st.caption(f'{len(plans)} position(s) · est cost ${total_cost:.2f} · '
+                       f'skipped {len(skipped)} over budget · '
+                       f'mode = {"REST" if rest_mode else "CROSS"}')
+
+            if execute:
+                st.warning('Placing live orders...')
+                expiry_ts = int((_dt.now(_tz.utc) + _td(minutes=int(ttl_min))).timestamp())
+                placed, errored = [], []
+                progress = st.progress(0.0)
+                status_placeholder = st.empty()
+
+                for i, (m, n, cents, mode) in enumerate(plans, start=1):
+                    try:
+                        order = _nothing.place_no_order(
+                            m['ticker'], cents, n, mode, expiry_ts)
+                        oid    = order.get('order_id')
+                        status = order.get('status', 'unknown')
+                        entry  = cents / 100
+                        _nothing.log_trade({
+                            'logged_at':         _dt.now(_tz.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+                            'order_id':          oid,
+                            'series_ticker':     m.get('_series', ''),
+                            'event_ticker':      m.get('event_ticker', ''),
+                            'k_ticker':          m['ticker'],
+                            'title':             (m.get('title') or '')[:120],
+                            'mode':              mode,
+                            'entry_price':       entry,
+                            'entry_price_cents': cents,
+                            'fee_rate':          fee_rate,
+                            'contracts':         n,
+                            'total_cost':        round(n * entry, 4),
+                            'max_payout':        round(n * (1 - entry) * (1 - fee_rate), 4),
+                            'expires_at':        _dt.fromtimestamp(expiry_ts, tz=_tz.utc).isoformat(),
+                            'final_status':      status,
+                            'close_reason':      '',
+                            'result':            'PENDING',
+                            'actual_pnl':        '',
+                        })
+                        placed.append({'ticker': m['ticker'], 'status': status,
+                                       'order_id': oid, 'contracts': n,
+                                       'price': cents})
+                    except Exception as exc:
+                        errored.append({'ticker': m['ticker'], 'error': str(exc)})
+                    progress.progress(i / len(plans))
+                    status_placeholder.write(
+                        f'Placed {len(placed)} · errors {len(errored)} · {i}/{len(plans)}')
+
+                st.success(f'Done — placed {len(placed)}, errors {len(errored)}')
+                if placed:
+                    st.dataframe(pd.DataFrame(placed), use_container_width=True,
+                                 hide_index=True)
+                if errored:
+                    st.error('Errors:')
+                    st.dataframe(pd.DataFrame(errored), use_container_width=True,
+                                 hide_index=True)
+
+    # ── Log viewer ──────────────────────────────────────────────────────────
+    st.divider()
+    st.caption(f'Log: `{_nothing.LOG_PATH}`')
+    try:
+        if os.path.exists(_nothing.LOG_PATH) and os.path.getsize(_nothing.LOG_PATH) > 0:
+            log_df = pd.read_csv(_nothing.LOG_PATH)
+            st.dataframe(log_df.tail(50), use_container_width=True, hide_index=True)
+            st.caption(f'{len(log_df)} total rows · showing last 50')
+        else:
+            st.caption('No trades logged yet.')
+    except Exception as exc:
+        st.error(f'Failed to read log: {exc}')
