@@ -23,6 +23,7 @@ NOTHING_SERIES = [
     ('KXEARNINGSMENTIONUBER', 'Uber earnings mentions',    'mentions'),
     ('KXEARNINGSMENTIONLYFT', 'Lyft earnings mentions',    'mentions'),
     ('KXEARNINGSMENTIONABNB', 'ABNB earnings mentions',    'mentions'),
+    ('KXFEDMENTION', 'Fed meeting mentions', 'mentions')
 
     # Candidates worth evaluating but not added by default:
     # ('KXLABORANNOUNCE',     'Trump Labor Sec announce',  'politics'),  # time-bucket
