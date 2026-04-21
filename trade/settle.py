@@ -22,12 +22,74 @@ import pandas as pd
 from rich.console import Console
 from KALSHI.k_helpers import kalshi_headers
 
-LOG_DIR     = os.path.join(os.path.dirname(__file__), 'logs')
-LOG_PATH    = os.path.join(LOG_DIR, 'trades.csv')
-NO_LOG_PATH = os.path.join(LOG_DIR, 'no_trades.csv')
+LOG_DIR          = os.path.join(os.path.dirname(__file__), 'logs')
+LOG_PATH         = os.path.join(LOG_DIR, 'trades.csv')
+NO_LOG_PATH      = os.path.join(LOG_DIR, 'no_trades.csv')
+NOTHING_LOG_PATH = os.path.join(LOG_DIR, 'nothing_trades.csv')
 BASE_URL    = 'https://api.elections.kalshi.com/trade-api/v2'
 
 console = Console()
+
+
+TERMINAL_ORDER_STATUSES = {'executed', 'filled', 'canceled', 'expired'}
+
+
+def fetch_order_status(order_id: str) -> Optional[dict]:
+    """Fetch one order directly. Returns the order dict or None on error."""
+    path = f'/trade-api/v2/portfolio/orders/{order_id}'
+    resp = requests.get(f'{BASE_URL}/portfolio/orders/{order_id}',
+                        headers=kalshi_headers('GET', path))
+    if resp.ok:
+        return resp.json().get('order', {})
+    return None
+
+
+def refresh_statuses(path: str) -> int:
+    """
+    For every row with a non-terminal `final_status`, re-query Kalshi by
+    order_id and update `final_status` + `contracts` (filled count) in place.
+    Returns the number of rows updated.
+    """
+    label = os.path.basename(path)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return 0
+    df = pd.read_csv(path)
+    if df.empty or 'order_id' not in df.columns or 'final_status' not in df.columns:
+        return 0
+
+    mask = (
+        df['order_id'].fillna('').ne('') &
+        ~df['final_status'].fillna('').str.lower().isin(TERMINAL_ORDER_STATUSES)
+    )
+    stale = df[mask]
+    if stale.empty:
+        return 0
+
+    console.print(f'  [dim]{label}[/dim]: refreshing {len(stale)} non-terminal row(s)')
+    updated = 0
+    for idx, row in stale.iterrows():
+        order = fetch_order_status(row['order_id'])
+        if not order:
+            continue
+        new_status = order.get('status', '')
+        if not new_status or new_status == row['final_status']:
+            continue
+        df.at[idx, 'final_status'] = new_status
+        # Update filled count if Kalshi reports a remaining_count
+        remaining = order.get('remaining_count_fp') or order.get('remaining_count')
+        if remaining is not None:
+            try:
+                original = int(row.get('contracts', 0))
+                filled   = max(original - int(float(remaining)), 0)
+                df.at[idx, 'contracts'] = filled
+            except Exception:
+                pass
+        updated += 1
+
+    if updated:
+        df.to_csv(path, index=False)
+        console.print(f'  [green]{label}: updated {updated} row(s)[/green]')
+    return updated
 
 
 def fetch_market_result(ticker: str) -> Optional[str]:
@@ -97,7 +159,8 @@ def _settle_file(path: str, side: str, dry_run: bool) -> int:
     updates = 0
     for idx, row in pending.iterrows():
         ticker = row['k_ticker']
-        console.print(f'  {ticker}  {row["outcome"]}', end='  ')
+        desc   = row.get('outcome') if 'outcome' in row.index else row.get('title', '')
+        console.print(f'  {ticker}  {desc}', end='  ')
 
         k_result = fetch_market_result(ticker)
 
@@ -137,9 +200,18 @@ def _settle_file(path: str, side: str, dry_run: bool) -> int:
 
 
 def run(dry_run: bool = False):
+    # First, refresh any stale final_status/contracts by re-querying Kalshi.
+    # This catches orders that filled after the bot exited and never wrote back.
+    if not dry_run:
+        console.print('[bold]Refreshing order statuses from Kalshi...[/bold]')
+        refresh_statuses(LOG_PATH)
+        refresh_statuses(NO_LOG_PATH)
+        refresh_statuses(NOTHING_LOG_PATH)
+
     total = 0
-    total += _settle_file(LOG_PATH,    side='yes', dry_run=dry_run)
-    total += _settle_file(NO_LOG_PATH, side='no',  dry_run=dry_run)
+    total += _settle_file(LOG_PATH,         side='yes', dry_run=dry_run)
+    total += _settle_file(NO_LOG_PATH,      side='no',  dry_run=dry_run)
+    total += _settle_file(NOTHING_LOG_PATH, side='no',  dry_run=dry_run)
     if total == 0:
         console.print('\n[yellow]No markets have settled yet.[/yellow]')
 

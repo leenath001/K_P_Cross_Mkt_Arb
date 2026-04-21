@@ -569,7 +569,13 @@ with tab_review:
     if log_df2.empty:
         st.info('No trade log found yet.')
     else:
-        filled  = log_df2[log_df2['final_status'].isin(['executed', 'filled'])]
+        # Hide canceled / expired / resting rows AND anything closed via
+        # user_canceled reason — these aren't real completed trades for stats.
+        _reason = log_df2['close_reason'].fillna('') if 'close_reason' in log_df2.columns else ''
+        filled  = log_df2[
+            log_df2['final_status'].isin(['executed', 'filled']) &
+            ~_reason.str.contains('canceled|cancelled|user_', case=False, regex=True)
+        ]
         settled = filled[filled['result'].isin(['WIN', 'LOSS'])].copy()
         settled['actual_pnl'] = pd.to_numeric(settled['actual_pnl'], errors='coerce')
 
@@ -708,38 +714,61 @@ with tab_review:
 
 with tab_nothing:
     import nothing as _nothing
+    from nothing_config import NOTHING_SERIES as _NOTHING_SERIES
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
 
     st.subheader('"Nothing Ever Happens" — NO-side event bot')
     st.caption('Buys 1 NO contract per qualifying market. Caps total spend at '
                'a fraction of Kalshi cash so the K/P bot keeps capital.')
 
+    # Curated list from nothing_config.py — pre-selected by default
+    _series_options = {
+        f'{ticker}  —  {label}  ({cat})': ticker
+        for ticker, label, cat in _NOTHING_SERIES
+    }
+    selected_labels = st.multiselect(
+        'Series (curated list — edit trade/nothing_config.py to add/remove)',
+        options=list(_series_options.keys()),
+        default=list(_series_options.keys()),
+        key='nothing_series_select',
+    )
+    selected_series = [_series_options[lbl] for lbl in selected_labels]
+
     c1, c2, c3 = st.columns(3)
     with c1:
-        series_raw = st.text_input('Kalshi series tickers (space-separated)',
-                                   key='nothing_series', placeholder='KXSERIES1 KXSERIES2')
+        extra_series_raw = st.text_input('Extra series (optional)',
+                                         key='nothing_extra_series',
+                                         placeholder='KXEXTRASERIES')
     with c2:
-        tickers_raw = st.text_input('Explicit market tickers (space-separated)',
-                                    key='nothing_tickers', placeholder='MKT-ABC MKT-DEF')
+        tickers_raw = st.text_input('Explicit market tickers (optional)',
+                                    key='nothing_tickers',
+                                    placeholder='MKT-ABC MKT-DEF')
     with c3:
         budget_pct = st.slider('Budget % of Kalshi cash', 1, 50, 10,
                                key='nothing_budget_pct') / 100
 
-    c4, c5, c6, c7 = st.columns(4)
+    c4, c5, c6, c7, c8 = st.columns(5)
     with c4:
         max_no_price = st.slider('Max NO price', 0.05, 0.95, 0.50, step=0.01,
                                  key='nothing_max_no_price')
     with c5:
-        ttl_min = st.number_input('TTL (min)', 5, 1440, 60,
-                                  key='nothing_ttl_min')
+        ttl_min = st.number_input('TTL (min)', 5, 1440, 30,
+                                  key='nothing_ttl_min',
+                                  help='Cancel unfilled orders after this many minutes (or when market closes)')
     with c6:
-        rest_mode = st.toggle('Rest (maker, post_only)', value=False,
-                              key='nothing_rest')
+        rest_mode = st.toggle('Rest (maker)', value=False,
+                              key='nothing_rest',
+                              help='Off = cross at no_ask (taker). On = rest at no_ask−1¢ post_only (maker)')
     with c7:
-        allow_multi = st.toggle('Allow multi-market events', value=False,
-                                key='nothing_multi')
+        dynamic_size = st.toggle('Dynamic sizing', value=False,
+                                 key='nothing_dynamic',
+                                 help='Off = 1 contract per market. On = partial Kelly (1–5 contracts) — more when NO is cheap.')
+    with c8:
+        allow_multi = st.toggle('Allow mutex events', value=False,
+                                key='nothing_multi',
+                                help='Off = drop A-vs-B events where yes-asks sum to ~1.0')
 
-    series  = [s.strip() for s in series_raw.split()  if s.strip()]
+    series  = selected_series + [s.strip() for s in extra_series_raw.split() if s.strip()]
     tickers = [t.strip() for t in tickers_raw.split() if t.strip()]
 
     preview_col, execute_col, cancel_col = st.columns(3)
@@ -784,9 +813,21 @@ with tab_nothing:
                 markets.append(m)
 
         kept = _nothing.filter_markets(markets, max_no_price=max_no_price,
-                                       single_event_only=not allow_multi)
-        st.caption(f'fetched={len(markets)} · kept={len(kept)} · '
-                   f'single_event={not allow_multi}')
+                                       mutually_exclusive_only_filter=not allow_multi)
+
+        # Dedup: drop tickers already sitting in nothing_trades.csv as open/pending
+        existing = _nothing.already_bet_tickers()
+        dropped_existing = 0
+        if existing:
+            before = len(kept)
+            kept = [m for m in kept if m['ticker'] not in existing]
+            dropped_existing = before - len(kept)
+
+        cap = (f'fetched={len(markets)} · kept={len(kept)} · '
+               f'single_event={not allow_multi}')
+        if dropped_existing:
+            cap += f' · deduped={dropped_existing} (already open)'
+        st.caption(cap)
 
         # Resolve budget
         try:
@@ -799,11 +840,13 @@ with tab_nothing:
                   f'${budget:.2f}',
                   delta=f'{budget_pct*100:.0f}% of ${cash:.2f} cash')
 
-        plans, skipped = _nothing.size_one_each(kept, budget, rest=rest_mode)
+        plans, skipped = _nothing.plan_contracts(kept, budget, rest=rest_mode,
+                                                 dynamic=dynamic_size)
         if not plans:
             st.info('No plans — budget cannot afford a single contract.')
         else:
             total_cost = sum(n * (c / 100) for _, n, c, _ in plans)
+            total_cts  = sum(n for _, n, _, _ in plans)
             fee_rate   = _nothing.MAKER_FEE if rest_mode else _nothing.TAKER_FEE
 
             plan_rows = []
@@ -821,14 +864,16 @@ with tab_nothing:
                 })
             st.dataframe(pd.DataFrame(plan_rows), use_container_width=True,
                          hide_index=True)
-            st.caption(f'{len(plans)} position(s) · est cost ${total_cost:.2f} · '
-                       f'skipped {len(skipped)} over budget · '
-                       f'mode = {"REST" if rest_mode else "CROSS"}')
+            st.caption(f'{len(plans)} market(s) · {total_cts} contracts · '
+                       f'est cost ${total_cost:.2f} · skipped {len(skipped)} over budget · '
+                       f'mode = {"REST" if rest_mode else "CROSS"} · '
+                       f'sizing = {"DYNAMIC" if dynamic_size else "EQUAL"}')
 
             if execute:
                 st.warning('Placing live orders...')
                 expiry_ts = int((_dt.now(_tz.utc) + _td(minutes=int(ttl_min))).timestamp())
-                placed, errored = [], []
+                placed_tracked = []  # feeds the monitor thread
+                errored = []
                 progress = st.progress(0.0)
                 status_placeholder = st.empty()
 
@@ -859,23 +904,123 @@ with tab_nothing:
                             'result':            'PENDING',
                             'actual_pnl':        '',
                         })
-                        placed.append({'ticker': m['ticker'], 'status': status,
-                                       'order_id': oid, 'contracts': n,
-                                       'price': cents})
+
+                        close_time = None
+                        ct_raw = m.get('close_time')
+                        if ct_raw:
+                            try:
+                                close_time = _dt.fromisoformat(
+                                    str(ct_raw).replace('Z', '+00:00'))
+                            except Exception:
+                                close_time = None
+
+                        if oid:
+                            placed_tracked.append({
+                                'order_id':    oid,
+                                'ticker':      m['ticker'],
+                                'title':       (m.get('title') or '')[:60],
+                                'contracts':   n,
+                                'entry_cents': cents,
+                                'close_time':  close_time,
+                            })
                     except Exception as exc:
                         errored.append({'ticker': m['ticker'], 'error': str(exc)})
                     progress.progress(i / len(plans))
                     status_placeholder.write(
-                        f'Placed {len(placed)} · errors {len(errored)} · {i}/{len(plans)}')
+                        f'Placed {len(placed_tracked)} · errors {len(errored)} · '
+                        f'{i}/{len(plans)}')
 
-                st.success(f'Done — placed {len(placed)}, errors {len(errored)}')
-                if placed:
-                    st.dataframe(pd.DataFrame(placed), use_container_width=True,
-                                 hide_index=True)
+                st.success(f'Placed {len(placed_tracked)}, errors {len(errored)}')
                 if errored:
                     st.error('Errors:')
                     st.dataframe(pd.DataFrame(errored), use_container_width=True,
                                  hide_index=True)
+
+                # ── Kick off live monitor ───────────────────────────────────
+                if placed_tracked:
+                    state      = {}
+                    stop_event = threading.Event()
+                    ttl_sec    = int(ttl_min) * 60
+
+                    def _monitor_worker(tracked=placed_tracked, state=state,
+                                        stop=stop_event, ttl=ttl_sec):
+                        try:
+                            _nothing.monitor_orders(tracked, stop, state,
+                                                    ttl_seconds=ttl,
+                                                    poll_seconds=10,
+                                                    close_buffer_seconds=300)
+                        except Exception as exc:
+                            state['_error'] = str(exc)
+
+                    t = threading.Thread(target=_monitor_worker, daemon=True)
+                    t.start()
+                    st.session_state['_nothing_thread'] = t
+                    st.session_state['_nothing_state']  = state
+                    st.session_state['_nothing_stop']   = stop_event
+                    st.rerun()
+
+    # ── Live monitor dashboard ──────────────────────────────────────────────
+    if '_nothing_thread' in st.session_state:
+        _n_thread = st.session_state['_nothing_thread']
+        _n_state  = st.session_state['_nothing_state']
+        _n_stop   = st.session_state['_nothing_stop']
+        _alive    = _n_thread.is_alive()
+
+        @st.fragment(run_every='2s' if _alive else None)
+        def _nothing_live():
+            hc1, hc2 = st.columns([4, 1])
+            hc1.markdown('#### Live Nothing Dashboard')
+            if _n_thread.is_alive():
+                if hc2.button('🛑 Cancel ALL orders', key='_nothing_live_cancel',
+                              type='primary', use_container_width=True):
+                    _n_stop.set()
+                    st.warning('Cancel requested — monitor will kill all open orders.')
+
+            if '_error' in _n_state:
+                st.error(f'Monitor error: {_n_state["_error"]}')
+
+            lock = _n_state.get('_lock')
+            snapshot = {}
+            if lock:
+                with lock:
+                    snapshot = {k: dict(v) for k, v in _n_state.items()
+                                if not k.startswith('_')}
+
+            if snapshot:
+                rows = []
+                for oid, rec in snapshot.items():
+                    rows.append({
+                        'Ticker':    rec.get('ticker', ''),
+                        'Title':     rec.get('title', ''),
+                        'Contracts': rec.get('contracts', 0),
+                        'Filled':    rec.get('filled', 0),
+                        'Remaining': rec.get('remaining', 0),
+                        'Price ¢':   rec.get('entry_cents', 0),
+                        'Status':    rec.get('status', 'unknown'),
+                        'Reason':    rec.get('reason', ''),
+                        'Elapsed':   f"{rec.get('elapsed', 0)}s",
+                        'Last ping': rec.get('last_ping', ''),
+                    })
+                st.dataframe(pd.DataFrame(rows),
+                             use_container_width=True, hide_index=True)
+                filled_ct  = sum(1 for r in snapshot.values()
+                                 if r.get('status') in ('executed', 'filled'))
+                resting_ct = sum(1 for r in snapshot.values()
+                                 if r.get('status') == 'resting')
+                st.caption(f'{filled_ct} filled · {resting_ct} resting · '
+                           f'{len(snapshot)} tracked · poll=10s · '
+                           f'TTL={int(ttl_min)}min')
+            else:
+                st.caption('Monitor starting — waiting for first poll...')
+
+            if not _n_thread.is_alive():
+                st.success('Monitor complete — all orders resolved or canceled.')
+
+        _nothing_live()
+
+        if not _alive:
+            for k in ('_nothing_thread', '_nothing_state', '_nothing_stop'):
+                st.session_state.pop(k, None)
 
     # ── Log viewer ──────────────────────────────────────────────────────────
     st.divider()
