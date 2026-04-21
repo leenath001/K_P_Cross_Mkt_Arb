@@ -273,12 +273,20 @@ with tab_trade:
             n_approved       = int(approved_mask.sum())
 
             # limit_only is a YES-only option — NO always rests
-            if side == 'yes':
-                limit_only = st.checkbox('Limit orders only (never cross book)', value=False)
-                st.caption(f'{n_approved} YES signal(s) selected — will cross at `yes_ask` or rest at `yes_bid+1¢`')
-            else:
-                limit_only = False
-                st.caption(f'{n_approved} NO signal(s) selected — will rest at `no_ask − 1¢` (maker fee {maker_fee*100:.0f}%)')
+            _opt_c1, _opt_c2 = st.columns([2, 1])
+            with _opt_c1:
+                if side == 'yes':
+                    limit_only = st.checkbox('Limit orders only (never cross book)', value=False)
+                    st.caption(f'{n_approved} YES signal(s) selected — will cross at `yes_ask` or rest at `yes_bid+1¢`')
+                else:
+                    limit_only = False
+                    st.caption(f'{n_approved} NO signal(s) selected — will rest at `no_ask − 1¢` (maker fee {maker_fee*100:.0f}%)')
+            with _opt_c2:
+                trade_ttl_min = st.number_input(
+                    'Order TTL (min)', min_value=1, max_value=1440, value=30,
+                    key='trade_ttl_min',
+                    help='Cancel unfilled orders after this many minutes'
+                )
 
             btn_label  = f'Execute {n_approved} {side.upper()} Signal(s)'
             thread_key = '_trade_thread'
@@ -299,12 +307,14 @@ with tab_trade:
                     def _worker(approved=approved_signals.copy(),
                                 bk=balance, tf=taker_fee, mf=maker_fee,
                                 lo=limit_only, s=side,
+                                ttl=int(trade_ttl_min) * 60,
                                 d=dash, rh=results_holder, se=stop_event):
                         try:
                             out = run_all_signals(
                                 approved, bankroll=bk,
                                 taker_fee=tf, maker_fee=mf,
                                 limit_only=lo, side=s,
+                                max_duration=ttl,
                                 dashboard=d, stop_event=se,
                             )
                             rh.extend(out or [])
@@ -1021,6 +1031,64 @@ with tab_nothing:
         if not _alive:
             for k in ('_nothing_thread', '_nothing_state', '_nothing_stop'):
                 st.session_state.pop(k, None)
+
+    # ── Performance metrics ─────────────────────────────────────────────────
+    st.divider()
+    st.markdown('#### Nothing Bot Performance')
+    try:
+        if os.path.exists(_nothing.LOG_PATH) and os.path.getsize(_nothing.LOG_PATH) > 0:
+            _nlog = pd.read_csv(_nothing.LOG_PATH)
+            _nlog['actual_pnl'] = pd.to_numeric(_nlog['actual_pnl'], errors='coerce')
+
+            _filled   = _nlog[_nlog['final_status'].isin(['executed', 'filled'])]
+            _settled  = _filled[_filled['result'].isin(['WIN', 'LOSS', 'VOID'])]
+            _wins     = _settled[_settled['result'] == 'WIN']
+            _losses   = _settled[_settled['result'] == 'LOSS']
+            _pending  = _filled[_filled['result'] == 'PENDING']
+            _win_rate = len(_wins) / len(_settled) if len(_settled) > 0 else None
+            _pnl      = _settled['actual_pnl'].sum()
+            _wagered  = _filled['total_cost'].sum() if 'total_cost' in _filled.columns else 0
+            _avg_pnl  = _settled['actual_pnl'].mean() if not _settled.empty else None
+            _roi      = (_pnl / _wagered) if _wagered > 0 else None
+
+            _mc1, _mc2, _mc3, _mc4, _mc5 = st.columns(5)
+            _mc1.metric('Bets placed',   len(_nlog))
+            _mc2.metric('Filled',        len(_filled))
+            _mc3.metric('Settled',       len(_settled))
+            _mc4.metric('Pending',       len(_pending))
+            _mc5.metric('Win rate',
+                        f'{_win_rate:.0%}' if _win_rate is not None else '—')
+
+            _mc6, _mc7, _mc8, _mc9, _mc10 = st.columns(5)
+            _mc6.metric('Wins',          len(_wins))
+            _mc7.metric('Losses',        len(_losses))
+            _mc8.metric('Total PnL',     f'${_pnl:+.2f}',
+                        delta_color='normal' if _pnl >= 0 else 'inverse')
+            _mc9.metric('Total wagered', f'${_wagered:.2f}')
+            _mc10.metric('ROI',
+                         f'{_roi:.1%}' if _roi is not None else '—',
+                         delta_color='normal' if (_roi or 0) >= 0 else 'inverse')
+
+            # Series breakdown
+            if not _settled.empty and 'series_ticker' in _settled.columns:
+                with st.expander('Breakdown by series'):
+                    _by_series = (
+                        _settled.groupby('series_ticker')
+                        .agg(
+                            bets=('result', 'count'),
+                            wins=('result', lambda x: (x == 'WIN').sum()),
+                            pnl=('actual_pnl', 'sum'),
+                        )
+                        .assign(win_rate=lambda d: d['wins'] / d['bets'])
+                        .reset_index()
+                    )
+                    _by_series['win_rate'] = _by_series['win_rate'].map('{:.0%}'.format)
+                    _by_series['pnl']      = _by_series['pnl'].map('${:+.2f}'.format)
+                    st.dataframe(_by_series, use_container_width=True, hide_index=True)
+        else:
+            st.caption('No trades logged yet.')
+    except Exception as exc:
+        st.error(f'Metrics error: {exc}')
 
     # ── Log viewer ──────────────────────────────────────────────────────────
     st.divider()

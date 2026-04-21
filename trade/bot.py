@@ -574,6 +574,7 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
                     maker_fee: float = MAKER_FEE,
                     limit_only: bool = False,
                     side: str = 'yes',
+                    max_duration: int = MAX_DURATION,
                     dashboard=None,
                     stop_event: Optional[threading.Event] = None) -> list:
     """
@@ -602,6 +603,7 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
             result = run_trade(row, bankroll=bankroll,
                                taker_fee=taker_fee, maker_fee=maker_fee,
                                limit_only=limit_only, side=side,
+                               max_duration=max_duration,
                                dashboard=dashboard, stop_event=stop_event,
                                order_registry=order_registry)
         except Exception as exc:
