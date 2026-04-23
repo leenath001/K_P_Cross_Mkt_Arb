@@ -18,7 +18,7 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from KALSHI.k_helpers import kalshi_headers
 from theODDS.p_helpers import pinnacle_odds, get_api_usage
-from logger import log_trade
+from logger import log_trade, LOG_PATH, NO_LOG_PATH
 
 BASE_URL          = 'https://api.elections.kalshi.com/trade-api/v2'
 TAKER_FEE         = 0.07   # 7% of winnings — fee when crossing the book
@@ -583,6 +583,28 @@ def _force_cancel_all(order_ids: list) -> int:
     return canceled
 
 
+def already_bet_tickers() -> set:
+    """
+    Tickers with an open or pending position across both log files.
+    Blocks re-trading any ticker where result=PENDING and the order is
+    still active (resting / executed / filled).
+    Canceled/expired rows and settled WIN/LOSS rows are not blocked.
+    """
+    import csv as _csv
+    blocked = set()
+    for path in (LOG_PATH, NO_LOG_PATH):
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            continue
+        with open(path, newline='') as f:
+            for row in _csv.DictReader(f):
+                if (row.get('result') == 'PENDING' and
+                        row.get('final_status', '') in ('resting', 'executed', 'filled')):
+                    ticker = row.get('k_ticker') or row.get('ticker', '')
+                    if ticker:
+                        blocked.add(ticker)
+    return blocked
+
+
 def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
                     taker_fee: float = TAKER_FEE,
                     maker_fee: float = MAKER_FEE,
@@ -605,6 +627,15 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
     active = (signals_df[signals_df.get(signal_col, signals_df['signal'])]
               .drop_duplicates(subset='k_ticker')
               .copy())
+
+    # Drop tickers with existing open/pending positions (dedup across runs)
+    _open = already_bet_tickers()
+    if _open:
+        before = len(active)
+        active = active[~active['k_ticker'].isin(_open)].copy()
+        dropped = before - len(active)
+        if dropped:
+            print(f'  [dedup] Skipped {dropped} ticker(s) with existing open positions')
 
     # Owned by run_all_signals — every order this run places gets tracked here
     if stop_event is None:

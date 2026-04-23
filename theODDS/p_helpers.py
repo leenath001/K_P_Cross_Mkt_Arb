@@ -49,6 +49,41 @@ def fetch_usage() -> tuple:
         _active_sports[entry['key']] = bool(entry.get('active', False))
     return used, remaining
 
+
+def check_sports_with_events(sport_keys: list, hrs: int) -> dict:
+    """
+    For each sport key, query the /v4/sports/{sport}/events endpoint to check
+    whether Pinnacle actually has events in the next `hrs` hours.
+    Returns {sport_key: event_count}. Costs 1 API credit per sport.
+    Sports missing from the response or raising errors get count=0.
+    """
+    now_utc = datetime.now(timezone.utc)
+    soon    = now_utc + timedelta(hours=hrs)
+    t_from  = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    t_to    = soon.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    counts = {}
+    for key in sport_keys:
+        try:
+            resp = requests.get(
+                f'{BASE_URL}/sports/{key}/events',
+                params={
+                    'apiKey':            API_KEY,
+                    'commenceTimeFrom':  t_from,
+                    'commenceTimeTo':    t_to,
+                },
+                timeout=10,
+            )
+            if resp.ok:
+                _api_usage['used']      = int(resp.headers.get('x-requests-used',      _api_usage['used']))
+                _api_usage['remaining'] = int(resp.headers.get('x-requests-remaining',  _api_usage['remaining']))
+                counts[key] = len(resp.json()) if isinstance(resp.json(), list) else 0
+            else:
+                counts[key] = 0
+        except Exception:
+            counts[key] = 0
+    return counts
+
 def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFrame:
     """
     sport: americanfootball_ncaaf, basketball_nba, basketball_ncaab (see 1. List In-Season Sports)

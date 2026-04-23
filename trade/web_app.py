@@ -16,14 +16,17 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import config
-from theODDS.p_helpers import pinnacle_odds, fetch_usage, get_api_usage
+from theODDS.p_helpers import pinnacle_odds, fetch_usage, get_api_usage, get_active_sports, check_sports_with_events
 from KALSHI.k_helpers   import kalshi_odds
 from bot                import get_balance, run_all_signals
 from dashboard          import StreamlitDashboard
 from settle             import fetch_market_result, compute_pnl
 
 def _in_season(key: str) -> bool:
-    """True if the sport is currently in season per config.SEASON_MONTHS."""
+    if st.session_state.get('active_sports_ok'):
+        # API call succeeded — missing key means no events, don't fall back
+        return st.session_state.get('active_sports', {}).get(key, False)
+    # API call failed or hasn't run yet — fall back to season months
     months = config.SEASON_MONTHS.get(key)
     if months is not None:
         return datetime.now().month in months
@@ -55,6 +58,24 @@ def _load_all_logs():
 
 st.set_page_config(page_title='K/P Arb Dashboard', page_icon='📊', layout='wide')
 st.title('K/P Cross-Market Arbitrage')
+
+# ── Startup: check which sports have real Pinnacle events in the window ───────
+if 'active_sports' not in st.session_state:
+    with st.spinner(f'Checking OddsAPI for upcoming events across {len(config.SPORTS_CONFIG)} sports...'):
+        try:
+            used, remaining = fetch_usage()
+            st.session_state['api_used']       = used
+            st.session_state['api_remaining']  = remaining
+            _event_counts = check_sports_with_events(
+                list(config.SPORTS_CONFIG.keys()), config.LOOKAHEAD_HRS)
+            # True = at least 1 event in the look-ahead window
+            st.session_state['active_sports']     = {k: v > 0 for k, v in _event_counts.items()}
+            st.session_state['active_sports_at']  = datetime.utcnow().strftime('%H:%M UTC')
+            st.session_state['active_sports_ok']  = True
+        except Exception:
+            st.session_state['active_sports']     = {}
+            st.session_state['active_sports_at']  = '—'
+            st.session_state['active_sports_ok']  = False
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 
@@ -116,6 +137,24 @@ with tab_trade:
 
     # ── Sport selection ──────────────────────────────────────────────────────
     st.subheader('Select Sports')
+
+    # Show OddsAPI active-sport check status
+    _as_ok = st.session_state.get('active_sports_ok', False)
+    _as_at = st.session_state.get('active_sports_at', '—')
+    _as    = st.session_state.get('active_sports', {})
+    _n_active_sports = sum(1 for k in config.SPORTS_CONFIG if _as.get(k, False))
+    if _as_ok:
+        st.caption(
+            f'🟢 OddsAPI event check: **{_n_active_sports}/{len(config.SPORTS_CONFIG)} sports have upcoming events** '
+            f'in the {hrs}h window — checked {_as_at}'
+        )
+    else:
+        st.caption('🔴 OddsAPI event check failed — falling back to season-month defaults. Check your API key.')
+    if st.button('🔄 Re-check OddsAPI', key='recheck_odds_api',
+                 help=f'Re-query events for all {len(config.SPORTS_CONFIG)} sports using current {hrs}h window. Costs ~{len(config.SPORTS_CONFIG)} API credits.'):
+        for _k in ('active_sports', 'active_sports_at', 'active_sports_ok'):
+            st.session_state.pop(_k, None)
+        st.rerun()
 
     _CATEGORY_LABELS = {
         'americanfootball': 'American Football',
@@ -632,7 +671,7 @@ with tab_review:
             if val == 'LOSS': return 'color: red'
             return 'color: orange'
 
-        styled = log_df2.style.applymap(_colour_result, subset=['result']) \
+        styled = log_df2.style.map(_colour_result, subset=['result']) \
                               if 'result' in log_df2.columns else log_df2
 
         st.dataframe(styled, width="stretch", hide_index=True)
@@ -699,28 +738,41 @@ with tab_review:
                 ax.tick_params(colors='black')
                 for sp in ax.spines.values(): sp.set_edgecolor('#ccc')
 
-                # 3. Win / Loss by order type
+                # 3. Win rate by order type
                 ax = axes[2]
-                if not settled.empty:
-                    types  = settled['order_type'].unique()
-                    wins   = [len(settled[(settled['order_type'] == t) & (settled['result'] == 'WIN')]) for t in types]
-                    losses = [len(settled[(settled['order_type'] == t) & (settled['result'] == 'LOSS')]) for t in types]
-                    x = np.arange(len(types))
-                    ax.bar(x - 0.175, wins,   0.35, label='WIN',  color='#2ecc71')
-                    ax.bar(x + 0.175, losses, 0.35, label='LOSS', color='#e74c3c')
-                    ax.set_xticks(x)
-                    ax.set_xticklabels(types)
-                    for i, t in enumerate(types):
+                if not settled.empty and 'order_type' in settled.columns:
+                    _LABEL_MAP = {'no_rest': 'rest', 'no_cross': 'cross'}
+                    settled = settled.copy()
+                    settled['order_type'] = settled['order_type'].map(
+                        lambda v: _LABEL_MAP.get(v, v))
+                    types   = sorted(settled['order_type'].unique())
+                    wr_vals = []
+                    colors  = []
+                    for t in types:
                         sub = settled[settled['order_type'] == t]
                         wr  = (sub['result'] == 'WIN').mean()
-                        ax.text(i, max(wins[i], losses[i]) + 0.1,
-                                f'WR={wr:.0%}', ha='center', fontsize=8, color='black')
-                    ax.legend(fontsize=8)
+                        wr_vals.append(wr)
+                        colors.append('#2ecc71' if wr >= 0.5 else '#e74c3c')
+                    x = np.arange(len(types))
+                    ax.bar(x, wr_vals, color=colors, width=0.5)
+                    ax.axhline(0.5, color='gray', linewidth=1, linestyle='--')
+                    ax.set_ylim(0, 1.15)
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(types)
+                    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.0%}'))
+                    for i, t in enumerate(types):
+                        sub = settled[settled['order_type'] == t]
+                        w   = (sub['result'] == 'WIN').sum()
+                        l   = (sub['result'] == 'LOSS').sum()
+                        pnl = pd.to_numeric(sub['actual_pnl'], errors='coerce').sum()
+                        ax.text(i, wr_vals[i] + 0.04,
+                                f'{wr_vals[i]:.0%}\n{w}W/{l}L  ${pnl:+.2f}',
+                                ha='center', fontsize=8, color='black')
                 else:
                     ax.text(0.5, 0.5, 'No settled trades yet', ha='center', va='center',
                             transform=ax.transAxes, color='gray')
-                ax.set_title('Win / Loss by Order Type', color='black')
-                ax.set_ylabel('Count', color='black')
+                ax.set_title('Win Rate by Order Type', color='black')
+                ax.set_ylabel('Win Rate', color='black')
                 ax.set_facecolor('white')
                 ax.tick_params(colors='black')
                 for sp in ax.spines.values(): sp.set_edgecolor('#ccc')
@@ -746,18 +798,54 @@ with tab_nothing:
     st.caption('Buys 1 NO contract per qualifying market. Caps total spend at '
                'a fraction of Kalshi cash so the K/P bot keeps capital.')
 
-    # Curated list from nothing_config.py — pre-selected by default
-    _series_options = {
-        f'{ticker}  —  {label}  ({cat})': ticker
-        for ticker, label, cat in _NOTHING_SERIES
-    }
-    selected_labels = st.multiselect(
-        'Series (curated list — edit trade/nothing_config.py to add/remove)',
-        options=list(_series_options.keys()),
-        default=list(_series_options.keys()),
-        key='nothing_series_select',
-    )
-    selected_series = [_series_options[lbl] for lbl in selected_labels]
+    # ── Series selection ─────────────────────────────────────────────────────
+    if 'nothing_open_counts' not in st.session_state:
+        with st.spinner(f'Checking Kalshi for open markets across {len(_NOTHING_SERIES)} series...'):
+            _counts = {}
+            for _t, _l, _c in _NOTHING_SERIES:
+                try:
+                    _counts[_t] = len(_nothing.fetch_series_markets(_t))
+                except Exception:
+                    _counts[_t] = 0
+            st.session_state['nothing_open_counts'] = _counts
+            st.session_state['nothing_counts_checked_at'] = _dt.now(_tz.utc).strftime('%H:%M UTC')
+
+    _ncounts    = st.session_state['nothing_open_counts']
+    _checked_at = st.session_state.get('nothing_counts_checked_at', '—')
+    _n_active   = sum(1 for v in _ncounts.values() if v > 0)
+    st.caption(f'Kalshi market check: **{_n_active}/{len(_NOTHING_SERIES)} series have open markets** — last checked {_checked_at}')
+
+    _nb1, _nb2, _ = st.columns([1, 1, 6])
+    if _nb1.button('Select all active', key='nothing_sel_all'):
+        for _t, _l, _c in _NOTHING_SERIES:
+            st.session_state[f'nseries_{_t}'] = _ncounts.get(_t, 0) > 0
+    if _nb2.button('Deselect all', key='nothing_desel_all'):
+        for _t, _l, _c in _NOTHING_SERIES:
+            st.session_state[f'nseries_{_t}'] = False
+    if st.button('🔄 Refresh market counts', key='nothing_refresh_counts'):
+        st.session_state.pop('nothing_open_counts', None)
+        st.rerun()
+
+    # Group by category and render as checkboxes (like Trade tab sports)
+    _n_grouped: dict = {}
+    for _t, _l, _c in _NOTHING_SERIES:
+        _n_grouped.setdefault(_c, []).append((_t, _l))
+
+    selected_series: list = []
+    for _cat, _items in _n_grouped.items():
+        st.markdown(f'**{_cat.title()}**')
+        _ncols = st.columns(min(len(_items), 3))
+        for _i, (_t, _l) in enumerate(_items):
+            with _ncols[_i % 3]:
+                _cnt   = _ncounts.get(_t, 0)
+                _dot   = '🟢' if _cnt > 0 else '🔴'
+                _dflt  = _cnt > 0
+                _label = f'{_dot} {_l}  ({_cnt} open)' if _cnt > 0 else f'{_dot} {_l}  (no open markets)'
+                if st.checkbox(_label, value=_dflt, key=f'nseries_{_t}'):
+                    selected_series.append(_t)
+
+    st.caption(f'{len(selected_series)} series selected')
+    st.divider()
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -1051,55 +1139,16 @@ with tab_nothing:
     st.divider()
     st.markdown('#### Nothing Bot Performance')
     try:
-        if os.path.exists(_nothing.LOG_PATH) and os.path.getsize(_nothing.LOG_PATH) > 0:
-            _nlog = pd.read_csv(_nothing.LOG_PATH)
-            _nlog['actual_pnl'] = pd.to_numeric(_nlog['actual_pnl'], errors='coerce')
-
-            _filled   = _nlog[_nlog['final_status'].isin(['executed', 'filled'])]
-            _settled  = _filled[_filled['result'].isin(['WIN', 'LOSS', 'VOID'])]
-            _wins     = _settled[_settled['result'] == 'WIN']
-            _losses   = _settled[_settled['result'] == 'LOSS']
-            _pending  = _filled[_filled['result'] == 'PENDING']
-            _win_rate = len(_wins) / len(_settled) if len(_settled) > 0 else None
-            _pnl      = _settled['actual_pnl'].sum()
-            _wagered  = _filled['total_cost'].sum() if 'total_cost' in _filled.columns else 0
-            _avg_pnl  = _settled['actual_pnl'].mean() if not _settled.empty else None
-            _roi      = (_pnl / _wagered) if _wagered > 0 else None
-
-            _mc1, _mc2, _mc3, _mc4, _mc5 = st.columns(5)
-            _mc1.metric('Bets placed',   len(_nlog))
-            _mc2.metric('Filled',        len(_filled))
-            _mc3.metric('Settled',       len(_settled))
-            _mc4.metric('Pending',       len(_pending))
-            _mc5.metric('Win rate',
-                        f'{_win_rate:.0%}' if _win_rate is not None else '—')
-
-            _mc6, _mc7, _mc8, _mc9, _mc10 = st.columns(5)
-            _mc6.metric('Wins',          len(_wins))
-            _mc7.metric('Losses',        len(_losses))
-            _mc8.metric('Total PnL',     f'${_pnl:+.2f}',
-                        delta_color='normal' if _pnl >= 0 else 'inverse')
-            _mc9.metric('Total wagered', f'${_wagered:.2f}')
-            _mc10.metric('ROI',
-                         f'{_roi:.1%}' if _roi is not None else '—',
-                         delta_color='normal' if (_roi or 0) >= 0 else 'inverse')
-
-            # Series breakdown
-            if not _settled.empty and 'series_ticker' in _settled.columns:
-                with st.expander('Breakdown by series'):
-                    _by_series = (
-                        _settled.groupby('series_ticker')
-                        .agg(
-                            bets=('result', 'count'),
-                            wins=('result', lambda x: (x == 'WIN').sum()),
-                            pnl=('actual_pnl', 'sum'),
-                        )
-                        .assign(win_rate=lambda d: d['wins'] / d['bets'])
-                        .reset_index()
-                    )
-                    _by_series['win_rate'] = _by_series['win_rate'].map('{:.0%}'.format)
-                    _by_series['pnl']      = _by_series['pnl'].map('${:+.2f}'.format)
-                    st.dataframe(_by_series, width="stretch", hide_index=True)
+        import trade.nothing_review as _nr
+        import matplotlib.pyplot as _plt
+        _nr_df = _nr.load_log()
+        if not _nr_df.empty:
+            _nr_fig = _nr.build_charts(_nr_df)
+            if _nr_fig:
+                st.pyplot(_nr_fig)
+                _plt.close(_nr_fig)
+            else:
+                st.caption('No settled trades yet — nothing to chart.')
         else:
             st.caption('No trades logged yet.')
     except Exception as exc:

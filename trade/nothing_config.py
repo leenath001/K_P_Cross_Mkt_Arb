@@ -20,11 +20,21 @@ NOTHING_SERIES = [
 
     # Earnings-call mention markets — will company CEO say word X on call.
     # Same "nothing" thesis: most specific words aren't mentioned.
-    ('KXEARNINGSMENTIONUBER', 'Uber earnings mentions',    'mentions'),
-    ('KXEARNINGSMENTIONLYFT', 'Lyft earnings mentions',    'mentions'),
-    ('KXEARNINGSMENTIONABNB', 'ABNB earnings mentions',    'mentions'),
-    ('KXFEDMENTION', 'Fed meeting mentions', 'mentions')
-    
+    ('KXEARNINGSMENTIONUBER', 'Uber earnings mentions',       'mentions'),
+    ('KXEARNINGSMENTIONLYFT', 'Lyft earnings mentions',       'mentions'),
+    ('KXEARNINGSMENTIONABNB', 'ABNB earnings mentions',       'mentions'),
+    ('KXEARNINGSMENTIONAMZN', 'Amazon earnings mentions',     'mentions'),
+    ('KXEARNINGSMENTIONAAPL', 'Apple earnings mentions',      'mentions'),
+    ('KXEARNINGSMENTIONSBUX', 'Starbucks earnings mentions',  'mentions'),
+    ('KXEARNINGSMENTIONMETA', 'Meta earnings mentions',       'mentions'),
+    ('KXEARNINGSMENTIONV',    'Visa earnings mentions',       'mentions'),
+    ('KXEARNINGSMENTIONINTC', 'Intel earnings mentions',      'mentions'),
+    ('KXEARNINGSMENTIONSPOT', 'Spotify earnings mentions',    'mentions'),
+    ('KXEARNINGSMENTIONHOOD', 'Robinhood earnings mentions',  'mentions'),
+    ('KXEARNINGSMENTIONRDDT', 'Reddit earnings mentions',     'mentions'),
+    ('KXEARNINGSMENTIONMSFT', 'Microsoft earnings mentions',  'mentions'),
+    ('KXEARNINGSMENTIONKO',   'Coca-Cola earnings mentions',  'mentions'),
+    ('KXFEDMENTION',          'Fed meeting mentions',         'mentions'),
 
     # Candidates worth evaluating but not added by default:
     # ('KXLABORANNOUNCE',     'Trump Labor Sec announce',  'politics'),  # time-bucket

@@ -20,7 +20,8 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
-LOG_PATH = os.path.join(os.path.dirname(__file__), 'logs', 'trades.csv')
+LOG_PATH    = os.path.join(os.path.dirname(__file__), 'logs', 'trades.csv')
+NO_LOG_PATH = os.path.join(os.path.dirname(__file__), 'logs', 'no_trades.csv')
 
 console = Console()
 
@@ -28,10 +29,16 @@ console = Console()
 # ── Load ────────────────────────────────────────────────────────────────────
 
 def load_log() -> pd.DataFrame:
-    if not os.path.exists(LOG_PATH):
+    frames = []
+    for path in (LOG_PATH, NO_LOG_PATH):
+        if os.path.exists(path):
+            _df = pd.read_csv(path, parse_dates=['logged_at', 'commence'])
+            if not _df.empty:
+                frames.append(_df)
+    if not frames:
         console.print('[yellow]No trade log found yet.[/yellow]')
         raise SystemExit(0)
-    df = pd.read_csv(LOG_PATH, parse_dates=['logged_at', 'commence'])
+    df = pd.concat(frames, ignore_index=True)
     if df.empty:
         console.print('[yellow]Trade log is empty.[/yellow]')
         raise SystemExit(0)
@@ -63,6 +70,30 @@ def print_summary(df: pd.DataFrame):
         f'Win rate : [cyan]{win_rate:.0%}[/cyan]  |  '
         f'Total wagered : [cyan]${total_cost:.2f}[/cyan]'
     )
+
+    # Win rate by order type
+    if not settled.empty and 'order_type' in settled.columns:
+        _LABEL_MAP = {'no_rest': 'rest', 'no_cross': 'cross'}
+        settled = settled.copy()
+        settled['order_type'] = settled['order_type'].map(lambda v: _LABEL_MAP.get(v, v))
+        console.print()
+        console.print('  [bold]Win rate by order type:[/bold]')
+        for otype in sorted(settled['order_type'].unique()):
+            sub  = settled[settled['order_type'] == otype]
+            w    = (sub['result'] == 'WIN').sum()
+            l    = (sub['result'] == 'LOSS').sum()
+            wr   = w / len(sub) if len(sub) else float('nan')
+            pnl  = pd.to_numeric(sub['actual_pnl'], errors='coerce').sum()
+            avg_ev = sub['ev_total'].mean() if 'ev_total' in sub.columns else float('nan')
+            wr_c = 'green' if wr >= 0.5 else 'red'
+            pnl_c = 'green' if pnl >= 0 else 'red'
+            console.print(
+                f'    [cyan]{otype:8s}[/cyan]  '
+                f'{w}W / {l}L  '
+                f'win rate=[{wr_c}]{wr:.0%}[/{wr_c}]  '
+                f'pnl=[{pnl_c}]${pnl:+.2f}[/{pnl_c}]  '
+                + (f'avg_ev=${avg_ev:+.3f}' if not pd.isna(avg_ev) else '')
+            )
     console.print()
 
     table = Table(box=box.SIMPLE_HEAD, expand=True, padding=(0, 1))
@@ -222,31 +253,40 @@ def show_charts(df: pd.DataFrame):
 
     # ── 4. Win rate by order type ─────────────────────────────────────────────
     ax4 = fig.add_subplot(gs[1, 1])
-    if not settled.empty:
-        types    = settled['order_type'].unique()
-        wins     = [len(settled[(settled['order_type'] == t) & (settled['result'] == 'WIN')]) for t in types]
-        losses   = [len(settled[(settled['order_type'] == t) & (settled['result'] == 'LOSS')]) for t in types]
-        x        = np.arange(len(types))
-        w        = 0.35
-        bars_w   = ax4.bar(x - w/2, wins,   w, label='WIN',  color='#2ecc71')
-        bars_l   = ax4.bar(x + w/2, losses, w, label='LOSS', color='#e74c3c')
-        ax4.set_title('Win / Loss by Order Type')
-        ax4.set_xticks(x)
-        ax4.set_xticklabels(types)
-        ax4.set_ylabel('Count')
-        ax4.legend(fontsize=8)
-        # add expected win rate annotation
-        for i, t in enumerate(types):
+    if not settled.empty and 'order_type' in settled.columns:
+        _LABEL_MAP = {'no_rest': 'rest', 'no_cross': 'cross'}
+        settled = settled.copy()
+        settled['order_type'] = settled['order_type'].map(lambda v: _LABEL_MAP.get(v, v))
+        types   = sorted(settled['order_type'].unique())
+        wr_vals = []
+        colors  = []
+        for t in types:
             sub = settled[settled['order_type'] == t]
             wr  = (sub['result'] == 'WIN').mean()
-            avg_fp = sub['fair_prob'].mean()
-            ax4.text(i, max(wins[i], losses[i]) + 0.1,
-                     f'WR={wr:.0%}\nfair={avg_fp:.2f}',
-                     ha='center', fontsize=7, color='black')
+            wr_vals.append(wr)
+            colors.append('#2ecc71' if wr >= 0.5 else '#e74c3c')
+        x = np.arange(len(types))
+        ax4.bar(x, wr_vals, color=colors, width=0.5)
+        ax4.axhline(0.5, color='gray', linewidth=1, linestyle='--', label='50%')
+        ax4.set_ylim(0, 1.05)
+        ax4.set_title('Win Rate by Order Type')
+        ax4.set_xticks(x)
+        ax4.set_xticklabels(types)
+        ax4.set_ylabel('Win Rate')
+        ax4.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.0%}'))
+        ax4.legend(fontsize=8)
+        for i, t in enumerate(types):
+            sub = settled[settled['order_type'] == t]
+            w   = (sub['result'] == 'WIN').sum()
+            l   = (sub['result'] == 'LOSS').sum()
+            pnl = pd.to_numeric(sub['actual_pnl'], errors='coerce').sum()
+            ax4.text(i, wr_vals[i] + 0.03,
+                     f'{wr_vals[i]:.0%}\n{w}W/{l}L  ${pnl:+.2f}',
+                     ha='center', fontsize=8, color='black')
     else:
-        ax4.text(0.5, 0.5, 'No settled trades yet\n(update result column in CSV)',
-                 ha='center', va='center', transform=ax4.transAxes, color='gray')
-        ax4.set_title('Win / Loss by Order Type')
+        ax4.text(0.5, 0.5, 'No settled trades yet', ha='center', va='center',
+                 transform=ax4.transAxes, color='gray')
+        ax4.set_title('Win Rate by Order Type')
     ax4.set_facecolor('white')
     ax4.tick_params(colors='black')
     ax4.title.set_color('black')
@@ -270,3 +310,16 @@ if __name__ == '__main__':
     print_summary(df)
     if not args.table:
         show_charts(df)
+
+    # Nothing Ever Happens bot review
+    import nothing_review as _nr
+    _nr_df = _nr.load_log()
+    if not _nr_df.empty:
+        _nr.print_summary(_nr_df)
+        if not args.table:
+            import matplotlib.pyplot as plt
+            _nr_fig = _nr.build_charts(_nr_df)
+            if _nr_fig:
+                plt.show()
+            else:
+                console.print('[dim]No settled Nothing trades yet — nothing to chart.[/dim]')
