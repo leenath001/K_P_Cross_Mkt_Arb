@@ -337,6 +337,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
               taker_fee: float = TAKER_FEE,
               maker_fee: float = MAKER_FEE,
               limit_only: bool = False,
+              force_cross: bool = False,
               side: str = 'yes',
               max_duration: int = MAX_DURATION,
               pre_event_buffer: int = PRE_EVENT_BUFFER,
@@ -376,14 +377,19 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         if _ev(fair_prob_no, no_ask, maker_fee) <= 0:
             return {'status': 'skipped', 'reason': 'no_edge_after_fees',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
-        # Rest 1¢ below no_ask — joins top of bid without crossing
-        order_price = round(no_ask - 0.01, 2)
+        # Cross at no_ask (taker) or rest 1¢ below it (maker)
+        if force_cross:
+            order_price = no_ask
+            fee_rate    = taker_fee
+            order_type  = 'no_cross'
+        else:
+            order_price = round(no_ask - 0.01, 2)
+            fee_rate    = maker_fee
+            order_type  = 'no_rest'
         if order_price < 0.01:
             return {'status': 'skipped', 'reason': 'no_ask_too_low',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
-        ev          = _ev(fair_prob_no, order_price, maker_fee)
-        fee_rate    = maker_fee
-        order_type  = 'no_rest'
+        ev          = _ev(fair_prob_no, order_price, fee_rate)
         price_cents = round(order_price * 100)
         contracts   = kelly_contracts(fair_prob_no, order_price, bankroll, fee_rate)
 
@@ -397,7 +403,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
 
         order    = place_order(ticker, price_cents, contracts, side='no',
                                expiration_ts=int(expiry_dt.timestamp()),
-                               post_only=True)
+                               post_only=not force_cross)
         order_id = order.get('order_id')
         if order_registry is not None and order_id:
             order_registry.append(order_id)
@@ -573,6 +579,7 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
                     taker_fee: float = TAKER_FEE,
                     maker_fee: float = MAKER_FEE,
                     limit_only: bool = False,
+                    force_cross: bool = False,
                     side: str = 'yes',
                     max_duration: int = MAX_DURATION,
                     dashboard=None,
@@ -602,8 +609,8 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
         try:
             result = run_trade(row, bankroll=bankroll,
                                taker_fee=taker_fee, maker_fee=maker_fee,
-                               limit_only=limit_only, side=side,
-                               max_duration=max_duration,
+                               limit_only=limit_only, force_cross=force_cross,
+                               side=side, max_duration=max_duration,
                                dashboard=dashboard, stop_event=stop_event,
                                order_registry=order_registry)
         except Exception as exc:

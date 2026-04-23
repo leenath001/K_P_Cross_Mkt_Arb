@@ -28,8 +28,9 @@ parser.add_argument('--hrs',        type=int,   default=config.LOOKAHEAD_HRS,   
 parser.add_argument('--fetch-live', action='store_true', default=config.LIVE,     help=f'Fetch live games instead of upcoming (default: {config.LIVE} from config)')
 parser.add_argument('--taker-fee',  type=float, default=0.07,                     help='Taker fee rate as fraction of winnings (default: 0.07)')
 parser.add_argument('--maker-fee',  type=float, default=0.03,                     help='Maker fee rate as fraction of winnings (default: 0.03)')
-parser.add_argument('--limit-only', action='store_true',                          help='Never cross the book — always rest at bid')
-parser.add_argument('--side',       choices=['yes', 'no'], default='yes',         help='Contract side: yes (cross/rest YES) or no (rest NO, maker)')
+parser.add_argument('--mode',       choices=['rest', 'cross', 'auto'], default='rest',
+                                                                          help='Order mode: rest=maker limit (default), cross=taker at ask, auto=cross if EV positive else rest')
+parser.add_argument('--side',       choices=['yes', 'no'], default='yes',         help='Contract side: yes or no')
 parser.add_argument('--threshold',  type=float, default=0.85,                     help='Min fuzzy-match score (default: 0.85)')
 parser.add_argument('--usage',      action='store_true',                          help='Print The Odds API usage and exit')
 args = parser.parse_args()
@@ -110,22 +111,33 @@ print(matched_df[['sport', 'outcome', 'fair_prob', 'yes_ask', 'match_score', 'si
 
 from bot import _ev, TAKER_FEE, MAKER_FEE
 
-def _order_params(row, taker_fee, maker_fee):
+def _order_params(row, taker_fee, maker_fee, mode='rest'):
     """
     Determine order mode, price, fee_rate for a signal row.
+    mode: 'rest' = always maker limit, 'cross' = always taker at ask,
+          'auto' = cross if taker EV positive else rest.
     Returns dict or None if no tradeable price exists.
     """
     tev = _ev(row['fair_prob'], row['yes_ask'], taker_fee)
     bid = row['yes_bid'] if row['yes_bid'] else None
-    if tev > 0:
-        price, fee_rate, mode = row['yes_ask'], taker_fee, 'cross'
-    elif bid is not None:
-        price, fee_rate, mode = round(bid + 0.01, 2), maker_fee, 'rest'
-    else:
-        return None
+
+    if mode == 'cross':
+        price, fee_rate, order_mode = row['yes_ask'], taker_fee, 'cross'
+    elif mode == 'rest':
+        if bid is None:
+            return None
+        price, fee_rate, order_mode = round(bid + 0.01, 2), maker_fee, 'rest'
+    else:  # auto
+        if tev > 0:
+            price, fee_rate, order_mode = row['yes_ask'], taker_fee, 'cross'
+        elif bid is not None:
+            price, fee_rate, order_mode = round(bid + 0.01, 2), maker_fee, 'rest'
+        else:
+            return None
+
     ev = _ev(row['fair_prob'], price, fee_rate)
     n  = kelly_contracts(row['fair_prob'], price, bankroll, fee_rate)
-    return {'price': price, 'fee_rate': fee_rate, 'mode': mode,
+    return {'price': price, 'fee_rate': fee_rate, 'mode': order_mode,
             'ev': ev, 'n': n, 'cost': round(n * price, 2), 'tev': tev}
 
 
@@ -174,7 +186,7 @@ if not args.live:
     for _, group in signals.groupby('event_id', sort=False):
         _event_header(group)
         for _, row in group.iterrows():
-            p = _order_params(row, args.taker_fee, args.maker_fee)
+            p = _order_params(row, args.taker_fee, args.maker_fee, args.mode)
             if p is None:
                 print(f"    {row['outcome']:28s}  [skip — no bid]")
                 continue
@@ -195,7 +207,7 @@ else:
     for _, group in signals.groupby('event_id', sort=False):
         _event_header(group)
         for _, row in group.iterrows():
-            p = _order_params(row, args.taker_fee, args.maker_fee)
+            p = _order_params(row, args.taker_fee, args.maker_fee, args.mode)
             if p is None:
                 print(f"    [skip — no bid]  {row['outcome']}")
                 continue
@@ -229,7 +241,9 @@ else:
             dash.set_api_usage(used, remaining)
             results = run_all_signals(approved_df, bankroll=bankroll,
                                       taker_fee=args.taker_fee, maker_fee=args.maker_fee,
-                                      limit_only=args.limit_only, side=args.side,
+                                      limit_only=(args.mode == 'rest'),
+                                      force_cross=(args.mode == 'cross'),
+                                      side=args.side,
                                       dashboard=dash, stop_event=stop_event)
     except KeyboardInterrupt:
         print('\n  All orders canceled.')

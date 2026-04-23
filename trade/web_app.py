@@ -211,13 +211,24 @@ with tab_trade:
         st.subheader('Results')
 
         # Side selector drives which signals are shown and how orders execute
-        trade_side = st.radio(
-            'Contract side',
-            ['YES — buy YES (cross or rest)', 'NO — rest NO at top of book (maker, 3%)'],
-            index=0, horizontal=True, key='_side_select',
-        )
-        side    = 'no' if trade_side.startswith('NO') else 'yes'
-        sig_col = 'signal_no' if side == 'no' else 'signal'
+        _sc1, _sc2 = st.columns(2)
+        with _sc1:
+            trade_side = st.radio(
+                'Contract side',
+                ['YES', 'NO'],
+                index=0, horizontal=True, key='_side_select',
+            )
+        with _sc2:
+            trade_mode = st.radio(
+                'Order mode',
+                ['Rest (maker, 3%)', 'Cross (taker, 7%)', 'Auto (cross if EV+, else rest)'],
+                index=0, horizontal=True, key='_mode_select',
+                help='Rest = post limit at top of book. Cross = take at ask immediately. Auto = cross only when taker EV is positive.'
+            )
+        side        = 'no' if trade_side == 'NO' else 'yes'
+        force_cross = trade_mode.startswith('Cross')
+        limit_only_mode = trade_mode.startswith('Rest')
+        sig_col     = 'signal_no' if side == 'no' else 'signal'
 
         if sig_col in matched_df.columns:
             signals = matched_df[matched_df[sig_col]]
@@ -261,7 +272,7 @@ with tab_trade:
             locked_cols = [c for c in editable.columns if c != 'Execute']
             edited = st.data_editor(
                 editable,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 disabled=locked_cols,
                 column_config={'Execute': st.column_config.CheckboxColumn('Execute', default=True)},
@@ -275,12 +286,13 @@ with tab_trade:
             # limit_only is a YES-only option — NO always rests
             _opt_c1, _opt_c2 = st.columns([2, 1])
             with _opt_c1:
-                if side == 'yes':
-                    limit_only = st.checkbox('Limit orders only (never cross book)', value=False)
-                    st.caption(f'{n_approved} YES signal(s) selected — will cross at `yes_ask` or rest at `yes_bid+1¢`')
+                limit_only = limit_only_mode
+                if force_cross:
+                    st.caption(f'{n_approved} {side.upper()} signal(s) — **CROSS** at ask (taker, {taker_fee*100:.0f}% fee)')
+                elif limit_only:
+                    st.caption(f'{n_approved} {side.upper()} signal(s) — **REST** at top of book (maker, {maker_fee*100:.0f}% fee)')
                 else:
-                    limit_only = False
-                    st.caption(f'{n_approved} NO signal(s) selected — will rest at `no_ask − 1¢` (maker fee {maker_fee*100:.0f}%)')
+                    st.caption(f'{n_approved} {side.upper()} signal(s) — **AUTO**: cross if taker EV positive, else rest')
             with _opt_c2:
                 trade_ttl_min = st.number_input(
                     'Order TTL (min)', min_value=1, max_value=1440, value=30,
@@ -306,14 +318,14 @@ with tab_trade:
 
                     def _worker(approved=approved_signals.copy(),
                                 bk=balance, tf=taker_fee, mf=maker_fee,
-                                lo=limit_only, s=side,
+                                lo=limit_only, fc=force_cross, s=side,
                                 ttl=int(trade_ttl_min) * 60,
                                 d=dash, rh=results_holder, se=stop_event):
                         try:
                             out = run_all_signals(
                                 approved, bankroll=bk,
                                 taker_fee=tf, maker_fee=mf,
-                                limit_only=lo, side=s,
+                                limit_only=lo, force_cross=fc, side=s,
                                 max_duration=ttl,
                                 dashboard=d, stop_event=se,
                             )
@@ -330,6 +342,8 @@ with tab_trade:
                     st.session_state['_trade_results_h']  = results_holder
                     st.session_state['_trade_stop']       = stop_event
                     st.session_state['_trade_side']       = side
+                    _mlab = 'CROSS' if force_cross else ('REST' if limit_only else 'AUTO')
+                    st.session_state['_trade_mode'] = _mlab
                     st.rerun()
 
             # ── Live dashboard (while trades are running) ───────────────────
@@ -339,6 +353,7 @@ with tab_trade:
                 results_h     = st.session_state.get('_trade_results_h', [])
                 stop_event    = st.session_state.get('_trade_stop')
                 last_side     = st.session_state.get('_trade_side', 'yes')
+                last_mode     = st.session_state.get('_trade_mode', 'REST')
 
                 is_alive = thread.is_alive()
 
@@ -350,7 +365,7 @@ with tab_trade:
 
                     # Header + cancel button
                     hc1, hc2 = st.columns([4, 1])
-                    hc1.markdown(f'#### Live {last_side.upper()} Dashboard')
+                    hc1.markdown(f'#### Dashboard — {last_side.upper()} · {last_mode}')
                     if thread.is_alive():
                         if hc2.button('🛑 Cancel all', key='_cancel_all_btn'):
                             if stop_event:
@@ -375,7 +390,7 @@ with tab_trade:
                                 'Last ping':  pos['last_ping'],
                             })
                         st.dataframe(pd.DataFrame(rows),
-                                     use_container_width=True, hide_index=True)
+                                     width="stretch", hide_index=True)
                     else:
                         st.caption('Waiting for orders to be placed...')
 
@@ -396,21 +411,21 @@ with tab_trade:
                     st.session_state['last_results'] = final_results
                     st.session_state['last_side']    = last_side
                     for k in (thread_key, '_trade_dash', '_trade_results_h',
-                              '_trade_stop', '_trade_side'):
+                              '_trade_stop', '_trade_side', '_trade_mode'):
                         st.session_state.pop(k, None)
 
             # ── Final results (persist after dashboard clears) ──────────────
             last_results = st.session_state.get('last_results')
             last_side    = st.session_state.get('last_side', 'yes')
             if last_results:
-                st.markdown(f'#### {last_side.upper()} Trade Results')
+                st.markdown(f'#### Trade Results — {last_side.upper()}')
                 results_df = pd.DataFrame([r for r in last_results if r is not None])
                 if not results_df.empty:
                     price_key  = 'no_price' if last_side == 'no' else 'yes_price'
                     show_cols  = [c for c in ['ticker', 'outcome', 'order_type', 'status',
                                               'reason', 'contracts', price_key, 'ev']
                                   if c in results_df.columns]
-                    st.dataframe(results_df[show_cols], use_container_width=True, hide_index=True)
+                    st.dataframe(results_df[show_cols], width="stretch", hide_index=True)
                     if 'status' in results_df.columns:
                         errors = results_df[results_df['status'] == 'error']
                         for _, err in errors.iterrows():
@@ -423,7 +438,7 @@ with tab_trade:
                                     'fair_prob', 'yes_ask', 'no_ask', 'match_score',
                                     'signal', 'signal_no', 'k_ticker']
                         if c in matched_df.columns]
-            st.dataframe(matched_df[all_cols], use_container_width=True, hide_index=True)
+            st.dataframe(matched_df[all_cols], width="stretch", hide_index=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -462,11 +477,11 @@ with tab_settle:
             if not yes_pending.empty:
                 st.markdown('#### Pending YES Trades')
                 st.dataframe(yes_pending[[c for c in show_cols if c in yes_pending.columns]],
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
             if not no_pending.empty:
                 st.markdown('#### Pending NO Trades')
                 st.dataframe(no_pending[[c for c in show_cols if c in no_pending.columns]],
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
 
             dry_run = st.checkbox('Dry run (preview only, do not write)', value=False)
 
@@ -485,11 +500,11 @@ with tab_settle:
                     if not yes_orph.empty:
                         st.caption('YES log orphans')
                         st.dataframe(yes_orph[[c for c in orphan_cols if c in yes_orph.columns]],
-                                     use_container_width=True, hide_index=True)
+                                     width="stretch", hide_index=True)
                     if not no_orph.empty:
                         st.caption('NO log orphans')
                         st.dataframe(no_orph[[c for c in orphan_cols if c in no_orph.columns]],
-                                     use_container_width=True, hide_index=True)
+                                     width="stretch", hide_index=True)
                     if st.button('Clear orphans (mark as CANCELED)'):
                         cleaned = 0
                         if not yes_orph.empty:
@@ -564,7 +579,7 @@ with tab_settle:
         with st.expander('Full trade log (YES + NO)'):
             combined = _load_all_logs()
             if not combined.empty:
-                st.dataframe(combined, use_container_width=True, hide_index=True)
+                st.dataframe(combined, width="stretch", hide_index=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -620,7 +635,7 @@ with tab_review:
         styled = log_df2.style.applymap(_colour_result, subset=['result']) \
                               if 'result' in log_df2.columns else log_df2
 
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(styled, width="stretch", hide_index=True)
 
         # ── Charts ───────────────────────────────────────────────────────────
         if not filled.empty:
@@ -783,11 +798,11 @@ with tab_nothing:
 
     preview_col, execute_col, cancel_col = st.columns(3)
     preview = preview_col.button('Preview', key='nothing_preview',
-                                 use_container_width=True)
+                                 width="stretch")
     execute = execute_col.button('Execute (LIVE)', key='nothing_execute',
-                                 type='primary', use_container_width=True)
+                                 type='primary', width="stretch")
     cancel  = cancel_col.button('Cancel all tracked', key='nothing_cancel',
-                                use_container_width=True)
+                                width="stretch")
 
     if cancel:
         with st.spinner('Canceling tracked orders...'):
@@ -872,7 +887,7 @@ with tab_nothing:
                     'max_payout':  round(n * (1 - entry_p) * (1 - fee_rate), 2),
                     'event':       m.get('event_ticker', ''),
                 })
-            st.dataframe(pd.DataFrame(plan_rows), use_container_width=True,
+            st.dataframe(pd.DataFrame(plan_rows), width="stretch",
                          hide_index=True)
             st.caption(f'{len(plans)} market(s) · {total_cts} contracts · '
                        f'est cost ${total_cost:.2f} · skipped {len(skipped)} over budget · '
@@ -943,7 +958,7 @@ with tab_nothing:
                 st.success(f'Placed {len(placed_tracked)}, errors {len(errored)}')
                 if errored:
                     st.error('Errors:')
-                    st.dataframe(pd.DataFrame(errored), use_container_width=True,
+                    st.dataframe(pd.DataFrame(errored), width="stretch",
                                  hide_index=True)
 
                 # ── Kick off live monitor ───────────────────────────────────
@@ -982,7 +997,7 @@ with tab_nothing:
             hc1.markdown('#### Live Nothing Dashboard')
             if _n_thread.is_alive():
                 if hc2.button('🛑 Cancel ALL orders', key='_nothing_live_cancel',
-                              type='primary', use_container_width=True):
+                              type='primary', width="stretch"):
                     _n_stop.set()
                     st.warning('Cancel requested — monitor will kill all open orders.')
 
@@ -1012,7 +1027,7 @@ with tab_nothing:
                         'Last ping': rec.get('last_ping', ''),
                     })
                 st.dataframe(pd.DataFrame(rows),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
                 filled_ct  = sum(1 for r in snapshot.values()
                                  if r.get('status') in ('executed', 'filled'))
                 resting_ct = sum(1 for r in snapshot.values()
@@ -1084,7 +1099,7 @@ with tab_nothing:
                     )
                     _by_series['win_rate'] = _by_series['win_rate'].map('{:.0%}'.format)
                     _by_series['pnl']      = _by_series['pnl'].map('${:+.2f}'.format)
-                    st.dataframe(_by_series, use_container_width=True, hide_index=True)
+                    st.dataframe(_by_series, width="stretch", hide_index=True)
         else:
             st.caption('No trades logged yet.')
     except Exception as exc:
@@ -1096,7 +1111,7 @@ with tab_nothing:
     try:
         if os.path.exists(_nothing.LOG_PATH) and os.path.getsize(_nothing.LOG_PATH) > 0:
             log_df = pd.read_csv(_nothing.LOG_PATH)
-            st.dataframe(log_df.tail(50), use_container_width=True, hide_index=True)
+            st.dataframe(log_df.tail(50), width="stretch", hide_index=True)
             st.caption(f'{len(log_df)} total rows · showing last 50')
         else:
             st.caption('No trades logged yet.')
