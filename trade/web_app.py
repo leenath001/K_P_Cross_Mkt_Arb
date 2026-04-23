@@ -314,31 +314,33 @@ with tab_trade:
                 ]
                 _pending_tickers = set(_really_open['k_ticker'].tolist())
 
-            # Columns adapt per side: show the price that drives the signal
-            price_col = 'no_ask' if side == 'no' else 'yes_ask'
-            display_cols = [c for c in ['sport', 'home', 'away', 'commence', 'outcome',
-                                        'fair_prob', price_col, 'match_score', 'k_ticker']
-                            if c in signals.columns]
-
-            editable = signals[display_cols].copy().reset_index(drop=True)
-
-            # entry_price: the actual price the bot will fill at (what must be < fair_prob)
+            # Compute entry_price (what the bot fills/posts at) before building display
+            # CROSS → taker fills at ask; REST → limit order at bid+1¢ (YES) or ask-1¢ (NO)
+            _sig = signals.copy()
             if side == 'no':
+                _sig['entry_price'] = (_sig['no_ask'] if force_cross
+                                       else (_sig['no_ask'] - 0.01).round(2))
+            else:
                 if force_cross:
-                    editable['entry_price'] = signals['no_ask'].values
-                else:
-                    editable['entry_price'] = (signals['no_ask'] - 0.01).round(2).values
-            else:  # YES
-                if force_cross:
-                    editable['entry_price'] = signals['yes_ask'].values
+                    _sig['entry_price'] = _sig['yes_ask']
                 elif limit_only_mode:
-                    editable['entry_price'] = (signals['yes_bid'] + 0.01).round(2).values
-                else:  # AUTO — per-row: cross signals use yes_ask, rest signals use yes_bid+1¢
-                    editable['entry_price'] = signals.apply(
+                    _sig['entry_price'] = (_sig['yes_ask'] - 0.01).round(2)
+                else:  # AUTO: cross rows use yes_ask, rest rows use yes_ask-1¢
+                    _sig['entry_price'] = _sig.apply(
                         lambda r: r['yes_ask'] if r.get('signal', False)
-                                  else round(r.get('yes_bid', 0) + 0.01, 2),
+                                  else round(r.get('yes_ask', 0) - 0.01, 2),
                         axis=1,
-                    ).values
+                    )
+
+            # mkt_ask = Kalshi top-of-book ask (taker price, shown for reference only)
+            mkt_ask_col = 'no_ask' if side == 'no' else 'yes_ask'
+            display_cols = [c for c in ['sport', 'home', 'away', 'commence', 'outcome',
+                                        'fair_prob', 'entry_price', mkt_ask_col,
+                                        'match_score', 'k_ticker']
+                            if c in _sig.columns]
+
+            editable = _sig[display_cols].copy().reset_index(drop=True)
+            editable = editable.rename(columns={mkt_ask_col: 'mkt_ask'})
             already_traded = editable['k_ticker'].isin(_pending_tickers)
             editable.insert(0, 'Execute', (~already_traded))
             editable.insert(1, 'Status', already_traded.map({True: '⚠️ pending', False: ''}))

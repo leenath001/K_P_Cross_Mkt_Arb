@@ -155,10 +155,7 @@ def cancel_order(order_id: str) -> bool:
 
 
 def get_market_price(ticker: str) -> Optional[int]:
-    """
-    Fetch the current yes_ask for a Kalshi market in cents.
-    Returns None if unavailable.
-    """
+    """Fetch the current yes_ask for a Kalshi market in cents. Returns None if unavailable."""
     path = f'/trade-api/v2/markets/{ticker}'
     resp = requests.get(f'{BASE_URL}/markets/{ticker}',
                         headers=kalshi_headers('GET', path))
@@ -167,6 +164,27 @@ def get_market_price(ticker: str) -> Optional[int]:
         ask = m.get('yes_ask_dollars')
         return round(float(ask) * 100) if ask else None
     return None
+
+
+def get_market_prices(ticker: str) -> dict:
+    """
+    Fetch current yes_ask and no_ask for a Kalshi market in cents.
+    Returns {'yes_ask': int, 'no_ask': int} or {} if unavailable.
+    """
+    path = f'/trade-api/v2/markets/{ticker}'
+    resp = requests.get(f'{BASE_URL}/markets/{ticker}',
+                        headers=kalshi_headers('GET', path))
+    if resp.ok:
+        m = resp.json().get('market', {})
+        ya = m.get('yes_ask_dollars')
+        na = m.get('no_ask_dollars')
+        result = {}
+        if ya:
+            result['yes_ask'] = round(float(ya) * 100)
+        if na:
+            result['no_ask'] = round(float(na) * 100)
+        return result
+    return {}
 
 
 def get_order_status(order_id: str) -> dict:
@@ -347,14 +365,13 @@ def run_trade(signal_row: pd.Series, bankroll: float,
     """
     Execute a single trade for one signaled row from kalshi_odds().
 
-    side='yes' (default): Cross-or-rest YES logic unchanged.
-      1. Check EV at yes_ask with taker_fee — if positive, cross the book.
-      2. Else check EV at yes_bid+1¢ with maker_fee — if positive, rest.
-      3. Else skip.
+    Both sides share the same logic structure:
+      AUTO  : cross at ask (taker fee) if EV > 0, else rest at ask-1¢ (maker fee) if EV > 0, else skip.
+      CROSS : cross at ask (taker fee); skip if EV <= 0.
+      REST  : rest at ask-1¢ (maker fee); skip if EV <= 0.
 
-    side='no': Resting NO order at no_ask, always maker (post_only=True).
-      Signal: EV > 0 using (1-fair_prob) vs no_ask at maker_fee.
-      No cross attempt — NO orders always rest.
+    YES: ask = yes_ask,  fair = fair_prob
+    NO : ask = no_ask,   fair = 1 - fair_prob
     """
     ticker    = signal_row['k_ticker']
     fair_prob = float(signal_row['fair_prob'])
@@ -367,29 +384,59 @@ def run_trade(signal_row: pd.Series, bankroll: float,
     sport     = signal_row['sport']
     outcome   = signal_row['outcome']
 
-    # ── NO side: resting limit just below no_ask (top of book), maker fee ───
+    # ── NO side: same AUTO/CROSS/REST logic as YES, using no_ask ────────────
     if side == 'no':
         if no_ask is None:
             return {'status': 'skipped', 'reason': 'no_ask_unavailable',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
         fair_prob_no = 1 - fair_prob
-        # Gate uses the fee that will actually be charged
-        _gate_fee = taker_fee if force_cross else maker_fee
-        if _ev(fair_prob_no, no_ask, _gate_fee) <= 0:
-            return {'status': 'skipped', 'reason': 'no_edge_after_fees',
-                    'ticker': ticker, 'order_id': None, 'contracts': 0}
-        # Cross at no_ask (taker) or rest 1¢ below it (maker)
+        rest_price_no = round(no_ask - 0.01, 2)
+        taker_ev_no   = _ev(fair_prob_no, no_ask,      taker_fee)
+        maker_ev_no   = _ev(fair_prob_no, rest_price_no, maker_fee)
         if force_cross:
+            if taker_ev_no <= 0:
+                return {'status': 'skipped', 'reason': 'no_edge_after_fees',
+                        'ticker': ticker, 'order_id': None, 'contracts': 0}
             order_price = no_ask
             fee_rate    = taker_fee
             order_type  = 'no_cross'
-        else:
-            order_price = round(no_ask - 0.01, 2)
+        elif not limit_only and taker_ev_no > 0:
+            order_price = no_ask
+            fee_rate    = taker_fee
+            order_type  = 'no_cross'
+        elif maker_ev_no > 0:
+            order_price = rest_price_no
             fee_rate    = maker_fee
             order_type  = 'no_rest'
+        else:
+            return {'status': 'skipped', 'reason': 'no_edge_after_fees',
+                    'ticker': ticker, 'order_id': None, 'contracts': 0}
         if order_price < 0.01:
             return {'status': 'skipped', 'reason': 'no_ask_too_low',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
+
+        # Re-fetch live ask before placing to avoid post_only rejection on stale price
+        if order_type == 'no_rest':
+            live_prices = get_market_prices(ticker)
+            live_na = live_prices.get('no_ask')
+            if live_na is not None:
+                live_rest = round(live_na / 100 - 0.01, 2)
+                live_ev   = _ev(fair_prob_no, live_rest, fee_rate)
+                if live_ev <= 0:
+                    return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
+                            'ticker': ticker, 'order_id': None, 'contracts': 0}
+                order_price = live_rest
+        elif order_type == 'no_cross':
+            live_prices = get_market_prices(ticker)
+            live_na = live_prices.get('no_ask')
+            if live_na is not None:
+                live_cross = round(live_na / 100, 2)
+                live_ev    = _ev(fair_prob_no, live_cross, fee_rate)
+                if live_ev <= 0:
+                    return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
+                            'ticker': ticker, 'order_id': None, 'contracts': 0}
+                order_price = live_cross
+
         ev          = _ev(fair_prob_no, order_price, fee_rate)
         price_cents = round(order_price * 100)
         contracts   = kelly_contracts(fair_prob_no, order_price, bankroll, fee_rate)
@@ -449,22 +496,35 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             'reason':     reason,
         }
 
-    # ── YES side (default): cross-or-rest ────────────────────────────────────
-    taker_ev = _ev(fair_prob, yes_ask, taker_fee)
-    if not limit_only and taker_ev > 0:
+    # ── YES side: same AUTO/CROSS/REST logic as NO, using yes_ask ───────────
+    rest_price_yes = round(yes_ask - 0.01, 2)
+    taker_ev_yes   = _ev(fair_prob, yes_ask,       taker_fee)
+    maker_ev_yes   = _ev(fair_prob, rest_price_yes, maker_fee)
+    if force_cross:
+        if taker_ev_yes <= 0:
+            if dashboard:
+                skip_id = f'skip_{ticker}'
+                dashboard.add_position(skip_id, ticker, outcome, 0,
+                                       round(yes_ask * 100), fair_prob, taker_ev_yes)
+                dashboard.update(skip_id, status='skipped')
+            return {'status': 'skipped', 'reason': 'no_edge_after_fees',
+                    'ticker': ticker, 'order_id': None, 'contracts': 0}
         order_price = yes_ask
         fee_rate    = taker_fee
         order_type  = 'cross'
-    elif yes_bid is not None and _ev(fair_prob, round(yes_bid + 0.01, 2), maker_fee) > 0:
-        order_price = round(yes_bid + 0.01, 2)
+    elif not limit_only and taker_ev_yes > 0:
+        order_price = yes_ask
+        fee_rate    = taker_fee
+        order_type  = 'cross'
+    elif maker_ev_yes > 0:
+        order_price = rest_price_yes
         fee_rate    = maker_fee
         order_type  = 'rest'
     else:
-        ev_at_ask = taker_ev
         if dashboard:
             skip_id = f'skip_{ticker}'
             dashboard.add_position(skip_id, ticker, outcome, 0,
-                                   round(yes_ask * 100), fair_prob, ev_at_ask)
+                                   round(yes_ask * 100), fair_prob, taker_ev_yes)
             dashboard.update(skip_id, status='skipped')
         return {'status': 'skipped', 'reason': 'no_edge_after_fees',
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
@@ -487,16 +547,19 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         return {'status': 'skipped', 'reason': 'event_too_soon',
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
 
-    if order_type == 'cross':
-        live_ask_cents = get_market_price(ticker)
-        if live_ask_cents is not None:
+    # Re-fetch live ask before placing to avoid post_only rejection on stale price
+    live_ask_cents = get_market_price(ticker)
+    if live_ask_cents is not None:
+        if order_type == 'cross':
             order_price = live_ask_cents / 100
-            ev          = _ev(fair_prob, order_price, fee_rate)
-            if ev <= 0:
-                return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
-                        'ticker': ticker, 'order_id': None, 'contracts': 0}
-            price_cents = live_ask_cents
-            contracts   = kelly_contracts(fair_prob, order_price, bankroll, fee_rate)
+        else:  # rest: top of book = ask - 1¢
+            order_price = round(live_ask_cents / 100 - 0.01, 2)
+        ev = _ev(fair_prob, order_price, fee_rate)
+        if ev <= 0:
+            return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
+                    'ticker': ticker, 'order_id': None, 'contracts': 0}
+        price_cents = round(order_price * 100)
+        contracts   = kelly_contracts(fair_prob, order_price, bankroll, fee_rate)
 
     if contracts <= 0:
         return {'status': 'skipped', 'reason': 'zero_contracts',
@@ -623,8 +686,28 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
     still open. A second Ctrl+C during cleanup is ignored so cancellation
     always completes.
     """
-    signal_col = 'signal_no' if side == 'no' else 'signal'
-    active = (signals_df[signals_df.get(signal_col, signals_df['signal'])]
+    # Build the same mask web_app uses so REST/CROSS/AUTO modes are consistent
+    def _scol(name):
+        if name in signals_df.columns:
+            return signals_df[name]
+        return pd.Series(False, index=signals_df.index)
+
+    if side == 'no':
+        if force_cross:
+            sig_mask = _scol('signal_no_cross')
+        elif limit_only:
+            sig_mask = _scol('signal_no')
+        else:
+            sig_mask = _scol('signal_no_cross') | _scol('signal_no')
+    else:
+        if force_cross:
+            sig_mask = _scol('signal')
+        elif limit_only:
+            sig_mask = _scol('signal_yes_rest')
+        else:
+            sig_mask = _scol('signal') | _scol('signal_yes_rest')
+
+    active = (signals_df[sig_mask]
               .drop_duplicates(subset='k_ticker')
               .copy())
 
@@ -653,6 +736,7 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
                                dashboard=dashboard, stop_event=stop_event,
                                order_registry=order_registry)
         except Exception as exc:
+            print(f'  [error] {row.get("k_ticker", "?")}  {type(exc).__name__}: {exc}')
             result = {
                 'status':  'error',
                 'ticker':  row.get('k_ticker', ''),
@@ -661,6 +745,8 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
                 'order_id': None,
                 'contracts': 0,
             }
+        if result.get('status') in ('skipped', 'error'):
+            print(f'  [skip]  {result.get("ticker", "?")}  reason={result.get("reason", "?")}')
         with lock:
             results[idx] = result
 

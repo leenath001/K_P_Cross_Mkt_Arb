@@ -229,7 +229,7 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
 
             yes_bid         = k_row['yes_bid']
             no_bid          = k_row['no_bid']
-            rest_price_yes  = round(yes_bid + 0.01, 2) if yes_bid is not None else None
+            rest_price_yes  = round(yes_ask - 0.01, 2) if yes_ask is not None else None
             rest_price_no   = round(no_ask  - 0.01, 2) if no_ask  is not None else None
 
             fp     = p_row['fair_prob']
@@ -240,7 +240,7 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
             signal           = (not mismatched and yes_ask is not None and
                                 fp - yes_ask >= MIN_EDGE and
                                 _taker_ev(fp, yes_ask, fees) > 0)
-            # YES rest: maker posts at yes_bid+1¢
+            # YES rest: maker posts at yes_ask-1¢ (top of book)
             signal_yes_rest  = (not mismatched and rest_price_yes is not None and
                                 fp - rest_price_yes >= MIN_EDGE and
                                 _maker_ev(fp, rest_price_yes, maker_fees) > 0)
