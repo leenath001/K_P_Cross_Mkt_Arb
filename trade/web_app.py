@@ -321,9 +321,24 @@ with tab_trade:
                             if c in signals.columns]
 
             editable = signals[display_cols].copy().reset_index(drop=True)
-            if side == 'no' and 'no_ask' in editable.columns:
-                # Show the resting price the bot will actually post at
-                editable['rest_price'] = (editable['no_ask'] - 0.01).round(2)
+
+            # entry_price: the actual price the bot will fill at (what must be < fair_prob)
+            if side == 'no':
+                if force_cross:
+                    editable['entry_price'] = signals['no_ask'].values
+                else:
+                    editable['entry_price'] = (signals['no_ask'] - 0.01).round(2).values
+            else:  # YES
+                if force_cross:
+                    editable['entry_price'] = signals['yes_ask'].values
+                elif limit_only_mode:
+                    editable['entry_price'] = (signals['yes_bid'] + 0.01).round(2).values
+                else:  # AUTO — per-row: cross signals use yes_ask, rest signals use yes_bid+1¢
+                    editable['entry_price'] = signals.apply(
+                        lambda r: r['yes_ask'] if r.get('signal', False)
+                                  else round(r.get('yes_bid', 0) + 0.01, 2),
+                        axis=1,
+                    ).values
             already_traded = editable['k_ticker'].isin(_pending_tickers)
             editable.insert(0, 'Execute', (~already_traded))
             editable.insert(1, 'Status', already_traded.map({True: '⚠️ pending', False: ''}))

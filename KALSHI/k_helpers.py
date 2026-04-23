@@ -232,18 +232,26 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
             rest_price_yes  = round(yes_bid + 0.01, 2) if yes_bid is not None else None
             rest_price_no   = round(no_ask  - 0.01, 2) if no_ask  is not None else None
 
+            fp     = p_row['fair_prob']
+            fp_no  = 1 - fp
+            MIN_EDGE = 0.01  # require at least 1¢ probability edge above entry price
+
             # YES cross: taker fills at yes_ask
             signal           = (not mismatched and yes_ask is not None and
-                                _taker_ev(p_row['fair_prob'], yes_ask, fees) > 0)
+                                fp - yes_ask >= MIN_EDGE and
+                                _taker_ev(fp, yes_ask, fees) > 0)
             # YES rest: maker posts at yes_bid+1¢
             signal_yes_rest  = (not mismatched and rest_price_yes is not None and
-                                _maker_ev(p_row['fair_prob'], rest_price_yes, maker_fees) > 0)
+                                fp - rest_price_yes >= MIN_EDGE and
+                                _maker_ev(fp, rest_price_yes, maker_fees) > 0)
             # NO cross: taker fills at no_ask
             signal_no_cross  = (not mismatched and no_ask is not None and
-                                _taker_ev(1 - p_row['fair_prob'], no_ask, fees) > 0)
+                                fp_no - no_ask >= MIN_EDGE and
+                                _taker_ev(fp_no, no_ask, fees) > 0)
             # NO rest: maker posts at no_ask-1¢
             signal_no        = (not mismatched and rest_price_no is not None and
-                                _maker_ev(1 - p_row['fair_prob'], rest_price_no, maker_fees) > 0)
+                                fp_no - rest_price_no >= MIN_EDGE and
+                                _maker_ev(fp_no, rest_price_no, maker_fees) > 0)
 
             rows.append({
                 'sport':          p_row['sport'],
