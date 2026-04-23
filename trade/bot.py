@@ -373,8 +373,9 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             return {'status': 'skipped', 'reason': 'no_ask_unavailable',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
         fair_prob_no = 1 - fair_prob
-        # Signal gate at no_ask (worst-case resting price)
-        if _ev(fair_prob_no, no_ask, maker_fee) <= 0:
+        # Gate uses the fee that will actually be charged
+        _gate_fee = taker_fee if force_cross else maker_fee
+        if _ev(fair_prob_no, no_ask, _gate_fee) <= 0:
             return {'status': 'skipped', 'reason': 'no_edge_after_fees',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
         # Cross at no_ask (taker) or rest 1¢ below it (maker)
@@ -392,6 +393,9 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         ev          = _ev(fair_prob_no, order_price, fee_rate)
         price_cents = round(order_price * 100)
         contracts   = kelly_contracts(fair_prob_no, order_price, bankroll, fee_rate)
+        if contracts <= 0:
+            return {'status': 'skipped', 'reason': 'zero_contracts',
+                    'ticker': ticker, 'order_id': None, 'contracts': 0}
 
         now_utc      = datetime.now(timezone.utc)
         commence_utc = pd.Timestamp(commence).tz_convert('UTC').to_pydatetime()
@@ -493,6 +497,10 @@ def run_trade(signal_row: pd.Series, bankroll: float,
                         'ticker': ticker, 'order_id': None, 'contracts': 0}
             price_cents = live_ask_cents
             contracts   = kelly_contracts(fair_prob, order_price, bankroll, fee_rate)
+
+    if contracts <= 0:
+        return {'status': 'skipped', 'reason': 'zero_contracts',
+                'ticker': ticker, 'order_id': None, 'contracts': 0}
 
     order    = place_order(ticker, price_cents, contracts, side='yes',
                            expiration_ts=int(expiry_dt.timestamp()),
