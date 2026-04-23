@@ -267,13 +267,32 @@ with tab_trade:
         side        = 'no' if trade_side == 'NO' else 'yes'
         force_cross = trade_mode.startswith('Cross')
         limit_only_mode = trade_mode.startswith('Rest')
-        sig_col     = 'signal_no' if side == 'no' else 'signal'
 
-        if sig_col in matched_df.columns:
-            signals = matched_df[matched_df[sig_col]]
-        else:
-            signals = matched_df.iloc[0:0]
-            st.warning(f'`{sig_col}` not in results — refetch signals.')
+        # Pick signal mask based on side + mode so fees are correct
+        def _col(name):
+            if name in matched_df.columns:
+                return matched_df[name]
+            return pd.Series(False, index=matched_df.index)
+
+        if side == 'no':
+            if force_cross:
+                sig_mask = _col('signal_no_cross')
+            elif limit_only_mode:
+                sig_mask = _col('signal_no')
+            else:  # AUTO
+                sig_mask = _col('signal_no_cross') | _col('signal_no')
+        else:  # YES
+            if force_cross:
+                sig_mask = _col('signal')
+            elif limit_only_mode:
+                sig_mask = _col('signal_yes_rest')
+            else:  # AUTO
+                sig_mask = _col('signal') | _col('signal_yes_rest')
+
+        signals = matched_df[sig_mask]
+
+        if not any(c in matched_df.columns for c in ('signal', 'signal_yes_rest', 'signal_no', 'signal_no_cross')):
+            st.warning('Signal columns missing — refetch signals.')
 
         m1, m2, m3 = st.columns(3)
         m1.metric('Matches', len(matched_df))
@@ -404,7 +423,7 @@ with tab_trade:
 
                     # Header + cancel button
                     hc1, hc2 = st.columns([4, 1])
-                    hc1.markdown(f'#### Dashboard — {last_side.upper()} · {last_mode}')
+                    hc1.markdown('#### Dashboard')
                     if thread.is_alive():
                         if hc2.button('🛑 Cancel all', key='_cancel_all_btn'):
                             if stop_event:
@@ -416,20 +435,31 @@ with tab_trade:
                     if positions:
                         rows = []
                         for pos in positions.values():
+                            cts    = pos['contracts']
+                            filled = pos.get('filled', 0)
+                            if filled == cts and cts > 0:
+                                disp_status = 'executed'
+                            elif 0 < filled < cts:
+                                disp_status = 'partial'
+                            else:
+                                disp_status = pos['status']
                             rows.append({
-                                'Ticker':     pos['ticker'],
-                                'Outcome':    pos['outcome'],
-                                'Contracts':  pos['contracts'],
-                                'Entry ¢':    pos['entry_price'],
-                                'Mkt Ask ¢':  pos['market_ask'] if pos['market_ask'] is not None else '—',
-                                'Fair entry': f"{pos['fair_entry']:.3f}",
-                                'Fair last':  f"{pos['fair_last']:.3f}",
-                                'Edge':       f"{pos['edge_last']:+.3f}",
-                                'Status':     pos['status'],
-                                'Last ping':  pos['last_ping'],
+                                'Ticker':    pos['ticker'],
+                                'Outcome':   pos['outcome'],
+                                'Contracts': cts,
+                                'Filled':    filled,
+                                'Entry ¢':   pos['entry_price'],
+                                'Mkt Ask ¢': pos['market_ask'] if pos['market_ask'] is not None else '—',
+                                'Fair entry':f"{pos['fair_entry']:.3f}",
+                                'Fair last': f"{pos['fair_last']:.3f}",
+                                'Edge':      f"{pos['edge_last']:+.3f}",
+                                'Status':    disp_status,
+                                'Last ping': pos['last_ping'],
                             })
-                        st.dataframe(pd.DataFrame(rows),
-                                     width="stretch", hide_index=True)
+                        n = len(rows)
+                        st.dataframe(pd.DataFrame(rows), width="stretch",
+                                     hide_index=True,
+                                     height=min(35 * n + 38, 600))
                     else:
                         st.caption('Waiting for orders to be placed...')
 

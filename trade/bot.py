@@ -271,17 +271,17 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
         now_utc = datetime.now(timezone.utc)
 
         # ── Kalshi ping (every kalshi_poll seconds) ──────────────────────────
-        order     = get_order_status(order_id)
-        status    = order.get('status', 'unknown')
-        remaining = order.get('remaining_count_fp')
+        order      = get_order_status(order_id)
+        status     = order.get('status', 'unknown')
         live_price = order.get('yes_price_dollars')
+        fill_fp    = order.get('fill_count_fp')
 
         market_ask = get_market_price(ticker)
         if dashboard:
             dashboard.update(
                 order_id,
                 status=status,
-                contracts=round(float(remaining)) if remaining is not None else None,
+                filled=round(float(fill_fp)) if fill_fp is not None else None,
                 market_ask=market_ask,
             )
 

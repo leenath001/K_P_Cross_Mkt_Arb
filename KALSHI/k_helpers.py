@@ -227,10 +227,23 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
             delta_no   = abs((1 - p_row['fair_prob']) - no_ask) if no_ask is not None else 0
             mismatched = (delta_yes > max_delta) or (delta_no > max_delta)
 
-            signal    = (not mismatched and yes_ask is not None and
-                         _taker_ev(p_row['fair_prob'], yes_ask, fees) > 0)
-            signal_no = (not mismatched and no_ask is not None and
-                         _maker_ev(1 - p_row['fair_prob'], no_ask, maker_fees) > 0)
+            yes_bid         = k_row['yes_bid']
+            no_bid          = k_row['no_bid']
+            rest_price_yes  = round(yes_bid + 0.01, 2) if yes_bid is not None else None
+            rest_price_no   = round(no_ask  - 0.01, 2) if no_ask  is not None else None
+
+            # YES cross: taker fills at yes_ask
+            signal           = (not mismatched and yes_ask is not None and
+                                _taker_ev(p_row['fair_prob'], yes_ask, fees) > 0)
+            # YES rest: maker posts at yes_bid+1¢
+            signal_yes_rest  = (not mismatched and rest_price_yes is not None and
+                                _maker_ev(p_row['fair_prob'], rest_price_yes, maker_fees) > 0)
+            # NO cross: taker fills at no_ask
+            signal_no_cross  = (not mismatched and no_ask is not None and
+                                _taker_ev(1 - p_row['fair_prob'], no_ask, fees) > 0)
+            # NO rest: maker posts at no_ask-1¢
+            signal_no        = (not mismatched and rest_price_no is not None and
+                                _maker_ev(1 - p_row['fair_prob'], rest_price_no, maker_fees) > 0)
 
             rows.append({
                 'sport':          p_row['sport'],
@@ -251,8 +264,10 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
                 'match_score':    round(score, 3),
                 'price_delta':    round(max(delta_yes, delta_no), 3),
                 'mismatched':     mismatched,
-                'signal':         signal,
-                'signal_no':      signal_no,
+                'signal':           signal,
+                'signal_yes_rest':  signal_yes_rest,
+                'signal_no_cross':  signal_no_cross,
+                'signal_no':        signal_no,
             })
 
     df = pd.DataFrame(rows)

@@ -71,6 +71,7 @@ class Dashboard:
                 'ticker':       ticker,
                 'outcome':      outcome,
                 'contracts':    contracts,
+                'filled':       0,
                 'entry_price':  yes_price_cents,  # our order price (fixed)
                 'market_ask':   None,              # live Kalshi market ask
                 'fair_entry':   fair_prob,
@@ -83,7 +84,7 @@ class Dashboard:
 
     def update(self, order_id: str, status: Optional[str] = None,
                fair_prob: Optional[float] = None, edge: Optional[float] = None,
-               contracts: Optional[int] = None, market_ask: Optional[int] = None):
+               filled: Optional[int] = None, market_ask: Optional[int] = None):
         with self._lock:
             pos = self._positions.get(order_id)
             if pos is None:
@@ -95,8 +96,8 @@ class Dashboard:
                 pos['last_ping'] = datetime.now().strftime('%H:%M:%S')
             if edge is not None:
                 pos['edge_last'] = edge
-            if contracts is not None:
-                pos['contracts'] = contracts
+            if filled is not None:
+                pos['filled'] = filled
             if market_ask is not None:
                 pos['market_ask'] = market_ask
             self._refresh()
@@ -121,27 +122,39 @@ class Dashboard:
         )
         table.add_column('Ticker',       style='cyan',    no_wrap=True, max_width=36)
         table.add_column('Outcome',      style='white',   width=10)
-        table.add_column('Cts / Price',  style='white',   justify='right', width=14)
+        table.add_column('Cts',          style='white',   justify='right', width=5)
+        table.add_column('Filled',       style='white',   justify='right', width=7)
+        table.add_column('Price',        style='white',   justify='right', width=7)
         table.add_column('Last Mkt Ask', style='white',   justify='right', width=12)
         table.add_column('Fair (entry)', style='white',   justify='right', width=12)
         table.add_column('Fair (last)',  style='white',   justify='right', width=11)
         table.add_column('Edge',         justify='right', width=7)
-        table.add_column('Status',       width=22)
+        table.add_column('Status',       width=10)
         table.add_column('Last Ping',    style='white',   width=10)
 
         for pos in self._positions.values():
-            style    = _STATUS_STYLE.get(pos['status'], 'white')
-            edge_c   = 'green' if pos['edge_last'] > 0 else 'red'
-            mkt_ask  = f"{pos['market_ask']}¢" if pos['market_ask'] is not None else '—'
+            cts    = pos['contracts']
+            filled = pos.get('filled', 0)
+            if filled == cts and cts > 0:
+                disp_status = 'executed'
+            elif 0 < filled < cts:
+                disp_status = 'partial'
+            else:
+                disp_status = pos['status']
+            style   = _STATUS_STYLE.get(disp_status, 'white')
+            edge_c  = 'green' if pos['edge_last'] > 0 else 'red'
+            mkt_ask = f"{pos['market_ask']}¢" if pos['market_ask'] is not None else '—'
             table.add_row(
                 pos['ticker'][-36:],
                 pos['outcome'],
-                f"{pos['contracts']} @ {pos['entry_price']}¢",
+                str(cts),
+                str(filled),
+                f"{pos['entry_price']}¢",
                 mkt_ask,
                 f"{pos['fair_entry']:.3f}",
                 f"{pos['fair_last']:.3f}",
                 f"[{edge_c}]{pos['edge_last']:+.3f}[/{edge_c}]",
-                f"[{style}]{pos['status']}[/{style}]",
+                f"[{style}]{disp_status}[/{style}]",
                 pos['last_ping'],
             )
 
@@ -194,6 +207,7 @@ class StreamlitDashboard:
                 'ticker':      ticker,
                 'outcome':     outcome,
                 'contracts':   contracts,
+                'filled':      0,
                 'entry_price': yes_price_cents,
                 'market_ask':  None,
                 'fair_entry':  fair_prob,
@@ -205,7 +219,7 @@ class StreamlitDashboard:
 
     def update(self, order_id: str, status: Optional[str] = None,
                fair_prob: Optional[float] = None, edge: Optional[float] = None,
-               contracts: Optional[int] = None, market_ask: Optional[int] = None):
+               filled: Optional[int] = None, market_ask: Optional[int] = None):
         with self._lock:
             pos = self._positions.get(order_id)
             if pos is None:
@@ -215,7 +229,7 @@ class StreamlitDashboard:
                 pos['fair_last']  = fair_prob
                 pos['last_ping']  = datetime.now().strftime('%H:%M:%S')
             if edge is not None:       pos['edge_last']  = edge
-            if contracts is not None:  pos['contracts']  = contracts
+            if filled is not None:     pos['filled']     = filled
             if market_ask is not None: pos['market_ask'] = market_ask
 
     def set_api_usage(self, used: int, remaining: int):
