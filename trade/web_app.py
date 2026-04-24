@@ -12,6 +12,7 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, _TRADE)
 
 import threading
+import time
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -422,6 +423,8 @@ with tab_trade:
                         st.session_state['_trade_results_h']  = results_holder
                         st.session_state['_trade_stop']       = stop_event
                         st.session_state['_trade_side']       = side
+                        st.session_state['_trade_start_time'] = time.time()
+                        st.session_state['_trade_ttl_sec']    = int(trade_ttl_min) * 60
                         _mlab = 'CROSS' if force_cross else ('REST' if limit_only else 'AUTO')
                         st.session_state['_trade_mode'] = _mlab
                         st.rerun()
@@ -444,6 +447,15 @@ with tab_trade:
                 if dash is None:
                     return
                 snap = dash.snapshot()
+
+                # ── Time progress bar ───────────────────────────────────────
+                _start   = st.session_state.get('_trade_start_time', time.time())
+                _ttl     = st.session_state.get('_trade_ttl_sec', 1800)
+                _elapsed = time.time() - _start
+                _rem     = max(_ttl - _elapsed, 0)
+                _pct     = min(_elapsed / max(_ttl, 1), 1.0)
+                _m, _s   = int(_rem // 60), int(_rem % 60)
+                st.progress(_pct, text=f'⏱ {_m}m {_s:02d}s remaining')
 
                 # Header + cancel + cross&cancel buttons
                 hc1, hc2, hc3 = st.columns([3, 1, 1])
