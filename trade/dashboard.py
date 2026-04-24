@@ -65,7 +65,9 @@ class Dashboard:
 
     def add_position(self, order_id: str, ticker: str, outcome: str,
                      contracts: int, yes_price_cents: int,
-                     fair_prob: float, edge: float):
+                     fair_prob: float, edge: float,
+                     event_id: str = '', sport: str = '',
+                     raw_outcome: str = '', fee_rate: float = 0.07):
         with self._lock:
             self._positions[order_id] = {
                 'ticker':       ticker,
@@ -79,6 +81,10 @@ class Dashboard:
                 'edge_last':    edge,
                 'status':       'resting',
                 'last_ping':    datetime.now().strftime('%H:%M:%S'),
+                'event_id':     event_id,
+                'sport':        sport,
+                'raw_outcome':  raw_outcome or outcome,
+                'fee_rate':     fee_rate,
             }
             self._refresh()
 
@@ -201,7 +207,9 @@ class StreamlitDashboard:
     # Same signatures as Dashboard so run_trade can use either
     def add_position(self, order_id: str, ticker: str, outcome: str,
                      contracts: int, yes_price_cents: int,
-                     fair_prob: float, edge: float):
+                     fair_prob: float, edge: float,
+                     event_id: str = '', sport: str = '',
+                     raw_outcome: str = '', fee_rate: float = 0.07):
         with self._lock:
             self._positions[order_id] = {
                 'ticker':      ticker,
@@ -215,6 +223,10 @@ class StreamlitDashboard:
                 'edge_last':   edge,
                 'status':      'resting',
                 'last_ping':   datetime.now().strftime('%H:%M:%S'),
+                'event_id':    event_id,
+                'sport':       sport,
+                'raw_outcome': raw_outcome or outcome,
+                'fee_rate':    fee_rate,
             }
 
     def update(self, order_id: str, status: Optional[str] = None,

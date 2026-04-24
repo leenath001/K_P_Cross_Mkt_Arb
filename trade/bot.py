@@ -187,42 +187,74 @@ def get_market_prices(ticker: str) -> dict:
     return {}
 
 
-def cross_and_cancel_order(ticker: str, order_id: str, fair_last: float,
-                           contracts: int, taker_fee: float,
-                           side: str = 'yes') -> dict:
+def cross_and_cancel_order(ticker: str, order_id: str, contracts: int,
+                           taker_fee: float, side: str = 'yes',
+                           event_id: str = '', sport: str = '',
+                           outcome: str = '',
+                           fair_override: Optional[float] = None) -> dict:
     """
-    Cancel a resting order then re-place as a taker cross if the latest Pinnacle
-    fair prob (fair_last) still gives positive EV at the current ask.
-    Returns {'action': 'crossed'|'canceled'|'error', 'ticker', 'ev', 'ask', ...}
+    Cancel a resting order then re-place as a taker cross if a fresh Pinnacle
+    fair prob still gives EV >= MIN_CROSS_EV at the current Kalshi ask.
+
+    fair_override: pass when the caller already has a freshly-fetched fair prob
+                   (e.g. from _recheck_signal in the monitor loop). When None,
+                   this function pings Pinnacle itself using event_id/sport/outcome.
     """
-    ask_key   = 'no_ask' if side == 'no' else 'yes_ask'
+    ask_key = 'no_ask' if side == 'no' else 'yes_ask'
+
+    # ── 1. Get current Kalshi ask ────────────────────────────────────────────
     prices    = get_market_prices(ticker)
     ask_cents = prices.get(ask_key)
     if ask_cents is None:
         return {'action': 'error', 'ticker': ticker, 'reason': 'no ask price available'}
-
     ask = ask_cents / 100
-    ev  = _ev(fair_last, ask, taker_fee)
 
+    # ── 2. Get fresh Pinnacle fair prob ──────────────────────────────────────
+    if fair_override is not None:
+        fair = fair_override
+    elif event_id and sport and outcome:
+        try:
+            fresh_df = pinnacle_odds(sports=[sport], hrs=72, live=False)
+            match = fresh_df[
+                (fresh_df['event_id'] == event_id) &
+                (fresh_df['outcome']  == outcome)
+            ]
+            if match.empty:
+                cancel_order(order_id)
+                return {'action': 'canceled', 'ticker': ticker,
+                        'reason': 'outcome not found in Pinnacle — canceled without cross'}
+            yes_fair = float(match.iloc[0]['fair_prob'])
+            fair = (1 - yes_fair) if side == 'no' else yes_fair
+        except Exception as exc:
+            return {'action': 'error', 'ticker': ticker,
+                    'reason': f'Pinnacle ping failed: {exc}'}
+    else:
+        return {'action': 'error', 'ticker': ticker,
+                'reason': 'no fair prob source (pass fair_override or event_id+sport+outcome)'}
+
+    # ── 3. EV check with fresh fair prob ────────────────────────────────────
+    ev = _ev(fair, ask, taker_fee)
+
+    # ── 4. Always cancel the resting order ───────────────────────────────────
     if not cancel_order(order_id):
         return {'action': 'error', 'ticker': ticker, 'reason': 'cancel failed'}
 
     if ev < MIN_CROSS_EV:
         return {
             'action': 'canceled', 'ticker': ticker,
-            'ask': ask, 'fair': fair_last, 'ev': round(ev, 4),
+            'ask': ask, 'fair': fair, 'ev': round(ev, 4),
             'reason': f'EV {ev:+.4f} < {MIN_CROSS_EV} — not worth crossing at {ask:.2f}',
         }
 
-    # Re-fetch ask immediately before placing — cancel may have moved prices
+    # ── 5. Re-fetch ask immediately before placing (cancel may move book) ───
     prices2    = get_market_prices(ticker)
     ask_cents2 = prices2.get(ask_key, ask_cents)
     ask2       = ask_cents2 / 100
-    ev2        = _ev(fair_last, ask2, taker_fee)
+    ev2        = _ev(fair, ask2, taker_fee)
     if ev2 < MIN_CROSS_EV:
         return {
             'action': 'canceled', 'ticker': ticker,
-            'ask': ask2, 'fair': fair_last, 'ev': round(ev2, 4),
+            'ask': ask2, 'fair': fair, 'ev': round(ev2, 4),
             'reason': f'EV {ev2:+.4f} < {MIN_CROSS_EV} after re-fetch',
         }
 
@@ -234,7 +266,7 @@ def cross_and_cancel_order(ticker: str, order_id: str, fair_last: float,
         new_oid = order.get('order_id')
         return {
             'action': 'crossed', 'ticker': ticker,
-            'ask': ask2, 'fair': fair_last, 'ev': round(ev2, 4),
+            'ask': ask2, 'fair': fair, 'ev': round(ev2, 4),
             'new_order_id': new_oid, 'contracts': contracts,
         }
     except Exception as exc:
@@ -374,13 +406,15 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
 
         # ── Time-based kill conditions ───────────────────────────────────────
         if elapsed >= max_duration:
-            # Get fresh Pinnacle fair prob, then cross if EV still positive at taker price
+            # Re-ping Pinnacle for fresh fair prob, then cross if EV >= MIN_CROSS_EV
             _, _fair = _recheck_signal(event_id, sport, outcome, order_price,
                                        fee_rate, dashboard=dashboard,
                                        order_id=order_id, side=side)
             if _fair is not None:
-                _xc = cross_and_cancel_order(ticker, order_id, _fair, contracts,
-                                             taker_fee, side)
+                _xc = cross_and_cancel_order(
+                    ticker, order_id, contracts, taker_fee, side,
+                    fair_override=_fair,
+                )
                 _action = _xc.get('action', 'error')
             else:
                 cancel_order(order_id)
@@ -531,7 +565,9 @@ def run_trade(signal_row: pd.Series, bankroll: float,
 
         if dashboard:
             dashboard.add_position(order_id, ticker, f'NO:{outcome}', contracts,
-                                   price_cents, fair_prob_no, ev)
+                                   price_cents, fair_prob_no, ev,
+                                   event_id=event_id, sport=sport,
+                                   raw_outcome=outcome, fee_rate=fee_rate)
 
         reason = _monitor(
             order_id=order_id, ticker=ticker, event_id=event_id,
@@ -649,7 +685,9 @@ def run_trade(signal_row: pd.Series, bankroll: float,
 
     if dashboard:
         dashboard.add_position(order_id, ticker, outcome, contracts,
-                               price_cents, fair_prob, ev)
+                               price_cents, fair_prob, ev,
+                               event_id=event_id, sport=sport,
+                               raw_outcome=outcome, fee_rate=fee_rate)
 
     reason = _monitor(
         order_id=order_id, ticker=ticker, event_id=event_id,

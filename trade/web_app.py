@@ -472,16 +472,18 @@ with tab_trade:
                         _pos_now  = _snap2['positions']
                         _RESTING  = {'resting', 'open', 'pending', 'unknown'}
                         _targets  = [(oid, pos) for oid, pos in _pos_now.items()
-                                     if pos.get('status') in _RESTING
-                                     and pos.get('fair_last') is not None]
+                                     if pos.get('status') in _RESTING]
                         if not _targets:
                             st.info('No resting orders to process.')
                         else:
                             _xc_results = []
                             for _oid, _pos in _targets:
                                 _r = cross_and_cancel_order(
-                                    _pos['ticker'], _oid, _pos['fair_last'],
+                                    _pos['ticker'], _oid,
                                     _pos.get('contracts', 1), taker_fee, side,
+                                    event_id=_pos.get('event_id', ''),
+                                    sport=_pos.get('sport', ''),
+                                    outcome=_pos.get('raw_outcome', ''),
                                 )
                                 _xc_results.append(_r)
                             _n_crossed  = sum(1 for r in _xc_results if r['action'] == 'crossed')
