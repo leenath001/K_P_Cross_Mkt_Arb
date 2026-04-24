@@ -248,6 +248,47 @@ def cancel_order(order_id: str) -> bool:
     return resp.status_code in (200, 204)
 
 
+def get_no_ask_cents(ticker: str) -> Optional[int]:
+    """Current NO ask in cents for a market. Returns None if unavailable."""
+    path = f'/trade-api/v2/markets/{ticker}'
+    resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=_headers('GET', path))
+    if resp.ok:
+        na = resp.json().get('market', {}).get('no_ask_dollars')
+        return round(float(na) * 100) if na else None
+    return None
+
+
+def cross_no_order(ticker: str, order_id: str, entry_cents: int,
+                   contracts: int, expiry_ts: int) -> dict:
+    """
+    Cancel a resting NO order and re-place as taker cross if the current NO ask
+    is still <= entry_cents (price hasn't moved adversely since original approval).
+    Returns {'action': 'crossed'|'canceled'|'error', 'ticker', ...}
+    """
+    current_ask = get_no_ask_cents(ticker)
+    if current_ask is None:
+        return {'action': 'error', 'ticker': ticker, 'reason': 'no ask price available'}
+
+    if not cancel_order(order_id):
+        return {'action': 'error', 'ticker': ticker, 'reason': 'cancel failed'}
+
+    if current_ask > entry_cents:
+        return {
+            'action': 'canceled', 'ticker': ticker,
+            'reason': f'ask moved to {current_ask}¢ > entry {entry_cents}¢',
+        }
+
+    try:
+        order   = place_no_order(ticker, current_ask, contracts, 'cross', expiry_ts)
+        new_oid = order.get('order_id')
+        return {
+            'action': 'crossed', 'ticker': ticker,
+            'ask_cents': current_ask, 'contracts': contracts, 'new_order_id': new_oid,
+        }
+    except Exception as exc:
+        return {'action': 'error', 'ticker': ticker, 'reason': str(exc)}
+
+
 TERMINAL_STATUSES = {'executed', 'filled', 'canceled', 'expired'}
 
 
@@ -324,8 +365,14 @@ def monitor_orders(tracked: list, stop_event: threading.Event, state: dict,
             if status in TERMINAL_STATUSES:
                 reason = f'order_{status}'
             elif elapsed >= ttl_seconds:
-                if cancel_order(oid):
-                    status, reason = 'canceled', 'max_duration'
+                # Cross & cancel: cross at current ask if price is still acceptable
+                _exp = int((datetime.now(timezone.utc) + timedelta(seconds=300)).timestamp())
+                _xc  = cross_no_order(o['ticker'], oid,
+                                      o.get('entry_cents', 0),
+                                      o.get('contracts', 1),
+                                      _exp)
+                status = 'canceled'
+                reason = f'max_duration_{_xc.get("action", "error")}'
             elif o.get('close_time'):
                 to_close = (o['close_time'] - now_utc).total_seconds()
                 if to_close <= close_buffer_seconds:

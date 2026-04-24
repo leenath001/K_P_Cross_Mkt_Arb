@@ -234,12 +234,13 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
 
             fp     = p_row['fair_prob']
             fp_no  = 1 - fp
-            MIN_EDGE = 0.01  # require at least 1¢ probability edge above entry price
+            MIN_EDGE      = 0.01   # minimum raw probability gap above entry price
+            MIN_CROSS_EV  = 0.005  # minimum EV required to fire a taker (cross) signal
 
             # YES cross: taker fills at yes_ask
             signal           = (not mismatched and yes_ask is not None and
                                 fp - yes_ask >= MIN_EDGE and
-                                _taker_ev(fp, yes_ask, fees) > 0)
+                                _taker_ev(fp, yes_ask, fees) >= MIN_CROSS_EV)
             # YES rest: maker posts at yes_ask-1¢ (top of book)
             signal_yes_rest  = (not mismatched and rest_price_yes is not None and
                                 fp - rest_price_yes >= MIN_EDGE and
@@ -247,7 +248,7 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
             # NO cross: taker fills at no_ask
             signal_no_cross  = (not mismatched and no_ask is not None and
                                 fp_no - no_ask >= MIN_EDGE and
-                                _taker_ev(fp_no, no_ask, fees) > 0)
+                                _taker_ev(fp_no, no_ask, fees) >= MIN_CROSS_EV)
             # NO rest: maker posts at no_ask-1¢
             signal_no        = (not mismatched and rest_price_no is not None and
                                 fp_no - rest_price_no >= MIN_EDGE and

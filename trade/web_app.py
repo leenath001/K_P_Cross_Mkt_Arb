@@ -18,7 +18,7 @@ from datetime import datetime
 import config
 from theODDS.p_helpers import pinnacle_odds, fetch_usage, get_api_usage, get_active_sports, check_sports_with_events
 from KALSHI.k_helpers   import kalshi_odds
-from bot                import get_balance, run_all_signals
+from bot                import get_balance, run_all_signals, cross_and_cancel_order
 from dashboard          import StreamlitDashboard
 from settle             import fetch_market_result, compute_pnl
 
@@ -445,14 +445,45 @@ with tab_trade:
                     return
                 snap = dash.snapshot()
 
-                # Header + cancel button
-                hc1, hc2 = st.columns([4, 1])
+                # Header + cancel + cross&cancel buttons
+                hc1, hc2, hc3 = st.columns([3, 1, 1])
                 hc1.markdown('#### Dashboard')
                 if thread.is_alive():
                     if hc2.button('🛑 Cancel all', key='_cancel_all_btn'):
                         if stop_event:
                             stop_event.set()
                         st.warning('Cancellation requested — monitors will close orders.')
+                    if hc3.button('↑ Cross & Cancel', key='_cross_cancel_btn',
+                                  help='Re-check each resting order against Pinnacle fair value. '
+                                       'Crosses if EV still positive at current ask, cancels if not.'):
+                        _snap2    = dash.snapshot()
+                        _pos_now  = _snap2['positions']
+                        _RESTING  = {'resting', 'open', 'pending', 'unknown'}
+                        _targets  = [(oid, pos) for oid, pos in _pos_now.items()
+                                     if pos.get('status') in _RESTING
+                                     and pos.get('fair_last') is not None]
+                        if not _targets:
+                            st.info('No resting orders to process.')
+                        else:
+                            _xc_results = []
+                            for _oid, _pos in _targets:
+                                _r = cross_and_cancel_order(
+                                    _pos['ticker'], _oid, _pos['fair_last'],
+                                    _pos.get('contracts', 1), taker_fee, side,
+                                )
+                                _xc_results.append(_r)
+                            _n_crossed  = sum(1 for r in _xc_results if r['action'] == 'crossed')
+                            _n_canceled = sum(1 for r in _xc_results if r['action'] == 'canceled')
+                            _n_errors   = sum(1 for r in _xc_results if r['action'] == 'error')
+                            st.info(f'↑ {_n_crossed} crossed · {_n_canceled} canceled · {_n_errors} errors')
+                            for _r in _xc_results:
+                                if _r['action'] == 'crossed':
+                                    st.success(f"✓ {_r['ticker']}  {_r.get('contracts')}ct  "
+                                               f"ask={_r['ask']:.2f}  ev={_r['ev']:+.4f}")
+                                elif _r['action'] == 'canceled':
+                                    st.warning(f"✗ {_r['ticker']}  {_r.get('reason', 'canceled')}")
+                                else:
+                                    st.error(f"⚠ {_r['ticker']}  {_r.get('reason', 'error')}")
 
                 # Positions table
                 positions = snap['positions']
@@ -1123,6 +1154,7 @@ with tab_nothing:
                     st.session_state['_nothing_thread'] = t
                     st.session_state['_nothing_state']  = state
                     st.session_state['_nothing_stop']   = stop_event
+                    st.session_state['_nothing_ttl_min'] = ttl_min
                     st.rerun()
 
     # ── Live monitor dashboard ──────────────────────────────────────────────
@@ -1134,13 +1166,49 @@ with tab_nothing:
 
         @st.fragment(run_every='2s' if _alive else None)
         def _nothing_live():
-            hc1, hc2 = st.columns([4, 1])
+            hc1, hc2, hc3 = st.columns([3, 1, 1])
             hc1.markdown('#### Live Nothing Dashboard')
             if _n_thread.is_alive():
                 if hc2.button('🛑 Cancel ALL orders', key='_nothing_live_cancel',
                               type='primary', width="stretch"):
                     _n_stop.set()
                     st.warning('Cancel requested — monitor will kill all open orders.')
+                if hc3.button('↑ Cross & Cancel', key='_nothing_cross_cancel',
+                              help='For each resting order, cross at current ask if price '
+                                   'is unchanged or better, otherwise cancel.'):
+                    _nc_lock = _n_state.get('_lock')
+                    _nc_snap = {}
+                    if _nc_lock:
+                        with _nc_lock:
+                            _nc_snap = {k: dict(v) for k, v in _n_state.items()
+                                        if not k.startswith('_')}
+                    _NC_RESTING = {'pending', 'resting', 'open', 'unknown'}
+                    _nc_ttl     = st.session_state.get('_nothing_ttl_min', 30)
+                    _nc_exp     = int((_dt.now(_tz.utc) + _td(minutes=int(_nc_ttl))).timestamp())
+                    _nc_results = []
+                    for _oid, _rec in _nc_snap.items():
+                        if _rec.get('status') in _NC_RESTING:
+                            _r = _nothing.cross_no_order(
+                                _rec['ticker'], _oid,
+                                _rec.get('entry_cents', 0),
+                                _rec.get('contracts', 1),
+                                _nc_exp,
+                            )
+                            _nc_results.append(_r)
+                    if not _nc_results:
+                        st.info('No resting orders to process.')
+                    else:
+                        _nc_crossed  = sum(1 for r in _nc_results if r['action'] == 'crossed')
+                        _nc_canceled = sum(1 for r in _nc_results if r['action'] == 'canceled')
+                        _nc_errors   = sum(1 for r in _nc_results if r['action'] == 'error')
+                        st.info(f'↑ {_nc_crossed} crossed · {_nc_canceled} canceled · {_nc_errors} errors')
+                        for _r in _nc_results:
+                            if _r['action'] == 'crossed':
+                                st.success(f"✓ {_r['ticker']}  {_r.get('contracts')}ct  @ {_r['ask_cents']}¢")
+                            elif _r['action'] == 'canceled':
+                                st.warning(f"✗ {_r['ticker']}  {_r.get('reason', 'canceled')}")
+                            else:
+                                st.error(f"⚠ {_r['ticker']}  {_r.get('reason', 'error')}")
 
             if '_error' in _n_state:
                 st.error(f'Monitor error: {_n_state["_error"]}')

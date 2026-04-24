@@ -23,6 +23,7 @@ from logger import log_trade, LOG_PATH, NO_LOG_PATH
 BASE_URL          = 'https://api.elections.kalshi.com/trade-api/v2'
 TAKER_FEE         = 0.07   # 7% of winnings — fee when crossing the book
 MAKER_FEE         = 0.03   # 3% of winnings — fee when resting in the book
+MIN_CROSS_EV      = 0.005  # minimum EV required to fire or execute a taker (cross) order
 KALSHI_POLL       = 10     # seconds between Kalshi status checks
 PINNACLE_POLL     = 120    # seconds between Pinnacle re-checks
 MAX_DURATION      = 1800   # 30 min max order lifetime (seconds)
@@ -186,6 +187,60 @@ def get_market_prices(ticker: str) -> dict:
     return {}
 
 
+def cross_and_cancel_order(ticker: str, order_id: str, fair_last: float,
+                           contracts: int, taker_fee: float,
+                           side: str = 'yes') -> dict:
+    """
+    Cancel a resting order then re-place as a taker cross if the latest Pinnacle
+    fair prob (fair_last) still gives positive EV at the current ask.
+    Returns {'action': 'crossed'|'canceled'|'error', 'ticker', 'ev', 'ask', ...}
+    """
+    ask_key   = 'no_ask' if side == 'no' else 'yes_ask'
+    prices    = get_market_prices(ticker)
+    ask_cents = prices.get(ask_key)
+    if ask_cents is None:
+        return {'action': 'error', 'ticker': ticker, 'reason': 'no ask price available'}
+
+    ask = ask_cents / 100
+    ev  = _ev(fair_last, ask, taker_fee)
+
+    if not cancel_order(order_id):
+        return {'action': 'error', 'ticker': ticker, 'reason': 'cancel failed'}
+
+    if ev < MIN_CROSS_EV:
+        return {
+            'action': 'canceled', 'ticker': ticker,
+            'ask': ask, 'fair': fair_last, 'ev': round(ev, 4),
+            'reason': f'EV {ev:+.4f} < {MIN_CROSS_EV} — not worth crossing at {ask:.2f}',
+        }
+
+    # Re-fetch ask immediately before placing — cancel may have moved prices
+    prices2    = get_market_prices(ticker)
+    ask_cents2 = prices2.get(ask_key, ask_cents)
+    ask2       = ask_cents2 / 100
+    ev2        = _ev(fair_last, ask2, taker_fee)
+    if ev2 < MIN_CROSS_EV:
+        return {
+            'action': 'canceled', 'ticker': ticker,
+            'ask': ask2, 'fair': fair_last, 'ev': round(ev2, 4),
+            'reason': f'EV {ev2:+.4f} < {MIN_CROSS_EV} after re-fetch',
+        }
+
+    try:
+        # 5-minute expiry prevents orphaned resting orders if the cross doesn't fill immediately
+        _exp_ts = int((datetime.now(timezone.utc) + timedelta(minutes=5)).timestamp())
+        order   = place_order(ticker, ask_cents2, contracts, side=side, post_only=False,
+                              expiration_ts=_exp_ts)
+        new_oid = order.get('order_id')
+        return {
+            'action': 'crossed', 'ticker': ticker,
+            'ask': ask2, 'fair': fair_last, 'ev': round(ev2, 4),
+            'new_order_id': new_oid, 'contracts': contracts,
+        }
+    except Exception as exc:
+        return {'action': 'error', 'ticker': ticker, 'reason': str(exc)}
+
+
 def get_order_status(order_id: str) -> dict:
     """
     Fetch the current state of an order directly from Kalshi.
@@ -262,6 +317,8 @@ def _recheck_signal(event_id: str, sport: str, outcome: str,
 def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str,
              order_price: float, fee_rate: float, commence_utc: datetime,
              side: str = 'yes',
+             contracts: int = 1,
+             taker_fee: float = TAKER_FEE,
              kalshi_poll: int = KALSHI_POLL,
              pinnacle_poll: int = PINNACLE_POLL,
              max_duration: int = MAX_DURATION,
@@ -275,7 +332,7 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
 
     Kill conditions:
       - Kalshi confirms order closed (executed / canceled / expired)
-      - 30-min hard cap elapsed
+      - 30-min hard cap elapsed → cross & cancel (cross if EV positive, else cancel)
       - Event starts in < pre_event_buffer seconds
       - Pinnacle signal has flipped (EV gone negative)
     """
@@ -314,10 +371,20 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
 
         # ── Time-based kill conditions ───────────────────────────────────────
         if elapsed >= max_duration:
-            cancel_order(order_id)
+            # Get fresh Pinnacle fair prob, then cross if EV still positive at taker price
+            _, _fair = _recheck_signal(event_id, sport, outcome, order_price,
+                                       fee_rate, dashboard=dashboard,
+                                       order_id=order_id, side=side)
+            if _fair is not None:
+                _xc = cross_and_cancel_order(ticker, order_id, _fair, contracts,
+                                             taker_fee, side)
+                _action = _xc.get('action', 'error')
+            else:
+                cancel_order(order_id)
+                _action = 'exceeded'
             if dashboard:
                 dashboard.update(order_id, status='canceled')
-            return 'max_duration_exceeded'
+            return f'max_duration_{_action}'
 
         to_event = (commence_utc - now_utc).total_seconds()
         if to_event <= pre_event_buffer:
@@ -393,13 +460,13 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         taker_ev_no   = _ev(fair_prob_no, no_ask,      taker_fee)
         maker_ev_no   = _ev(fair_prob_no, rest_price_no, maker_fee)
         if force_cross:
-            if taker_ev_no <= 0:
+            if taker_ev_no < MIN_CROSS_EV:
                 return {'status': 'skipped', 'reason': 'no_edge_after_fees',
                         'ticker': ticker, 'order_id': None, 'contracts': 0}
             order_price = no_ask
             fee_rate    = taker_fee
             order_type  = 'no_cross'
-        elif not limit_only and taker_ev_no > 0:
+        elif not limit_only and taker_ev_no >= MIN_CROSS_EV:
             order_price = no_ask
             fee_rate    = taker_fee
             order_type  = 'no_cross'
@@ -468,6 +535,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             sport=sport, outcome=outcome,
             order_price=order_price, fee_rate=fee_rate,
             commence_utc=commence_utc, side='no',
+            contracts=contracts, taker_fee=taker_fee,
             max_duration=max_duration, pre_event_buffer=pre_event_buffer,
             dashboard=dashboard, stop_event=stop_event,
         )
@@ -500,7 +568,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
     taker_ev_yes   = _ev(fair_prob, yes_ask,       taker_fee)
     maker_ev_yes   = _ev(fair_prob, rest_price_yes, maker_fee)
     if force_cross:
-        if taker_ev_yes <= 0:
+        if taker_ev_yes < MIN_CROSS_EV:
             if dashboard:
                 skip_id = f'skip_{ticker}'
                 dashboard.add_position(skip_id, ticker, outcome, 0,
@@ -511,7 +579,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         order_price = yes_ask
         fee_rate    = taker_fee
         order_type  = 'cross'
-    elif not limit_only and taker_ev_yes > 0:
+    elif not limit_only and taker_ev_yes >= MIN_CROSS_EV:
         order_price = yes_ask
         fee_rate    = taker_fee
         order_type  = 'cross'
@@ -585,6 +653,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         sport=sport, outcome=outcome,
         order_price=order_price, fee_rate=fee_rate,
         commence_utc=commence_utc,
+        contracts=contracts, taker_fee=taker_fee,
         max_duration=max_duration, pre_event_buffer=pre_event_buffer,
         dashboard=dashboard, stop_event=stop_event,
     )
