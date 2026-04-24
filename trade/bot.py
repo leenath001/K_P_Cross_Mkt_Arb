@@ -39,11 +39,10 @@ _CLOSED_STATUSES = {'filled', 'executed', 'canceled', 'expired'}
 def _ev(fair_prob: float, price: float, fee_rate: float) -> float:
     """
     Expected value per contract in dollars.
-    Kalshi charges fee_rate * winnings on the winning side.
-      Win (prob=fair_prob): receive (1-price)*(1-fee_rate)
-      Lose               : lose price
+    Kalshi fee = fee_rate * price * (1-price), charged at entry regardless of outcome.
+      EV = fair_prob - price - fee_rate * price * (1-price)
     """
-    return fair_prob * (1 - price) * (1 - fee_rate) - (1 - fair_prob) * price
+    return fair_prob - price - fee_rate * price * (1 - price)
 
 
 def _kelly_fraction(roi: float) -> float:
@@ -66,8 +65,8 @@ def kelly_contracts(fair_prob: float, price: float, bankroll: float,
     """
     Returns the number of YES contracts to buy using partial Kelly.
 
-    Proper binary Kelly with fee on winnings:
-        win_amount = (1 - price) * (1 - fee_rate)
+    Kalshi fee model: fee = fee_rate * price * (1-price) per contract (charged at entry).
+    Net win per contract = (1-price) - fee = (1-price)*(1 - fee_rate*price)
         f* = EV / win_amount   [full Kelly fraction of bankroll]
     Scaled by a ROI-adjusted partial fraction.
     Each contract costs `price` dollars.
@@ -75,7 +74,7 @@ def kelly_contracts(fair_prob: float, price: float, bankroll: float,
     ev = _ev(fair_prob, price, fee_rate)
     if ev <= 0:
         return 0
-    win_amount = (1 - price) * (1 - fee_rate)
+    win_amount = (1 - price) * (1 - fee_rate * price)
     full_kelly = ev / win_amount
     partial    = _kelly_fraction(ev / price)   # ROI = ev per dollar at risk
     dollar_bet = bankroll * full_kelly * partial

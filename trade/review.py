@@ -118,7 +118,8 @@ def print_summary(df: pd.DataFrame):
     }
     RESULT_STYLE = {'WIN': 'bold green', 'LOSS': 'red', 'PENDING': 'yellow'}
 
-    for _, r in df.sort_values('logged_at').iterrows():
+    _CANCELLED = {'canceled', 'signal_flipped', 'max_duration_exceeded', 'event_imminent', 'user_canceled'}
+    for _, r in df[~df['final_status'].isin(_CANCELLED)].sort_values('logged_at').iterrows():
         date_str   = str(r['commence'])[:10] if pd.notna(r['commence']) else '—'
         status_c   = STATUS_STYLE.get(r['final_status'], 'white')
         result_c   = RESULT_STYLE.get(str(r['result']), 'dim')
@@ -194,31 +195,25 @@ def show_charts(df: pd.DataFrame):
     for spine in ax1.spines.values():
         spine.set_edgecolor('#ccc')
 
-    # ── 2. Cumulative EV vs actual PnL ───────────────────────────────────────
+    # ── 2. Cumulative EV vs actual PnL (settled bets only) ───────────────────
     ax2 = fig.add_subplot(gs[0, 1])
-    if not filled.empty:
-        cum_ev = filled.sort_values('logged_at')['ev_total'].cumsum().values
-        ax2.plot(range(len(cum_ev)), cum_ev, color='#3498db', linewidth=2,
+    if not settled.empty:
+        xs      = range(len(settled))
+        cum_ev  = settled['ev_total'].cumsum().values
+        cum_pnl = settled['actual_pnl'].cumsum().values
+        ax2.plot(xs, cum_ev,  color='#3498db', linewidth=2,
                  label='Projected EV', marker='o', markersize=4)
-        if not settled.empty:
-            cum_pnl = settled['actual_pnl'].cumsum().values
-            # align settled indices to their position in filled
-            settled_indices = [
-                i for i, (_, r) in enumerate(filled.sort_values('logged_at').iterrows())
-                if r['result'] in ('WIN', 'LOSS')
-            ]
-            ax2.plot(settled_indices[:len(cum_pnl)], cum_pnl,
-                     color='#2ecc71', linewidth=2, label='Actual PnL',
-                     marker='s', markersize=4)
+        ax2.plot(xs, cum_pnl, color='#2ecc71', linewidth=2,
+                 label='Actual PnL',   marker='s', markersize=4)
         ax2.axhline(0, color='black', linewidth=0.5, linestyle='--')
-        ax2.set_title('Cumulative EV vs Actual PnL')
-        ax2.set_xlabel('Trade #')
+        ax2.set_title('Cumulative EV vs Actual PnL (settled)')
+        ax2.set_xlabel('Settled bet #')
         ax2.set_ylabel('$')
         ax2.legend(fontsize=8)
     else:
-        ax2.text(0.5, 0.5, 'No filled orders yet', ha='center', va='center',
+        ax2.text(0.5, 0.5, 'No settled bets yet', ha='center', va='center',
                  transform=ax2.transAxes, color='gray')
-        ax2.set_title('Cumulative EV vs Actual PnL')
+        ax2.set_title('Cumulative EV vs Actual PnL (settled)')
     ax2.set_facecolor('white')
     ax2.tick_params(colors='black')
     ax2.title.set_color('black')

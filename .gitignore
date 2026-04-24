@@ -1,5 +1,9 @@
 .env
 *.pem
 KALSHI/kalshi_private.pem
-stuff.md
 trade/logs
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo

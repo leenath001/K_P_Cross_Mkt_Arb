@@ -299,225 +299,231 @@ with tab_trade:
         m2.metric(f'{side.upper()} signals', len(signals))
         m3.metric('Events',  matched_df['event_id'].nunique() if 'event_id' in matched_df.columns else '—')
 
-        if not signals.empty:
-            st.markdown(f'#### {side.upper()} Signals')
+        thread_key      = '_trade_thread'
+        _trading_active = thread_key in st.session_state
 
-            # Pending tickers — check BOTH logs so we don't double-bet across sides.
-            # Only count rows that were ACTUALLY filled (executed/filled). Orphans
-            # (canceled/expired that stayed PENDING) shouldn't block new bets.
-            _log = _load_all_logs()
-            _pending_tickers = set()
-            if not _log.empty and 'result' in _log.columns and 'k_ticker' in _log.columns:
-                _really_open = _log[
-                    (_log['result'] == 'PENDING') &
-                    (_log['final_status'].isin(['executed', 'filled']))
-                ]
-                _pending_tickers = set(_really_open['k_ticker'].tolist())
+        # ── Signals table + execute button (hidden while a trade session is active) ──
+        if not _trading_active:
+            if not signals.empty:
+                st.markdown(f'#### {side.upper()} Signals')
 
-            # Compute entry_price (what the bot fills/posts at) before building display
-            # CROSS → taker fills at ask; REST → limit order at bid+1¢ (YES) or ask-1¢ (NO)
-            _sig = signals.copy()
-            if side == 'no':
-                _sig['entry_price'] = (_sig['no_ask'] if force_cross
-                                       else (_sig['no_ask'] - 0.01).round(2))
-            else:
-                if force_cross:
-                    _sig['entry_price'] = _sig['yes_ask']
-                elif limit_only_mode:
-                    _sig['entry_price'] = (_sig['yes_ask'] - 0.01).round(2)
-                else:  # AUTO: cross rows use yes_ask, rest rows use yes_ask-1¢
-                    _sig['entry_price'] = _sig.apply(
-                        lambda r: r['yes_ask'] if r.get('signal', False)
-                                  else round(r.get('yes_ask', 0) - 0.01, 2),
-                        axis=1,
-                    )
+                # Pending tickers — check BOTH logs so we don't double-bet across sides.
+                # Only count rows that were ACTUALLY filled (executed/filled). Orphans
+                # (canceled/expired that stayed PENDING) shouldn't block new bets.
+                _log = _load_all_logs()
+                _pending_tickers = set()
+                if not _log.empty and 'result' in _log.columns and 'k_ticker' in _log.columns:
+                    _really_open = _log[
+                        (_log['result'] == 'PENDING') &
+                        (_log['final_status'].isin(['executed', 'filled']))
+                    ]
+                    _pending_tickers = set(_really_open['k_ticker'].tolist())
 
-            # mkt_ask = Kalshi top-of-book ask (taker price, shown for reference only)
-            mkt_ask_col = 'no_ask' if side == 'no' else 'yes_ask'
-            display_cols = [c for c in ['sport', 'home', 'away', 'commence', 'outcome',
-                                        'fair_prob', 'entry_price', mkt_ask_col,
-                                        'match_score', 'k_ticker']
-                            if c in _sig.columns]
-
-            editable = _sig[display_cols].copy().reset_index(drop=True)
-            editable = editable.rename(columns={mkt_ask_col: 'mkt_ask'})
-            already_traded = editable['k_ticker'].isin(_pending_tickers)
-            editable.insert(0, 'Execute', (~already_traded))
-            editable.insert(1, 'Status', already_traded.map({True: '⚠️ pending', False: ''}))
-            locked_cols = [c for c in editable.columns if c != 'Execute']
-            edited = st.data_editor(
-                editable,
-                width="stretch",
-                hide_index=True,
-                disabled=locked_cols,
-                column_config={'Execute': st.column_config.CheckboxColumn('Execute', default=True)},
-                key=f'signals_editor_{side}',
-            )
-
-            approved_mask    = edited['Execute'].values
-            approved_signals = signals.iloc[approved_mask].copy()
-            n_approved       = int(approved_mask.sum())
-
-            # limit_only is a YES-only option — NO always rests
-            _opt_c1, _opt_c2 = st.columns([2, 1])
-            with _opt_c1:
-                limit_only = limit_only_mode
-                if force_cross:
-                    st.caption(f'{n_approved} {side.upper()} signal(s) — **CROSS** at ask (taker, {taker_fee*100:.0f}% fee)')
-                elif limit_only:
-                    st.caption(f'{n_approved} {side.upper()} signal(s) — **REST** at top of book (maker, {maker_fee*100:.0f}% fee)')
+                # Compute entry_price (what the bot fills/posts at) before building display
+                # CROSS → taker fills at ask; REST → limit order at bid+1¢ (YES) or ask-1¢ (NO)
+                _sig = signals.copy()
+                if side == 'no':
+                    _sig['entry_price'] = (_sig['no_ask'] if force_cross
+                                           else (_sig['no_ask'] - 0.01).round(2))
                 else:
-                    st.caption(f'{n_approved} {side.upper()} signal(s) — **AUTO**: cross if taker EV positive, else rest')
-            with _opt_c2:
-                trade_ttl_min = st.number_input(
-                    'Order TTL (min)', min_value=1, max_value=1440, value=30,
-                    key='trade_ttl_min',
-                    help='Cancel unfilled orders after this many minutes'
+                    if force_cross:
+                        _sig['entry_price'] = _sig['yes_ask']
+                    elif limit_only_mode:
+                        _sig['entry_price'] = (_sig['yes_ask'] - 0.01).round(2)
+                    else:  # AUTO: cross rows use yes_ask, rest rows use yes_ask-1¢
+                        _sig['entry_price'] = _sig.apply(
+                            lambda r: r['yes_ask'] if r.get('signal', False)
+                                      else round(r.get('yes_ask', 0) - 0.01, 2),
+                            axis=1,
+                        )
+
+                # On the NO tab, flip fair_prob to 1-fair_prob so it reads as the NO probability
+                if side == 'no':
+                    _sig['fair_prob'] = (1 - _sig['fair_prob']).round(4)
+
+                # mkt_ask = Kalshi top-of-book ask (taker price, shown for reference only)
+                mkt_ask_col = 'no_ask' if side == 'no' else 'yes_ask'
+                display_cols = [c for c in ['sport', 'home', 'away', 'commence', 'outcome',
+                                            'fair_prob', 'entry_price', mkt_ask_col,
+                                            'match_score', 'k_ticker']
+                                if c in _sig.columns]
+
+                editable = _sig[display_cols].copy().reset_index(drop=True)
+                editable = editable.rename(columns={mkt_ask_col: 'mkt_ask'})
+                already_traded = editable['k_ticker'].isin(_pending_tickers)
+                editable.insert(0, 'Execute', (~already_traded))
+                editable.insert(1, 'Status', already_traded.map({True: '⚠️ pending', False: ''}))
+                locked_cols = [c for c in editable.columns if c != 'Execute']
+                edited = st.data_editor(
+                    editable,
+                    width="stretch",
+                    hide_index=True,
+                    disabled=locked_cols,
+                    column_config={'Execute': st.column_config.CheckboxColumn('Execute', default=True)},
+                    key=f'signals_editor_{side}',
                 )
 
-            btn_label  = f'Execute {n_approved} {side.upper()} Signal(s)'
-            thread_key = '_trade_thread'
-            running    = (thread_key in st.session_state and
-                          st.session_state[thread_key].is_alive())
+                approved_mask    = edited['Execute'].values
+                approved_signals = signals.iloc[approved_mask].copy()
+                n_approved       = int(approved_mask.sum())
 
-            if st.button(btn_label, type='primary',
-                         disabled=(n_approved == 0 or running)):
-                if balance is None:
-                    st.error('Refresh your Kalshi balance in the sidebar before trading.')
-                else:
-                    # Fresh dashboard + shared results holder
-                    dash           = StreamlitDashboard(api_limit=used + remaining)
-                    dash.set_api_usage(used, remaining)
-                    results_holder: list = []
-                    stop_event     = threading.Event()
-
-                    def _worker(approved=approved_signals.copy(),
-                                bk=balance, tf=taker_fee, mf=maker_fee,
-                                lo=limit_only, fc=force_cross, s=side,
-                                ttl=int(trade_ttl_min) * 60,
-                                d=dash, rh=results_holder, se=stop_event):
-                        try:
-                            out = run_all_signals(
-                                approved, bankroll=bk,
-                                taker_fee=tf, maker_fee=mf,
-                                limit_only=lo, force_cross=fc, side=s,
-                                max_duration=ttl,
-                                dashboard=d, stop_event=se,
-                            )
-                            rh.extend(out or [])
-                        except Exception as exc:
-                            rh.append({'status': 'error', 'ticker': '',
-                                       'outcome': '', 'reason': str(exc),
-                                       'order_id': None, 'contracts': 0})
-
-                    t = threading.Thread(target=_worker, daemon=True)
-                    t.start()
-                    st.session_state[thread_key]   = t
-                    st.session_state['_trade_dash']       = dash
-                    st.session_state['_trade_results_h']  = results_holder
-                    st.session_state['_trade_stop']       = stop_event
-                    st.session_state['_trade_side']       = side
-                    _mlab = 'CROSS' if force_cross else ('REST' if limit_only else 'AUTO')
-                    st.session_state['_trade_mode'] = _mlab
-                    st.rerun()
-
-            # ── Live dashboard (while trades are running) ───────────────────
-            if thread_key in st.session_state:
-                thread        = st.session_state[thread_key]
-                dash          = st.session_state.get('_trade_dash')
-                results_h     = st.session_state.get('_trade_results_h', [])
-                stop_event    = st.session_state.get('_trade_stop')
-                last_side     = st.session_state.get('_trade_side', 'yes')
-                last_mode     = st.session_state.get('_trade_mode', 'REST')
-
-                is_alive = thread.is_alive()
-
-                @st.fragment(run_every='1s' if is_alive else None)
-                def _live_panel():
-                    if dash is None:
-                        return
-                    snap = dash.snapshot()
-
-                    # Header + cancel button
-                    hc1, hc2 = st.columns([4, 1])
-                    hc1.markdown('#### Dashboard')
-                    if thread.is_alive():
-                        if hc2.button('🛑 Cancel all', key='_cancel_all_btn'):
-                            if stop_event:
-                                stop_event.set()
-                            st.warning('Cancellation requested — monitors will close orders.')
-
-                    # Positions table
-                    positions = snap['positions']
-                    if positions:
-                        rows = []
-                        for pos in positions.values():
-                            cts    = pos['contracts']
-                            filled = pos.get('filled', 0)
-                            if filled == cts and cts > 0:
-                                disp_status = 'executed'
-                            elif 0 < filled < cts:
-                                disp_status = 'partial'
-                            else:
-                                disp_status = pos['status']
-                            rows.append({
-                                'Ticker':    pos['ticker'],
-                                'Outcome':   pos['outcome'],
-                                'Contracts': cts,
-                                'Filled':    filled,
-                                'Entry ¢':   pos['entry_price'],
-                                'Mkt Ask ¢': pos['market_ask'] if pos['market_ask'] is not None else '—',
-                                'Fair entry':f"{pos['fair_entry']:.3f}",
-                                'Fair last': f"{pos['fair_last']:.3f}",
-                                'Edge':      f"{pos['edge_last']:+.3f}",
-                                'Status':    disp_status,
-                                'Last ping': pos['last_ping'],
-                            })
-                        n = len(rows)
-                        st.dataframe(pd.DataFrame(rows), width="stretch",
-                                     hide_index=True,
-                                     height=min(35 * n + 38, 600))
+                # limit_only is a YES-only option — NO always rests
+                _opt_c1, _opt_c2 = st.columns([2, 1])
+                with _opt_c1:
+                    limit_only = limit_only_mode
+                    if force_cross:
+                        st.caption(f'{n_approved} {side.upper()} signal(s) — **CROSS** at ask (taker, {taker_fee*100:.0f}% fee)')
+                    elif limit_only:
+                        st.caption(f'{n_approved} {side.upper()} signal(s) — **REST** at top of book (maker, {maker_fee*100:.0f}% fee)')
                     else:
-                        st.caption('Waiting for orders to be placed...')
+                        st.caption(f'{n_approved} {side.upper()} signal(s) — **AUTO**: cross if taker EV positive, else rest')
+                with _opt_c2:
+                    trade_ttl_min = st.number_input(
+                        'Order TTL (min)', min_value=1, max_value=1440, value=30,
+                        key='trade_ttl_min',
+                        help='Cancel unfilled orders after this many minutes'
+                    )
 
-                    # API bar
-                    au, al = snap['api_used'], snap['api_limit']
-                    ar = max(al - au, 0)
-                    pct = min(max(au / max(al, 1), 0.0), 1.0)
-                    st.progress(pct, text=f'API  {au} / {al} used  ({ar} remaining)')
+                btn_label = f'Execute {n_approved} {side.upper()} Signal(s)'
+                if st.button(btn_label, type='primary', disabled=(n_approved == 0)):
+                    if balance is None:
+                        st.error('Refresh your Kalshi balance in the sidebar before trading.')
+                    else:
+                        # Fresh dashboard + shared results holder
+                        dash           = StreamlitDashboard(api_limit=used + remaining)
+                        dash.set_api_usage(used, remaining)
+                        results_holder: list = []
+                        stop_event     = threading.Event()
+                        limit_only     = limit_only_mode
 
-                    if not thread.is_alive():
-                        st.success('Trade session complete.')
+                        def _worker(approved=approved_signals.copy(),
+                                    bk=balance, tf=taker_fee, mf=maker_fee,
+                                    lo=limit_only, fc=force_cross, s=side,
+                                    ttl=int(trade_ttl_min) * 60,
+                                    d=dash, rh=results_holder, se=stop_event):
+                            try:
+                                out = run_all_signals(
+                                    approved, bankroll=bk,
+                                    taker_fee=tf, maker_fee=mf,
+                                    limit_only=lo, force_cross=fc, side=s,
+                                    max_duration=ttl,
+                                    dashboard=d, stop_event=se,
+                                )
+                                rh.extend(out or [])
+                            except Exception as exc:
+                                rh.append({'status': 'error', 'ticker': '',
+                                           'outcome': '', 'reason': str(exc),
+                                           'order_id': None, 'contracts': 0})
 
-                _live_panel()
+                        t = threading.Thread(target=_worker, daemon=True)
+                        t.start()
+                        st.session_state[thread_key]          = t
+                        st.session_state['_trade_dash']       = dash
+                        st.session_state['_trade_results_h']  = results_holder
+                        st.session_state['_trade_stop']       = stop_event
+                        st.session_state['_trade_side']       = side
+                        _mlab = 'CROSS' if force_cross else ('REST' if limit_only else 'AUTO')
+                        st.session_state['_trade_mode'] = _mlab
+                        st.rerun()
+            else:
+                st.info(f'No {side.upper()} signals at current fees / threshold.')
 
-                # Cleanup: once thread is done, surface results and clear
-                if not is_alive:
-                    final_results = list(results_h)
-                    st.session_state['last_results'] = final_results
-                    st.session_state['last_side']    = last_side
-                    for k in (thread_key, '_trade_dash', '_trade_results_h',
-                              '_trade_stop', '_trade_side', '_trade_mode'):
-                        st.session_state.pop(k, None)
+        # ── Live dashboard — always at a fixed position in the tree ────────────
+        if _trading_active:
+            thread        = st.session_state[thread_key]
+            dash          = st.session_state.get('_trade_dash')
+            results_h     = st.session_state.get('_trade_results_h', [])
+            stop_event    = st.session_state.get('_trade_stop')
+            last_side     = st.session_state.get('_trade_side', 'yes')
+            last_mode     = st.session_state.get('_trade_mode', 'REST')
 
-            # ── Final results (persist after dashboard clears) ──────────────
-            last_results = st.session_state.get('last_results')
-            last_side    = st.session_state.get('last_side', 'yes')
-            if last_results:
-                st.markdown(f'#### Trade Results — {last_side.upper()}')
-                results_df = pd.DataFrame([r for r in last_results if r is not None])
-                if not results_df.empty:
-                    price_key  = 'no_price' if last_side == 'no' else 'yes_price'
-                    show_cols  = [c for c in ['ticker', 'outcome', 'order_type', 'status',
-                                              'reason', 'contracts', price_key, 'ev']
-                                  if c in results_df.columns]
-                    st.dataframe(results_df[show_cols], width="stretch", hide_index=True)
-                    if 'status' in results_df.columns:
-                        errors = results_df[results_df['status'] == 'error']
-                        for _, err in errors.iterrows():
-                            st.error(f"{err.get('ticker')} — {err.get('reason')}")
-        else:
-            st.info(f'No {side.upper()} signals at current fees / threshold.')
+            is_alive = thread.is_alive()
+
+            @st.fragment(run_every='1s' if is_alive else None)
+            def _live_panel():
+                if dash is None:
+                    return
+                snap = dash.snapshot()
+
+                # Header + cancel button
+                hc1, hc2 = st.columns([4, 1])
+                hc1.markdown('#### Dashboard')
+                if thread.is_alive():
+                    if hc2.button('🛑 Cancel all', key='_cancel_all_btn'):
+                        if stop_event:
+                            stop_event.set()
+                        st.warning('Cancellation requested — monitors will close orders.')
+
+                # Positions table
+                positions = snap['positions']
+                if positions:
+                    rows = []
+                    for pos in positions.values():
+                        cts    = pos['contracts']
+                        filled = pos.get('filled', 0)
+                        if filled == cts and cts > 0:
+                            disp_status = 'executed'
+                        elif 0 < filled < cts:
+                            disp_status = 'partial'
+                        else:
+                            disp_status = pos['status']
+                        rows.append({
+                            'Ticker':    pos['ticker'],
+                            'Outcome':   pos['outcome'],
+                            'Contracts': cts,
+                            'Filled':    filled,
+                            'Entry ¢':   pos['entry_price'],
+                            'Mkt Ask ¢': pos['market_ask'] if pos['market_ask'] is not None else '—',
+                            'Fair entry':f"{pos['fair_entry']:.3f}",
+                            'Fair last': f"{pos['fair_last']:.3f}",
+                            'Edge':      f"{pos['edge_last']:+.3f}",
+                            'Status':    disp_status,
+                            'Last ping': pos['last_ping'],
+                        })
+                    n = len(rows)
+                    st.dataframe(pd.DataFrame(rows), width="stretch",
+                                 hide_index=True,
+                                 height=min(35 * n + 38, 600))
+                else:
+                    st.caption('Waiting for orders to be placed...')
+
+                # API bar
+                au, al = snap['api_used'], snap['api_limit']
+                ar = max(al - au, 0)
+                pct = min(max(au / max(al, 1), 0.0), 1.0)
+                st.progress(pct, text=f'API  {au} / {al} used  ({ar} remaining)')
+
+                if not thread.is_alive():
+                    st.success('Trade session complete.')
+
+            _live_panel()
+
+            # Cleanup once thread finishes, then rerun to restore the signals view
+            if not is_alive:
+                final_results = list(results_h)
+                st.session_state['last_results'] = final_results
+                st.session_state['last_side']    = last_side
+                for k in (thread_key, '_trade_dash', '_trade_results_h',
+                          '_trade_stop', '_trade_side', '_trade_mode'):
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+        # ── Final results (persist after dashboard clears) ──────────────────
+        last_results = st.session_state.get('last_results')
+        last_side    = st.session_state.get('last_side', 'yes')
+        if last_results:
+            st.markdown(f'#### Trade Results — {last_side.upper()}')
+            results_df = pd.DataFrame([r for r in last_results if r is not None])
+            if not results_df.empty:
+                price_key  = 'no_price' if last_side == 'no' else 'yes_price'
+                show_cols  = [c for c in ['ticker', 'outcome', 'order_type', 'status',
+                                          'reason', 'contracts', price_key, 'ev']
+                              if c in results_df.columns]
+                st.dataframe(results_df[show_cols], width="stretch", hide_index=True)
+                if 'status' in results_df.columns:
+                    errors = results_df[results_df['status'] == 'error']
+                    for _, err in errors.iterrows():
+                        st.error(f"{err.get('ticker')} — {err.get('reason')}")
 
         with st.expander('All matches'):
             all_cols = [c for c in ['sport', 'home', 'away', 'commence', 'outcome',

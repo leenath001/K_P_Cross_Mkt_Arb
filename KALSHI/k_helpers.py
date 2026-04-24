@@ -120,12 +120,12 @@ def load_all_mkts(SERIES_TICKER: str):
     return z   
 
 def _taker_ev(fair_prob: float, price: float, taker_fee: float) -> float:
-    """EV per contract for a taker (cross) fill at `price` with fee on winnings."""
-    return fair_prob * (1 - price) * (1 - taker_fee) - (1 - fair_prob) * price
+    """EV per contract. Kalshi fee = fee_rate * price * (1-price), charged on entry."""
+    return fair_prob - price - taker_fee * price * (1 - price)
 
 def _maker_ev(fair_prob: float, price: float, maker_fee: float) -> float:
-    """EV per contract for a maker (resting) fill at `price` with fee on winnings."""
-    return fair_prob * (1 - price) * (1 - maker_fee) - (1 - fair_prob) * price
+    """EV per contract. Kalshi fee = fee_rate * price * (1-price), charged on entry."""
+    return fair_prob - price - maker_fee * price * (1 - price)
 
 
 def _match_event(group: pd.DataFrame, day_k: pd.DataFrame,
