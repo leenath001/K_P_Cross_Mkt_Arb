@@ -305,7 +305,10 @@ def _recheck_signal(event_id: str, sport: str, outcome: str,
         if dashboard is not None and order_id is not None:
             dashboard.update(order_id, fair_prob=our_fair, edge=fresh_ev)
 
-        return fresh_ev > 0, our_fair
+        # Cross orders (taker fee) require MIN_CROSS_EV to stay alive;
+        # REST orders (maker fee) only need EV > 0.
+        min_ev = MIN_CROSS_EV if fee_rate >= TAKER_FEE else 0
+        return fresh_ev >= min_ev, our_fair
     except Exception:
         return False, None
 
