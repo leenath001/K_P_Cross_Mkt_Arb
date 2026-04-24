@@ -750,18 +750,34 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
         with lock:
             results[idx] = result
 
-    threads = [
+    BATCH_SIZE  = 10   # orders fired per wave
+    BATCH_DELAY = 10   # seconds to wait between waves
+
+    rows_list = list(active.iterrows())
+    threads   = [
         threading.Thread(target=_trade, args=(row, i), daemon=True)
-        for i, (_, row) in enumerate(active.iterrows())
+        for i, (_, row) in enumerate(rows_list)
     ]
-    for t in threads:
-        t.start()
 
     try:
+        # Fire each batch then immediately move on — don't wait for monitors to finish.
+        # All threads run concurrently once started; we join ALL at the end.
+        for batch_start in range(0, len(threads), BATCH_SIZE):
+            batch   = threads[batch_start : batch_start + BATCH_SIZE]
+            n_total = len(threads)
+            print(f'  [batch] firing {len(batch)} order(s)  '
+                  f'({batch_start}/{n_total} sent so far)')
+            for t in batch:
+                t.start()
+            if batch_start + BATCH_SIZE < len(threads):
+                time.sleep(BATCH_DELAY)
+
+        # Wait for every thread (all batches) to complete
         for t in threads:
             t.join()
+
     except KeyboardInterrupt:
-        print('\n[shutdown] Ctrl+C received — canceling orders...')
+        print('\n[shutdown] Ctrl+C received — canceling ALL orders...')
         # Block further SIGINTs so cleanup always completes
         prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
@@ -772,7 +788,7 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
             signal.signal(signal.SIGINT, prev_handler)
         raise
     finally:
-        # Safety net: cancel any order this run placed that isn't already closed
+        # Cancel every order placed this run, across all batches
         n = _force_cancel_all(order_registry)
         if n > 0:
             print(f'[shutdown] force-canceled {n} open order(s)')
