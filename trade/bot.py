@@ -462,6 +462,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
               side: str = 'yes',
               max_duration: int = MAX_DURATION,
               pre_event_buffer: int = PRE_EVENT_BUFFER,
+              size_mult: float = 1.0,
               dashboard=None,
               stop_event: Optional[threading.Event] = None,
               order_registry: Optional[list] = None) -> dict:
@@ -545,6 +546,10 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         contracts   = kelly_contracts(fair_prob_no, order_price, bankroll, fee_rate)
         if contracts <= 0:
             return {'status': 'skipped', 'reason': 'zero_contracts',
+                    'ticker': ticker, 'order_id': None, 'contracts': 0}
+        contracts = max(1, round(contracts * size_mult))
+        if contracts * order_price > bankroll:
+            return {'status': 'skipped', 'reason': 'insufficient_cash',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
 
         now_utc      = datetime.now(timezone.utc)
@@ -670,6 +675,10 @@ def run_trade(signal_row: pd.Series, bankroll: float,
     if contracts <= 0:
         return {'status': 'skipped', 'reason': 'zero_contracts',
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
+    contracts = max(1, round(contracts * size_mult))
+    if contracts * order_price > bankroll:
+        return {'status': 'skipped', 'reason': 'insufficient_cash',
+                'ticker': ticker, 'order_id': None, 'contracts': 0}
 
     order    = place_order(ticker, price_cents, contracts, side='yes',
                            expiration_ts=int(expiry_dt.timestamp()),
@@ -784,6 +793,7 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
                     force_cross: bool = False,
                     side: str = 'yes',
                     max_duration: int = MAX_DURATION,
+                    size_mult: float = 1.0,
                     dashboard=None,
                     stop_event: Optional[threading.Event] = None) -> list:
     """
@@ -842,6 +852,7 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
                                taker_fee=taker_fee, maker_fee=maker_fee,
                                limit_only=limit_only, force_cross=force_cross,
                                side=side, max_duration=max_duration,
+                               size_mult=size_mult,
                                dashboard=dashboard, stop_event=stop_event,
                                order_registry=order_registry)
         except Exception as exc:

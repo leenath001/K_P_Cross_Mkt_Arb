@@ -32,6 +32,7 @@ parser.add_argument('--mode',       choices=['rest', 'cross', 'auto'], default='
                                                                           help='Order mode: rest=maker limit (default), cross=taker at ask, auto=cross if EV positive else rest')
 parser.add_argument('--side',       choices=['yes', 'no'], default='yes',         help='Contract side: yes or no')
 parser.add_argument('--threshold',  type=float, default=0.85,                     help='Min fuzzy-match score (default: 0.85)')
+parser.add_argument('--size',       type=float, default=1.0,                      help='Size multiplier on Kelly contracts (default: 1.0; e.g. 2.0 = double Kelly)')
 parser.add_argument('--usage',      action='store_true',                          help='Print The Odds API usage and exit')
 args = parser.parse_args()
 
@@ -136,7 +137,7 @@ def _order_params(row, taker_fee, maker_fee, mode='rest'):
             return None
 
     ev = _ev(row['fair_prob'], price, fee_rate)
-    n  = kelly_contracts(row['fair_prob'], price, bankroll, fee_rate)
+    n  = max(1, round(kelly_contracts(row['fair_prob'], price, bankroll, fee_rate) * args.size))
     return {'price': price, 'fee_rate': fee_rate, 'mode': order_mode,
             'ev': ev, 'n': n, 'cost': round(n * price, 2), 'tev': tev}
 
@@ -181,7 +182,8 @@ print('\n' + '=' * 60)
 if not args.live:
     print('STEP 4 — DRY RUN (pass --live to place real orders)')
     print('=' * 60)
-    print(f'\n  Bankroll: ${bankroll:.2f}')
+    size_tag = f'  (size ×{args.size})' if args.size != 1.0 else ''
+    print(f'\n  Bankroll: ${bankroll:.2f}{size_tag}')
 
     for _, group in signals.groupby('event_id', sort=False):
         _event_header(group)
@@ -244,6 +246,7 @@ else:
                                       limit_only=(args.mode == 'rest'),
                                       force_cross=(args.mode == 'cross'),
                                       side=args.side,
+                                      size_mult=args.size,
                                       dashboard=dash, stop_event=stop_event)
     except KeyboardInterrupt:
         print('\n  All orders canceled.')

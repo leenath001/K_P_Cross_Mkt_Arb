@@ -50,7 +50,10 @@ partial     = 10% if ROI < 2%
               33% if ROI 5–10%
               50% if ROI > 10%
 contracts   = floor(bankroll × full_kelly × partial / price)  [min 1]
+final       = max(1, round(contracts × size_mult))
 ```
+
+**Size multiplier (`--size` / web app "Size ×"):** scales the Kelly output after it's computed. `2.0` doubles every position, `0.5` halves them. If the multiplied contract count would cost more than the available bankroll, the order is **skipped** — no partial fill, no crash, just a clean skip with `reason='insufficient_cash'`.
 
 ---
 
@@ -138,6 +141,7 @@ python trade/cancel_all.py
 | `--force-cross` | off | CROSS only — never rest |
 | `--threshold <f>` | 0.85 | Min fuzzy-match score (0–1) |
 | `--side yes/no` | yes | Trade YES or NO contracts |
+| `--size <f>` | 1.0 | Size multiplier on Kelly contracts (e.g. `2.0` = double; order skipped if cost exceeds balance) |
 
 ---
 

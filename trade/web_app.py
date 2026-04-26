@@ -369,7 +369,7 @@ with tab_trade:
                 n_approved       = int(approved_mask.sum())
 
                 # limit_only is a YES-only option — NO always rests
-                _opt_c1, _opt_c2 = st.columns([2, 1])
+                _opt_c1, _opt_c2, _opt_c3 = st.columns([2, 1, 1])
                 with _opt_c1:
                     limit_only = limit_only_mode
                     if force_cross:
@@ -383,6 +383,12 @@ with tab_trade:
                         'Order TTL (min)', min_value=1, max_value=1440, value=30,
                         key='trade_ttl_min',
                         help='Cancel unfilled orders after this many minutes'
+                    )
+                with _opt_c3:
+                    size_mult = st.number_input(
+                        'Size ×', min_value=0.1, max_value=10.0, value=1.0, step=0.5,
+                        key='trade_size_mult',
+                        help='Multiply Kelly contract count by this factor (e.g. 2.0 = double Kelly). Order is skipped if total cost exceeds available balance.'
                     )
 
                 btn_label = f'Execute {n_approved} {side.upper()} Signal(s)'
@@ -401,6 +407,7 @@ with tab_trade:
                                     bk=balance, tf=taker_fee, mf=maker_fee,
                                     lo=limit_only, fc=force_cross, s=side,
                                     ttl=int(trade_ttl_min) * 60,
+                                    sm=float(size_mult),
                                     d=dash, rh=results_holder, se=stop_event):
                             try:
                                 out = run_all_signals(
@@ -408,6 +415,7 @@ with tab_trade:
                                     taker_fee=tf, maker_fee=mf,
                                     limit_only=lo, force_cross=fc, side=s,
                                     max_duration=ttl,
+                                    size_mult=sm,
                                     dashboard=d, stop_event=se,
                                 )
                                 rh.extend(out or [])
