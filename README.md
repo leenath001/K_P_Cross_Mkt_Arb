@@ -70,20 +70,25 @@ K_P_Cross_Mkt_Arb/
 ├── theODDS/
 │   └── p_helpers.py             # Pinnacle odds via The Odds API
 └── trade/
-    ├── web_app.py               # Streamlit web UI (signal viewer + trade executor)
-    ├── quickstart.py            # CLI entry point (dry run + live)
+    ├── web_app.py               # Streamlit web UI (5 tabs: Trade, Settle, Review, Nothing, Prospect)
+    ├── quickstart.py            # K/P arb CLI (dry run + live)
     ├── bot.py                   # Order placement, monitor loop, Kelly sizer
     ├── dashboard.py             # Rich terminal dashboard + Streamlit state store
     ├── logger.py                # Appends one row to logs/trades.csv per trade
-    ├── settle.py                # Auto-fills WIN/LOSS by querying Kalshi results
-    ├── review.py                # Rich table + matplotlib edge realization charts
+    ├── settle.py                # Auto-fills WIN/LOSS for all 4 logs
+    ├── review.py                # Rich table + charts for all 3 strategies
     ├── nothing.py               # Standalone bot for non-sports Kalshi markets
     ├── nothing_config.py        # Series list for the nothing bot
     ├── nothing_review.py        # Charts for nothing bot trade log
+    ├── prospect.py              # Standalone prospect theory bot
+    ├── prospect_quickstart.py   # Prospect theory CLI (dry run + live)
+    ├── prospect_review.py       # Charts for prospect theory trade log
     ├── cancel_all.py            # Emergency cancel all open orders
     └── logs/
-        ├── trades.csv           # K/P arb trade log
-        └── no_trades.csv        # Nothing bot trade log
+        ├── trades.csv           # K/P arb trade log (YES side)
+        ├── no_trades.csv        # K/P arb trade log (NO side)
+        ├── nothing_trades.csv   # Nothing bot trade log
+        └── prospect_trades.csv  # Prospect theory trade log
 ```
 
 ---
@@ -96,12 +101,13 @@ K_P_Cross_Mkt_Arb/
 streamlit run trade/web_app.py
 ```
 
-Opens a browser UI with four tabs:
+Opens a browser UI with five tabs:
 
-- **Trade** — fetch signals, select YES/NO side + order mode, review and execute
+- **Trade** — fetch K/P arb signals, select YES/NO side + order mode, review and execute
 - **Review** — edge realization charts from `trades.csv`
-- **Settle** — auto-settle pending trades against Kalshi results
+- **Settle** — auto-settle pending trades across all four logs
 - **Nothing** — standalone interface for non-sports Kalshi markets
+- **Prospect** — prospect theory strategy (fetch signals by zone, execute mixed YES/NO)
 
 ### CLI
 
@@ -119,9 +125,15 @@ python trade/quickstart.py --live
 python trade/settle.py --dry-run        # preview
 python trade/settle.py                  # write WIN/LOSS to trades.csv
 
-# Review edge realization
+# Review edge realization (all 3 strategies)
 python trade/review.py                  # table + charts
 python trade/review.py --table          # table only
+
+# Prospect Theory strategy (standalone)
+python trade/prospect_quickstart.py                  # dry run
+python trade/prospect_quickstart.py --live           # live trading
+python trade/prospect_review.py                      # review + charts
+python trade/prospect_review.py --table              # table only
 
 # Emergency cancel all open orders
 python trade/cancel_all.py
@@ -362,6 +374,53 @@ The nothing bot has its own review module (`nothing_review.py`) that generates s
 
 ---
 
+### `trade/prospect.py` — Prospect Theory Strategy
+
+A standalone strategy that exploits **cognitive-bias price distortions** in Kalshi markets, using Pinnacle `fair_prob` as the ground-truth anchor.
+
+**Theoretical basis (prospect theory / probability-weighting):**
+
+| Zone | Condition | Bias | Signal |
+|---|---|---|---|
+| **Longshot** | `yes_ask` $0.05–$0.15 | Retail *overprices* low-probability events | Buy **NO** |
+| **Favorite** | `yes_ask` $0.75–$0.92 | Retail *underprices* high-probability favorites | Buy **YES** |
+
+Signals fire only when the corresponding EV signal from `kalshi_odds()` also fires (real edge required, not just zone membership).
+
+**Completely separate from K/P arb and Nothing bots:**
+- Own log: `trade/logs/prospect_trades.csv`
+- Own CLI: `trade/prospect_quickstart.py`
+- Own web tab: **Prospect** in `web_app.py`
+- Own review: `trade/prospect_review.py`
+
+**Per-row side:** each signal carries `pt_side` (`'yes'` or `'no'`), so a single session can execute mixed YES and NO orders simultaneously.
+
+#### `prospect_quickstart.py` flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--live` | off | Place real orders |
+| `--bankroll <$>` | Kalshi balance | Override balance |
+| `--hrs <n>` | `config.LOOKAHEAD_HRS` | Look-ahead window |
+| `--taker-fee <f>` | 0.07 | Taker fee rate |
+| `--maker-fee <f>` | 0.03 | Maker fee rate |
+| `--threshold <f>` | 0.85 | Min fuzzy-match score |
+| `--mode rest/cross/auto` | rest | Order mode |
+| `--size <f>` | 1.0 | Kelly size multiplier |
+| `--longshot-lo <f>` | 0.05 | Longshot zone lower bound |
+| `--longshot-hi <f>` | 0.15 | Longshot zone upper bound |
+| `--favorite-lo <f>` | 0.75 | Favorite zone lower bound |
+| `--favorite-hi <f>` | 0.92 | Favorite zone upper bound |
+
+#### `prospect_review.py` charts
+
+1. **Edge per trade** — bar chart colored by zone (green = favorite, blue = longshot)
+2. **Cumulative EV vs actual PnL** — split by zone (dashed = projected EV, solid = realized)
+3. **Win rate by zone** — favorite vs longshot with annotated count + PnL
+4. **Win rate by side** — YES vs NO bar chart
+
+---
+
 ### `trade/dashboard.py`
 
 #### `Dashboard`
@@ -436,22 +495,44 @@ On Streamlit Cloud, set these in the **Secrets** panel instead of `.env`.
 
 ## Data Flow
 
+### K/P Arbitrage
 ```
 pinnacle_odds(sports, hrs)
     ↓ vig removal → fair_prob per outcome
 kalshi_odds(pinnacle_df)
     ↓ date filter + fuzzy match + event lock
     ↓ 4 signal columns (yes/no × cross/rest)
-web_app.py or quickstart.py
+web_app.py (Trade tab) or quickstart.py
     ↓ user selects side + mode, reviews signals
 run_all_signals(signals_df, bankroll)
     ↓ batched 10 at a time (rate limit)
     ↓ live price re-fetch → place_order (post_only for REST)
     ↓ _monitor: Kalshi poll 10s, Pinnacle re-check 2min
     ↓ cancel on: signal flip | 30min | event imminent | Ctrl+C
-logger.log_trade() → logs/trades.csv
+logger.log_trade() → logs/trades.csv or no_trades.csv
     ↓
-settle.py → WIN/LOSS/VOID + actual_pnl
+settle.py → WIN/LOSS/VOID + actual_pnl (all 4 logs)
     ↓
 review.py → edge realization charts
+```
+
+### Prospect Theory
+```
+pinnacle_odds(sports, hrs)
+    ↓ vig removal → fair_prob per outcome
+kalshi_odds(pinnacle_df)
+    ↓ (same matching + 4 signal columns)
+prospect_signals(matched_df)
+    ↓ filter to longshot zone ($0.05–$0.15 yes_ask → buy NO)
+    ↓           and favorite zone ($0.75–$0.92 yes_ask → buy YES)
+    ↓ pt_signal fires only when zone + EV signal both active
+web_app.py (Prospect tab) or prospect_quickstart.py
+    ↓ mixed YES/NO execution per pt_side column
+run_prospect_signals(signals_df, bankroll)
+    ↓ same monitor/cancel logic as K/P arb
+prospect.log_prospect_trade() → logs/prospect_trades.csv
+    ↓
+settle.py → WIN/LOSS/VOID per-row (reads pt_side column)
+    ↓
+prospect_review.py → zone/side breakdown charts
 ```

@@ -119,13 +119,9 @@ def load_all_mkts(SERIES_TICKER: str):
     
     return z   
 
-def _taker_ev(fair_prob: float, price: float, taker_fee: float) -> float:
+def _ev(fair_prob: float, price: float, fee_rate: float) -> float:
     """EV per contract. Kalshi fee = fee_rate * price * (1-price), charged on entry."""
-    return fair_prob - price - taker_fee * price * (1 - price)
-
-def _maker_ev(fair_prob: float, price: float, maker_fee: float) -> float:
-    """EV per contract. Kalshi fee = fee_rate * price * (1-price), charged on entry."""
-    return fair_prob - price - maker_fee * price * (1 - price)
+    return fair_prob - price - fee_rate * price * (1 - price)
 
 
 def _match_event(group: pd.DataFrame, day_k: pd.DataFrame,
@@ -240,19 +236,19 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
             # YES cross: taker fills at yes_ask
             signal           = (not mismatched and yes_ask is not None and
                                 fp - yes_ask >= MIN_EDGE and
-                                _taker_ev(fp, yes_ask, fees) >= MIN_CROSS_EV)
+                                _ev(fp, yes_ask, fees) >= MIN_CROSS_EV)
             # YES rest: maker posts at yes_ask-1¢ (top of book)
             signal_yes_rest  = (not mismatched and rest_price_yes is not None and
                                 fp - rest_price_yes >= MIN_EDGE and
-                                _maker_ev(fp, rest_price_yes, maker_fees) > 0)
+                                _ev(fp, rest_price_yes, maker_fees) > 0)
             # NO cross: taker fills at no_ask
             signal_no_cross  = (not mismatched and no_ask is not None and
                                 fp_no - no_ask >= MIN_EDGE and
-                                _taker_ev(fp_no, no_ask, fees) >= MIN_CROSS_EV)
+                                _ev(fp_no, no_ask, fees) >= MIN_CROSS_EV)
             # NO rest: maker posts at no_ask-1¢
             signal_no        = (not mismatched and rest_price_no is not None and
                                 fp_no - rest_price_no >= MIN_EDGE and
-                                _maker_ev(fp_no, rest_price_no, maker_fees) > 0)
+                                _ev(fp_no, rest_price_no, maker_fees) > 0)
 
             rows.append({
                 'sport':          p_row['sport'],
@@ -282,23 +278,47 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
     df = pd.DataFrame(rows)
     df = df.drop_duplicates(subset='k_ticker')
     return df
-    
-
-"""
-System Process: 
-1) Get odds from theODDS API, turn into list[dict] (add empty flag for ticker found in 3)
-2) For each event series, load ALL events into a list
-3) Use multithreading, using a thread for each dictionary to find the coresponding ticker
-    3a) Store ticker in dict 
-4) Present user with option to trade (trading bot)
-
-Considerations: 
-- If I buy the 30k requests, set a flag for how often we re-ping the API
-"""
 
 
-# once we've handled datafreame building, we can move to trading bot 
-    
+def prospect_signals(
+    df: pd.DataFrame,
+    longshot_lo: float = 0.05,
+    longshot_hi: float = 0.15,
+    favorite_lo: float = 0.75,
+    favorite_hi: float = 0.92,
+) -> pd.DataFrame:
+    """
+    Filter kalshi_odds() output to behavioral-bias price zones (prospect theory).
+
+    Longshot zone (yes_ask $0.05–$0.15): retail traders overprice low-prob events
+      → signal fires when NO EV is positive  (buy NO)
+    Favorite zone (yes_ask $0.75–$0.92): retail traders underprice high-prob events
+      → signal fires when YES EV is positive (buy YES)
+
+    Adds columns:
+      pt_zone   : 'longshot' | 'favorite' | None
+      pt_side   : 'no'       | 'yes'      | None
+      pt_signal : bool — in a bias zone AND the corresponding EV signal fires
+    """
+    df = df.copy()
+    in_long = df['yes_ask'].between(longshot_lo, longshot_hi)
+    in_fav  = df['yes_ask'].between(favorite_lo, favorite_hi)
+
+    df['pt_zone'] = None
+    df.loc[in_long, 'pt_zone'] = 'longshot'
+    df.loc[in_fav,  'pt_zone'] = 'favorite'
+
+    df['pt_side'] = None
+    df.loc[in_long, 'pt_side'] = 'no'
+    df.loc[in_fav,  'pt_side'] = 'yes'
+
+    # Requires BOTH: being in a bias zone AND the relevant EV signal already firing
+    long_sig = in_long & (df['signal_no'] | df['signal_no_cross'])
+    fav_sig  = in_fav  & (df['signal']    | df['signal_yes_rest'])
+    df['pt_signal'] = long_sig | fav_sig
+
+    return df
+
 
 
 

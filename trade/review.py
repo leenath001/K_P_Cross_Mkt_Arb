@@ -318,3 +318,16 @@ if __name__ == '__main__':
                 plt.show()
             else:
                 console.print('[dim]No settled Nothing trades yet — nothing to chart.[/dim]')
+
+    # Prospect Theory strategy review
+    import prospect_review as _pr
+    _pr_df = _pr.load_log()
+    if not _pr_df.empty:
+        _pr.print_summary(_pr_df)
+        if not args.table:
+            import matplotlib.pyplot as plt
+            _pr_fig = _pr.build_charts(_pr_df)
+            if _pr_fig:
+                plt.show()
+            else:
+                console.print('[dim]No settled Prospect trades yet — nothing to chart.[/dim]')

@@ -127,8 +127,8 @@ with st.sidebar:
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 
-tab_trade, tab_settle, tab_review, tab_nothing = st.tabs(
-    ['Trade', 'Settle', 'Review', 'Nothing'])
+tab_trade, tab_settle, tab_review, tab_nothing, tab_prospect = st.tabs(
+    ['Trade', 'Settle', 'Review', 'Nothing', 'Prospect'])
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — TRADE
@@ -1305,6 +1305,316 @@ with tab_nothing:
             log_df = pd.read_csv(_nothing.LOG_PATH)
             st.dataframe(log_df.tail(50), width="stretch", hide_index=True)
             st.caption(f'{len(log_df)} total rows · showing last 50')
+        else:
+            st.caption('No trades logged yet.')
+    except Exception as exc:
+        st.error(f'Failed to read log: {exc}')
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 5 — PROSPECT THEORY
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab_prospect:
+    from KALSHI.k_helpers import prospect_signals as _pt_prospect_signals
+    from prospect import run_prospect_signals as _run_prospect_signals
+    PROSPECT_LOG_PATH = os.path.join(_TRADE, 'logs', 'prospect_trades.csv')
+
+    st.subheader('Prospect Theory Strategy')
+    st.caption(
+        'Exploits cognitive-bias price distortions in Kalshi prediction markets. '
+        '**Favorite zone** (yes_ask $0.75–$0.92): retail underprices high-prob events → buy YES. '
+        '**Longshot zone** (yes_ask $0.05–$0.15): retail overprices low-prob events → buy NO.'
+    )
+
+    # ── Sidebar-shared params ─────────────────────────────────────────────────
+    _pt_hrs        = st.session_state.get('hrs', config.LOOKAHEAD_HRS)
+    _pt_taker_fee  = st.session_state.get('taker_fee', 0.07)
+    _pt_maker_fee  = st.session_state.get('maker_fee', 0.03)
+    _pt_threshold  = st.session_state.get('threshold', 0.85)
+
+    # ── Zone bounds ───────────────────────────────────────────────────────────
+    with st.expander('Zone bounds', expanded=False):
+        _ptc1, _ptc2 = st.columns(2)
+        with _ptc1:
+            st.markdown('**Longshot zone** (buy NO)')
+            _pt_long_lo = st.number_input('Lower bound', min_value=0.01, max_value=0.50,
+                                           value=0.05, step=0.01, format='%.2f',
+                                           key='_pt_long_lo')
+            _pt_long_hi = st.number_input('Upper bound', min_value=0.01, max_value=0.50,
+                                           value=0.15, step=0.01, format='%.2f',
+                                           key='_pt_long_hi')
+        with _ptc2:
+            st.markdown('**Favorite zone** (buy YES)')
+            _pt_fav_lo = st.number_input('Lower bound', min_value=0.50, max_value=0.99,
+                                          value=0.75, step=0.01, format='%.2f',
+                                          key='_pt_fav_lo')
+            _pt_fav_hi = st.number_input('Upper bound', min_value=0.50, max_value=0.99,
+                                          value=0.92, step=0.01, format='%.2f',
+                                          key='_pt_fav_hi')
+
+    _pt_fetch = st.button('Fetch Prospect Signals', key='_pt_fetch',
+                          type='primary',
+                          disabled='_pt_thread' in st.session_state)
+
+    if _pt_fetch:
+        with st.spinner('Fetching Pinnacle odds and matching to Kalshi...'):
+            try:
+                _pt_pinn = pinnacle_odds(config.SPORTS, hrs=_pt_hrs, live=False)
+                _pt_matched = kalshi_odds(
+                    _pt_pinn, threshold=_pt_threshold,
+                    fees=_pt_taker_fee, maker_fees=_pt_maker_fee,
+                )
+                _pt_signals_df = _pt_prospect_signals(
+                    _pt_matched,
+                    longshot_lo=_pt_long_lo, longshot_hi=_pt_long_hi,
+                    favorite_lo=_pt_fav_lo,  favorite_hi=_pt_fav_hi,
+                )
+                # Exclude tickers with open PENDING bets in prospect log
+                if os.path.exists(PROSPECT_LOG_PATH) and os.path.getsize(PROSPECT_LOG_PATH) > 0:
+                    _pt_log = pd.read_csv(PROSPECT_LOG_PATH)
+                    _pt_open = set(_pt_log.loc[_pt_log['result'] == 'PENDING', 'k_ticker'])
+                    if _pt_open:
+                        _pt_signals_df = _pt_signals_df[
+                            ~_pt_signals_df['k_ticker'].isin(_pt_open)]
+                st.session_state['_pt_signals']    = _pt_signals_df
+                st.session_state['_pt_show_table'] = True
+            except Exception as exc:
+                st.error(f'Fetch failed: {exc}')
+
+    # ── Show signals ──────────────────────────────────────────────────────────
+    _pt_showing = (st.session_state.get('_pt_show_table')
+                   and '_pt_thread' not in st.session_state)
+    if _pt_showing and '_pt_signals' in st.session_state:
+        _pt_df  = st.session_state['_pt_signals']
+        _pt_sig = _pt_df[_pt_df['pt_signal']]
+        _pt_fav = _pt_sig[_pt_sig['pt_zone'] == 'favorite']
+        _pt_lng = _pt_sig[_pt_sig['pt_zone'] == 'longshot']
+
+        if _pt_sig.empty:
+            st.info('No prospect theory signals at current zone bounds / fees.')
+        else:
+            if not _pt_fav.empty:
+                st.markdown(f'**Favorite zone — {len(_pt_fav)} signal(s)  (buy YES)**')
+                _pt_fav_disp = _pt_fav[['sport', 'home', 'away', 'outcome',
+                                         'fair_prob', 'yes_ask', 'no_ask',
+                                         'match_score', 'k_ticker']].copy()
+                _pt_fav_disp['ev'] = _pt_fav_disp.apply(
+                    lambda r: round(r['fair_prob'] - r['yes_ask'] -
+                                    _pt_taker_fee * r['yes_ask'] * (1 - r['yes_ask']), 4), axis=1)
+                st.dataframe(_pt_fav_disp, hide_index=True, use_container_width=True)
+
+            if not _pt_lng.empty:
+                st.markdown(f'**Longshot zone — {len(_pt_lng)} signal(s)  (buy NO)**')
+                _pt_lng_disp = _pt_lng[['sport', 'home', 'away', 'outcome',
+                                         'fair_prob', 'yes_ask', 'no_ask',
+                                         'match_score', 'k_ticker']].copy()
+                _pt_lng_disp['no_fair'] = (1 - _pt_lng_disp['fair_prob']).round(3)
+                _pt_lng_disp['ev'] = _pt_lng_disp.apply(
+                    lambda r: round((1 - r['fair_prob']) - r['no_ask'] -
+                                    _pt_taker_fee * r['no_ask'] * (1 - r['no_ask']), 4)
+                    if r['no_ask'] is not None else None, axis=1)
+                st.dataframe(_pt_lng_disp, hide_index=True, use_container_width=True)
+
+            # ── Execute controls ──────────────────────────────────────────────
+            st.divider()
+            _pt_oc1, _pt_oc2, _pt_oc3, _pt_oc4 = st.columns([2, 1, 1, 1])
+            with _pt_oc1:
+                _pt_mode = st.selectbox('Order mode', ['rest', 'cross', 'auto'],
+                                         key='_pt_mode')
+            with _pt_oc2:
+                _pt_ttl = st.number_input('TTL (min)', min_value=5, max_value=1440,
+                                           value=30, key='_pt_ttl')
+            with _pt_oc3:
+                _pt_size = st.number_input('Size ×', min_value=0.1, max_value=10.0,
+                                            value=1.0, step=0.5, key='_pt_size_mult')
+            with _pt_oc4:
+                balance = st.session_state.get('balance')
+
+            _pt_n = len(_pt_sig)
+            if st.button(f'Execute {_pt_n} Prospect Signal(s)',
+                          type='primary', key='_pt_execute',
+                          disabled=(balance is None)):
+                if balance is None:
+                    st.error('Refresh Kalshi balance in the sidebar before trading.')
+                else:
+                    _pt_dash       = StreamlitDashboard(api_limit=1000)
+                    _pt_results_h: list = []
+                    _pt_stop       = threading.Event()
+                    _pt_limit_only = (_pt_mode == 'rest')
+                    _pt_force_cross= (_pt_mode == 'cross')
+
+                    def _pt_worker(sdf=_pt_sig.copy(), bk=balance,
+                                   tf=_pt_taker_fee, mf=_pt_maker_fee,
+                                   lo=_pt_limit_only, fc=_pt_force_cross,
+                                   ttl=int(_pt_ttl) * 60, sm=float(_pt_size),
+                                   d=_pt_dash, rh=_pt_results_h, se=_pt_stop):
+                        try:
+                            out = _run_prospect_signals(
+                                sdf, bankroll=bk,
+                                taker_fee=tf, maker_fee=mf,
+                                limit_only=lo, force_cross=fc,
+                                max_duration=ttl, size_mult=sm,
+                                dashboard=d, stop_event=se,
+                            )
+                            rh.extend(out or [])
+                        except Exception as exc:
+                            rh.append({'status': 'error', 'ticker': '',
+                                       'outcome': '', 'reason': str(exc),
+                                       'order_id': None, 'contracts': 0})
+
+                    _pt_t = threading.Thread(target=_pt_worker, daemon=True)
+                    _pt_t.start()
+                    st.session_state['_pt_thread']      = _pt_t
+                    st.session_state['_pt_dash']        = _pt_dash
+                    st.session_state['_pt_results_h']   = _pt_results_h
+                    st.session_state['_pt_stop']        = _pt_stop
+                    st.session_state['_pt_start_time']  = time.time()
+                    st.session_state['_pt_ttl_sec']     = int(_pt_ttl) * 60
+                    st.session_state['_pt_show_table']  = False
+                    st.rerun()
+
+    # ── Live dashboard ────────────────────────────────────────────────────────
+    if '_pt_thread' in st.session_state:
+        _pt_thread   = st.session_state['_pt_thread']
+        _pt_dash_obj = st.session_state.get('_pt_dash')
+        _pt_results_h= st.session_state.get('_pt_results_h', [])
+        _pt_stop_ev  = st.session_state.get('_pt_stop')
+        _pt_alive    = _pt_thread.is_alive()
+
+        @st.fragment(run_every='1s' if _pt_alive else None)
+        def _pt_live_panel():
+            if _pt_dash_obj is None:
+                return
+            _pt_snap = _pt_dash_obj.snapshot()
+
+            # Progress bar
+            _pt_s  = st.session_state.get('_pt_start_time', time.time())
+            _pt_tl = st.session_state.get('_pt_ttl_sec', 1800)
+            _pt_el = time.time() - _pt_s
+            _pt_rm = max(_pt_tl - _pt_el, 0)
+            _pt_pc = min(_pt_el / max(_pt_tl, 1), 1.0)
+            _pt_mm, _pt_ss = int(_pt_rm // 60), int(_pt_rm % 60)
+            st.progress(_pt_pc, text=f'⏱ {_pt_mm}m {_pt_ss:02d}s remaining')
+
+            hc1, hc2, hc3 = st.columns([3, 1, 1])
+            hc1.markdown('#### Prospect Dashboard')
+            if _pt_thread.is_alive():
+                if hc2.button('🛑 Cancel all', key='_pt_cancel_btn'):
+                    if _pt_stop_ev:
+                        _pt_stop_ev.set()
+                    st.warning('Cancellation requested.')
+                if hc3.button('↑ Cross & Cancel', key='_pt_cc_btn',
+                              help='Re-ping Pinnacle, cross if EV > 0.005 else cancel.'):
+                    _pt_snap2   = _pt_dash_obj.snapshot()
+                    _pt_pos_now = _pt_snap2['positions']
+                    _PT_REST    = {'resting', 'open', 'pending', 'unknown'}
+                    _pt_targets = [(oid, pos) for oid, pos in _pt_pos_now.items()
+                                   if pos.get('status') in _PT_REST]
+                    if not _pt_targets:
+                        st.info('No resting orders to process.')
+                    else:
+                        _pt_xc = []
+                        for _oid, _pos in _pt_targets:
+                            _pt_side = _pos.get('side', 'yes')
+                            _r = cross_and_cancel_order(
+                                _pos['ticker'], _oid,
+                                _pos.get('contracts', 1),
+                                _pt_taker_fee, _pt_side,
+                                event_id=_pos.get('event_id', ''),
+                                sport=_pos.get('sport', ''),
+                                outcome=_pos.get('raw_outcome', ''),
+                            )
+                            _pt_xc.append(_r)
+                        _nc = sum(1 for r in _pt_xc if r['action'] == 'crossed')
+                        _nx = sum(1 for r in _pt_xc if r['action'] == 'canceled')
+                        _ne = sum(1 for r in _pt_xc if r['action'] == 'error')
+                        st.info(f'↑ {_nc} crossed · {_nx} canceled · {_ne} errors')
+                        for _r in _pt_xc:
+                            if _r['action'] == 'crossed':
+                                st.success(f"✓ {_r['ticker']}  {_r.get('contracts')}ct  "
+                                           f"ev={_r['ev']:+.4f}")
+                            elif _r['action'] == 'canceled':
+                                st.warning(f"✗ {_r['ticker']}  {_r.get('reason', 'canceled')}")
+                            else:
+                                st.error(f"⚠ {_r['ticker']}  {_r.get('reason', 'error')}")
+
+            positions = _pt_snap['positions']
+            if positions:
+                rows = []
+                for pos in positions.values():
+                    cts    = pos['contracts']
+                    filled = pos.get('filled', 0)
+                    if filled == cts and cts > 0:
+                        disp_status = 'executed'
+                    elif 0 < filled < cts:
+                        disp_status = 'partial'
+                    else:
+                        disp_status = pos['status']
+                    rows.append({
+                        'Ticker':    pos['ticker'],
+                        'Zone':      pos.get('pt_zone', '—'),
+                        'Side':      pos.get('side', '—'),
+                        'Outcome':   pos['outcome'],
+                        'Contracts': cts,
+                        'Filled':    filled,
+                        'Entry ¢':   pos['entry_price'],
+                        'Fair':      f"{pos['fair_entry']:.3f}",
+                        'Edge':      f"{pos['edge_last']:+.3f}",
+                        'Status':    disp_status,
+                        'Last ping': pos['last_ping'],
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption('Waiting for orders to be placed...')
+
+            if not _pt_thread.is_alive():
+                st.success('Prospect session complete.')
+
+        _pt_live_panel()
+
+        if not _pt_alive:
+            st.session_state.pop('_pt_thread', None)
+            st.session_state.pop('_pt_dash', None)
+            st.session_state.pop('_pt_results_h', None)
+            st.session_state.pop('_pt_stop', None)
+
+    # ── Review section ────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown('#### Prospect Theory Performance')
+    try:
+        import trade.prospect_review as _ptrv
+        import matplotlib.pyplot as _pt_plt
+        _pt_rv_df = _ptrv.load_log()
+        if not _pt_rv_df.empty:
+            _pt_m = _ptrv.compute_metrics(_pt_rv_df)
+            if _pt_m:
+                _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+                _mc1.metric('Settled', _pt_m['settled'])
+                _mc2.metric('Win Rate',
+                            f'{_pt_m["win_rate"]:.0%}' if _pt_m['win_rate'] is not None else '—')
+                _mc3.metric('PnL',
+                            f'${_pt_m["pnl"]:+.2f}')
+                _mc4.metric('ROI',
+                            f'{_pt_m["emp_ev_dol"]:.1%}' if _pt_m['emp_ev_dol'] is not None else '—')
+            _pt_rv_fig = _ptrv.build_charts(_pt_rv_df)
+            if _pt_rv_fig:
+                st.pyplot(_pt_rv_fig)
+                _pt_plt.close(_pt_rv_fig)
+            else:
+                st.caption('No settled trades yet — nothing to chart.')
+        else:
+            st.caption('No prospect trades logged yet.')
+    except Exception as exc:
+        st.error(f'Prospect metrics error: {exc}')
+
+    # ── Log viewer ────────────────────────────────────────────────────────────
+    st.divider()
+    st.caption(f'Log: `{PROSPECT_LOG_PATH}`')
+    try:
+        if os.path.exists(PROSPECT_LOG_PATH) and os.path.getsize(PROSPECT_LOG_PATH) > 0:
+            _pt_log_df = pd.read_csv(PROSPECT_LOG_PATH)
+            st.dataframe(_pt_log_df.tail(50), use_container_width=True, hide_index=True)
+            st.caption(f'{len(_pt_log_df)} total rows · showing last 50')
         else:
             st.caption('No trades logged yet.')
     except Exception as exc:

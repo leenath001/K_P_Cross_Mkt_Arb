@@ -22,10 +22,11 @@ import pandas as pd
 from rich.console import Console
 from KALSHI.k_helpers import kalshi_headers
 
-LOG_DIR          = os.path.join(os.path.dirname(__file__), 'logs')
-LOG_PATH         = os.path.join(LOG_DIR, 'trades.csv')
-NO_LOG_PATH      = os.path.join(LOG_DIR, 'no_trades.csv')
-NOTHING_LOG_PATH = os.path.join(LOG_DIR, 'nothing_trades.csv')
+LOG_DIR              = os.path.join(os.path.dirname(__file__), 'logs')
+LOG_PATH             = os.path.join(LOG_DIR, 'trades.csv')
+NO_LOG_PATH          = os.path.join(LOG_DIR, 'no_trades.csv')
+NOTHING_LOG_PATH     = os.path.join(LOG_DIR, 'nothing_trades.csv')
+PROSPECT_LOG_PATH    = os.path.join(LOG_DIR, 'prospect_trades.csv')
 BASE_URL    = 'https://api.elections.kalshi.com/trade-api/v2'
 
 console = Console()
@@ -132,8 +133,13 @@ def compute_pnl(result: str, contracts: int,
     return 0.0   # void
 
 
-def _settle_file(path: str, side: str, dry_run: bool) -> int:
-    """Settle one log file. Returns number of rows updated."""
+def _settle_file(path: str, side: str, dry_run: bool,
+                 side_col: Optional[str] = None) -> int:
+    """
+    Settle one log file. Returns number of rows updated.
+    side_col: if set, read the trade side from that column per row
+              (used for prospect_trades.csv where pt_side varies per row).
+    """
     label = os.path.basename(path)
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         console.print(f'[dim]{label}: no log[/dim]')
@@ -149,17 +155,20 @@ def _settle_file(path: str, side: str, dry_run: bool) -> int:
         console.print(f'[dim]{label}: no pending trades[/dim]')
         return 0
 
-    console.print(f'\n[bold]{label}[/bold] ({side.upper()} side) — checking [cyan]{len(pending)}[/cyan] pending\n')
-
-    # For NO trades the winning Kalshi result is 'no', not 'yes'
-    win_result  = 'no' if side == 'no' else 'yes'
-    loss_result = 'yes' if side == 'no' else 'no'
-    label_map   = {win_result: 'WIN', loss_result: 'LOSS', 'void': 'VOID'}
+    side_label = 'mixed' if side_col else side.upper()
+    console.print(f'\n[bold]{label}[/bold] ({side_label}) — checking [cyan]{len(pending)}[/cyan] pending\n')
 
     updates = 0
     for idx, row in pending.iterrows():
-        ticker = row['k_ticker']
-        desc   = row.get('outcome') if 'outcome' in row.index else row.get('title', '')
+        ticker   = row['k_ticker']
+        desc     = row.get('outcome') if 'outcome' in row.index else row.get('title', '')
+        row_side = row[side_col] if (side_col and side_col in df.columns and
+                                     pd.notna(row.get(side_col))) else side
+
+        win_result  = 'no' if row_side == 'no' else 'yes'
+        loss_result = 'yes' if row_side == 'no' else 'no'
+        label_map   = {win_result: 'WIN', loss_result: 'LOSS', 'void': 'VOID'}
+
         console.print(f'  {ticker}  {desc}', end='  ')
 
         k_result = fetch_market_result(ticker)
@@ -177,7 +186,7 @@ def _settle_file(path: str, side: str, dry_run: bool) -> int:
                           int(row['contracts']),
                           float(row['entry_price']),
                           float(row['fee_rate']),
-                          side=side)
+                          side=row_side)
         pnl_c = 'green' if pnl >= 0 else 'red'
 
         console.print(
@@ -207,11 +216,14 @@ def run(dry_run: bool = False):
         refresh_statuses(LOG_PATH)
         refresh_statuses(NO_LOG_PATH)
         refresh_statuses(NOTHING_LOG_PATH)
+        refresh_statuses(PROSPECT_LOG_PATH)
 
     total = 0
-    total += _settle_file(LOG_PATH,         side='yes', dry_run=dry_run)
-    total += _settle_file(NO_LOG_PATH,      side='no',  dry_run=dry_run)
-    total += _settle_file(NOTHING_LOG_PATH, side='no',  dry_run=dry_run)
+    total += _settle_file(LOG_PATH,          side='yes', dry_run=dry_run)
+    total += _settle_file(NO_LOG_PATH,       side='no',  dry_run=dry_run)
+    total += _settle_file(NOTHING_LOG_PATH,  side='no',  dry_run=dry_run)
+    total += _settle_file(PROSPECT_LOG_PATH, side='yes', dry_run=dry_run,
+                          side_col='pt_side')
     if total == 0:
         console.print('\n[yellow]No markets have settled yet.[/yellow]')
 

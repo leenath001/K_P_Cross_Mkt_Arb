@@ -23,36 +23,27 @@ Usage:
 Logs to trade/logs/nothing_trades.csv (separate from trades.csv / no_trades.csv).
 """
 
-import os, sys, csv, uuid, base64, signal, argparse, threading, time
+import os, sys, csv, uuid, signal, argparse, threading, time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
-from dotenv import load_dotenv
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 
-# ── Paths & self-contained Kalshi auth ───────────────────────────────────────
+# ── Paths ────────────────────────────────────────────────────────────────────
 
 _HERE   = os.path.dirname(os.path.abspath(__file__))
 _ROOT   = os.path.dirname(_HERE)
 sys.path.insert(0, _ROOT)
+sys.path.insert(0, _HERE)
 import config  # read-only: SPORTS_CONFIG for sports-series blocklist
 from nothing_config import NOTHING_SERIES, tickers as _nothing_tickers
+from KALSHI.k_helpers import kalshi_headers
+from bot import cancel_order, get_order_status, get_balance
 
 LOG_DIR  = os.path.join(_HERE, 'logs')
 LOG_PATH = os.path.join(LOG_DIR, 'nothing_trades.csv')
 
-load_dotenv(os.path.join(_ROOT, '.env'), override=True)
-API_KEY     = os.getenv('API_KEY')
-API_PRIVATE = os.getenv('API_PRIVATE')
-BASE_URL    = 'https://api.elections.kalshi.com/trade-api/v2'
-
-assert API_PRIVATE, 'API_PRIVATE not found — set it in .env'
-_pem = (b'-----BEGIN RSA PRIVATE KEY-----\n' +
-        API_PRIVATE.strip().encode() +
-        b'\n-----END RSA PRIVATE KEY-----\n')
-_PRIVATE_KEY = serialization.load_pem_private_key(_pem, password=None)
+BASE_URL = 'https://api.elections.kalshi.com/trade-api/v2'
 
 TAKER_FEE = 0.07
 MAKER_FEE = 0.03
@@ -67,29 +58,13 @@ FIELDS = [
 ]
 
 
-def _headers(method: str, path: str) -> dict:
-    ts  = str(int(datetime.now(timezone.utc).timestamp() * 1000))
-    msg = (ts + method.upper() + path).encode()
-    sig = _PRIVATE_KEY.sign(
-        msg,
-        asym_padding.PSS(mgf=asym_padding.MGF1(hashes.SHA256()),
-                         salt_length=asym_padding.PSS.MAX_LENGTH),
-        hashes.SHA256(),
-    )
-    return {
-        'KALSHI-ACCESS-KEY':       API_KEY,
-        'KALSHI-ACCESS-TIMESTAMP': ts,
-        'KALSHI-ACCESS-SIGNATURE': base64.b64encode(sig).decode(),
-    }
-
-
 # ── Market fetch ─────────────────────────────────────────────────────────────
 
 def fetch_series_markets(series: str) -> list:
     """All open markets under a series_ticker."""
     path = '/trade-api/v2/markets'
     resp = requests.get(f'{BASE_URL}/markets',
-                        headers=_headers('GET', path),
+                        headers=kalshi_headers('GET', path),
                         params={'series_ticker': series, 'status': 'open', 'limit': 500})
     resp.raise_for_status()
     return resp.json().get('markets', [])
@@ -97,7 +72,7 @@ def fetch_series_markets(series: str) -> list:
 
 def fetch_ticker(ticker: str) -> Optional[dict]:
     path = f'/trade-api/v2/markets/{ticker}'
-    resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=_headers('GET', path))
+    resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=kalshi_headers('GET', path))
     if not resp.ok:
         return None
     return resp.json().get('market')
@@ -234,24 +209,19 @@ def place_no_order(ticker: str, no_price_cents: int, count: int,
     if mode == 'rest':
         body['post_only'] = True
     resp = requests.post(f'{BASE_URL}/portfolio/orders',
-                         headers={**_headers('POST', path), 'Content-Type': 'application/json'},
+                         headers={**kalshi_headers('POST', path), 'Content-Type': 'application/json'},
                          json=body)
     if not resp.ok:
         raise requests.HTTPError(f'{resp.status_code} {resp.reason} — {resp.text}', response=resp)
     return resp.json().get('order', {})
 
 
-def cancel_order(order_id: str) -> bool:
-    path = f'/trade-api/v2/portfolio/orders/{order_id}'
-    resp = requests.delete(f'{BASE_URL}/portfolio/orders/{order_id}',
-                           headers=_headers('DELETE', path))
-    return resp.status_code in (200, 204)
 
 
 def get_no_ask_cents(ticker: str) -> Optional[int]:
     """Current NO ask in cents for a market. Returns None if unavailable."""
     path = f'/trade-api/v2/markets/{ticker}'
-    resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=_headers('GET', path))
+    resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=kalshi_headers('GET', path))
     if resp.ok:
         na = resp.json().get('market', {}).get('no_ask_dollars')
         return round(float(na) * 100) if na else None
@@ -292,14 +262,6 @@ def cross_no_order(ticker: str, order_id: str, entry_cents: int,
 TERMINAL_STATUSES = {'executed', 'filled', 'canceled', 'expired'}
 
 
-def get_order_status(order_id: str) -> dict:
-    """Single-order lookup. Returns {} or the order dict."""
-    path = f'/trade-api/v2/portfolio/orders/{order_id}'
-    resp = requests.get(f'{BASE_URL}/portfolio/orders/{order_id}',
-                        headers=_headers('GET', path))
-    if resp.ok:
-        return resp.json().get('order', {})
-    return {'status': 'unknown', 'order_id': order_id}
 
 
 def monitor_orders(tracked: list, stop_event: threading.Event, state: dict,
@@ -406,17 +368,10 @@ def monitor_orders(tracked: list, stop_event: threading.Event, state: dict,
 def list_my_open_orders() -> list:
     path = '/trade-api/v2/portfolio/orders'
     resp = requests.get(f'{BASE_URL}/portfolio/orders',
-                        headers=_headers('GET', path),
+                        headers=kalshi_headers('GET', path),
                         params={'status': 'resting', 'limit': 200})
     resp.raise_for_status()
     return resp.json().get('orders', [])
-
-
-def get_balance() -> float:
-    path = '/trade-api/v2/portfolio/balance'
-    resp = requests.get(f'{BASE_URL}/portfolio/balance', headers=_headers('GET', path))
-    resp.raise_for_status()
-    return resp.json().get('balance', 0) / 100
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
