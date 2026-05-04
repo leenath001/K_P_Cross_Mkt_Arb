@@ -168,23 +168,41 @@ def get_market_price(ticker: str) -> Optional[int]:
 
 def get_market_prices(ticker: str) -> dict:
     """
-    Fetch current yes_ask and no_ask for a Kalshi market in cents.
-    Returns {'yes_ask': int, 'no_ask': int} or {} if unavailable.
+    Fetch current yes_ask, yes_bid, no_ask, no_bid for a market in cents.
+    Returns a dict with whichever keys are available, or {} on failure.
     """
     path = f'/trade-api/v2/markets/{ticker}'
     resp = requests.get(f'{BASE_URL}/markets/{ticker}',
                         headers=kalshi_headers('GET', path))
     if resp.ok:
         m = resp.json().get('market', {})
-        ya = m.get('yes_ask_dollars')
-        na = m.get('no_ask_dollars')
         result = {}
-        if ya:
-            result['yes_ask'] = round(float(ya) * 100)
-        if na:
-            result['no_ask'] = round(float(na) * 100)
+        for key, field in [
+            ('yes_ask', 'yes_ask_dollars'), ('yes_bid', 'yes_bid_dollars'),
+            ('no_ask',  'no_ask_dollars'),  ('no_bid',  'no_bid_dollars'),
+        ]:
+            v = m.get(field)
+            if v:
+                result[key] = round(float(v) * 100)
         return result
     return {}
+
+
+def _rest_price_cents(bid_cents: Optional[int], ask_cents: int) -> int:
+    """
+    Spread-aware rest price (in cents).
+      2¢ spread: bid+1 (= ask-1) — tightens spread to 1¢
+      1¢ spread: bid   (= ask-1) — join the best bid
+      >2¢ spread: ask-1          — stay near top of book
+    Always returns a price that will not cross the book.
+    """
+    if bid_cents is not None:
+        spread = ask_cents - bid_cents
+        if spread == 2:
+            return ask_cents - 1   # = bid + 1
+        if spread == 1:
+            return bid_cents       # = ask - 1, join bid
+    return ask_cents - 1           # fallback: top of book
 
 
 def cross_and_cancel_order(ticker: str, order_id: str, contracts: int,
@@ -493,8 +511,10 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         if no_ask is None:
             return {'status': 'skipped', 'reason': 'no_ask_unavailable',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
-        fair_prob_no = 1 - fair_prob
-        rest_price_no = round(no_ask - 0.01, 2)
+        fair_prob_no  = 1 - fair_prob
+        no_bid_c      = round(no_bid * 100) if no_bid is not None else None
+        no_ask_c      = round(no_ask * 100)
+        rest_price_no = _rest_price_cents(no_bid_c, no_ask_c) / 100
         taker_ev_no   = _ev(fair_prob_no, no_ask,      taker_fee)
         maker_ev_no   = _ev(fair_prob_no, rest_price_no, maker_fee)
         if force_cross:
@@ -519,21 +539,19 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             return {'status': 'skipped', 'reason': 'no_ask_too_low',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
 
-        # Re-fetch live ask before placing to avoid post_only rejection on stale price
-        if order_type == 'no_rest':
-            live_prices = get_market_prices(ticker)
-            live_na = live_prices.get('no_ask')
-            if live_na is not None:
-                live_rest = round(live_na / 100 - 0.01, 2)
+        # Re-fetch live prices before placing to use fresh spread-aware rest price
+        live_prices = get_market_prices(ticker)
+        live_na = live_prices.get('no_ask')
+        if live_na is not None:
+            if order_type == 'no_rest':
+                live_nb   = live_prices.get('no_bid')
+                live_rest = _rest_price_cents(live_nb, live_na) / 100
                 live_ev   = _ev(fair_prob_no, live_rest, fee_rate)
                 if live_ev <= 0:
                     return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
                             'ticker': ticker, 'order_id': None, 'contracts': 0}
                 order_price = live_rest
-        elif order_type == 'no_cross':
-            live_prices = get_market_prices(ticker)
-            live_na = live_prices.get('no_ask')
-            if live_na is not None:
+            else:  # no_cross
                 live_cross = round(live_na / 100, 2)
                 live_ev    = _ev(fair_prob_no, live_cross, fee_rate)
                 if live_ev <= 0:
@@ -608,7 +626,9 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         }
 
     # ── YES side: same AUTO/CROSS/REST logic as NO, using yes_ask ───────────
-    rest_price_yes = round(yes_ask - 0.01, 2)
+    yes_bid_c      = round(yes_bid * 100) if yes_bid is not None else None
+    yes_ask_c      = round(yes_ask * 100)
+    rest_price_yes = _rest_price_cents(yes_bid_c, yes_ask_c) / 100
     taker_ev_yes   = _ev(fair_prob, yes_ask,       taker_fee)
     maker_ev_yes   = _ev(fair_prob, rest_price_yes, maker_fee)
     if force_cross:
@@ -658,13 +678,15 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         return {'status': 'skipped', 'reason': 'event_too_soon',
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
 
-    # Re-fetch live ask before placing to avoid post_only rejection on stale price
-    live_ask_cents = get_market_price(ticker)
-    if live_ask_cents is not None:
+    # Re-fetch live prices before placing to use fresh spread-aware rest price
+    live_prices = get_market_prices(ticker)
+    live_ya = live_prices.get('yes_ask')
+    if live_ya is not None:
         if order_type == 'cross':
-            order_price = live_ask_cents / 100
-        else:  # rest: top of book = ask - 1¢
-            order_price = round(live_ask_cents / 100 - 0.01, 2)
+            order_price = live_ya / 100
+        else:  # rest: spread-aware — 2¢ wide → bid+1, 1¢ wide → bid
+            live_yb     = live_prices.get('yes_bid')
+            order_price = _rest_price_cents(live_yb, live_ya) / 100
         ev = _ev(fair_prob, order_price, fee_rate)
         if ev <= 0:
             return {'status': 'skipped', 'reason': 'signal_gone_at_execution',

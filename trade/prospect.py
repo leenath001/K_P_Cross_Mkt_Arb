@@ -32,7 +32,7 @@ sys.path.insert(0, _HERE)
 
 from bot import (
     place_order, cancel_order, get_order_status,
-    get_market_price, get_market_prices,
+    get_market_price, get_market_prices, _rest_price_cents,
     cross_and_cancel_order, kelly_contracts, _ev,
     _monitor, _recheck_signal,
     TAKER_FEE, MAKER_FEE, MIN_CROSS_EV,
@@ -146,6 +146,7 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
     yes_ask   = float(signal_row['yes_ask'])
     no_ask    = float(signal_row['no_ask'])  if signal_row.get('no_ask')  is not None else None
     yes_bid   = float(signal_row['yes_bid']) if signal_row.get('yes_bid') is not None else None
+    no_bid    = float(signal_row['no_bid'])  if signal_row.get('no_bid')  is not None else None
     commence  = signal_row['commence']
     event_id  = signal_row['event_id']
     sport     = signal_row['sport']
@@ -160,7 +161,9 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
 
         fair_prob_no  = 1 - fair_prob
-        rest_price_no = round(no_ask - 0.01, 2)
+        no_bid_c      = round(no_bid * 100) if no_bid is not None else None
+        no_ask_c      = round(no_ask * 100)
+        rest_price_no = _rest_price_cents(no_bid_c, no_ask_c) / 100
         taker_ev_no   = _ev(fair_prob_no, no_ask, taker_fee)
         maker_ev_no   = _ev(fair_prob_no, rest_price_no, maker_fee)
 
@@ -181,12 +184,13 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
             return {'status': 'skipped', 'reason': 'no_ask_too_low',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
 
-        # Re-fetch live ask before placing
+        # Re-fetch live prices before placing for spread-aware rest price
         live_prices = get_market_prices(ticker)
         live_na = live_prices.get('no_ask')
         if live_na is not None:
             if order_type == 'no_rest':
-                order_price = round(live_na / 100 - 0.01, 2)
+                live_nb     = live_prices.get('no_bid')
+                order_price = _rest_price_cents(live_nb, live_na) / 100
             else:
                 order_price = round(live_na / 100, 2)
             live_ev = _ev(fair_prob_no, order_price, fee_rate)
@@ -252,7 +256,9 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
         }
 
     # ── YES side ─────────────────────────────────────────────────────────────
-    rest_price_yes = round(yes_ask - 0.01, 2)
+    yes_bid_c      = round(yes_bid * 100) if yes_bid is not None else None
+    yes_ask_c      = round(yes_ask * 100)
+    rest_price_yes = _rest_price_cents(yes_bid_c, yes_ask_c) / 100
     taker_ev_yes   = _ev(fair_prob, yes_ask, taker_fee)
     maker_ev_yes   = _ev(fair_prob, rest_price_yes, maker_fee)
 
@@ -281,11 +287,15 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
         return {'status': 'skipped', 'reason': 'event_too_soon',
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
 
-    # Re-fetch live ask before placing
-    live_ask_cents = get_market_price(ticker)
-    if live_ask_cents is not None:
-        order_price = live_ask_cents / 100 if order_type == 'cross' else \
-                      round(live_ask_cents / 100 - 0.01, 2)
+    # Re-fetch live prices before placing for spread-aware rest price
+    live_prices = get_market_prices(ticker)
+    live_ya = live_prices.get('yes_ask')
+    if live_ya is not None:
+        if order_type == 'cross':
+            order_price = live_ya / 100
+        else:  # rest: spread-aware
+            live_yb     = live_prices.get('yes_bid')
+            order_price = _rest_price_cents(live_yb, live_ya) / 100
         ev = _ev(fair_prob, order_price, fee_rate)
         if ev < (MIN_CROSS_EV if order_type == 'cross' else 0):
             return {'status': 'skipped', 'reason': 'signal_gone_at_execution',

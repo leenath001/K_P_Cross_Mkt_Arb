@@ -223,21 +223,30 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
             delta_no   = abs((1 - p_row['fair_prob']) - no_ask) if no_ask is not None else 0
             mismatched = (delta_yes > max_delta) or (delta_no > max_delta)
 
-            yes_bid         = k_row['yes_bid']
-            no_bid          = k_row['no_bid']
-            rest_price_yes  = round(yes_ask - 0.01, 2) if yes_ask is not None else None
-            rest_price_no   = round(no_ask  - 0.01, 2) if no_ask  is not None else None
+            yes_bid  = k_row['yes_bid']
+            no_bid   = k_row['no_bid']
 
-            fp     = p_row['fair_prob']
-            fp_no  = 1 - fp
-            MIN_EDGE      = 0.01   # minimum raw probability gap above entry price
-            MIN_CROSS_EV  = 0.005  # minimum EV required to fire a taker (cross) signal
+            # Spread-aware rest price: 2¢ wide → bid+1 (midpoint); 1¢ wide → bid; else ask-1
+            def _rp(bid, ask):
+                if bid is not None and ask is not None:
+                    s = round((ask - bid) * 100)
+                    if s == 2: return round(ask - 0.01, 2)
+                    if s == 1: return round(bid, 2)
+                return round(ask - 0.01, 2) if ask is not None else None
+
+            rest_price_yes = _rp(yes_bid, yes_ask)
+            rest_price_no  = _rp(no_bid,  no_ask)
+
+            fp    = p_row['fair_prob']
+            fp_no = 1 - fp
+            MIN_EDGE     = 0.01   # minimum raw probability gap above entry price
+            MIN_CROSS_EV = 0.005  # minimum EV required to fire a taker (cross) signal
 
             # YES cross: taker fills at yes_ask
             signal           = (not mismatched and yes_ask is not None and
                                 fp - yes_ask >= MIN_EDGE and
                                 _ev(fp, yes_ask, fees) >= MIN_CROSS_EV)
-            # YES rest: maker posts at yes_ask-1¢ (top of book)
+            # YES rest: maker posts at spread-aware price (bid+1 for 2¢ wide, bid for 1¢ wide)
             signal_yes_rest  = (not mismatched and rest_price_yes is not None and
                                 fp - rest_price_yes >= MIN_EDGE and
                                 _ev(fp, rest_price_yes, maker_fees) > 0)
@@ -245,7 +254,7 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
             signal_no_cross  = (not mismatched and no_ask is not None and
                                 fp_no - no_ask >= MIN_EDGE and
                                 _ev(fp_no, no_ask, fees) >= MIN_CROSS_EV)
-            # NO rest: maker posts at no_ask-1¢
+            # NO rest: maker posts at spread-aware price
             signal_no        = (not mismatched and rest_price_no is not None and
                                 fp_no - rest_price_no >= MIN_EDGE and
                                 _ev(fp_no, rest_price_no, maker_fees) > 0)
