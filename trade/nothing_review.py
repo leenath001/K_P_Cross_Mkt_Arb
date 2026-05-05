@@ -38,7 +38,7 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     if df.empty:
         return {}
     filled  = df[df['final_status'].isin(['executed', 'filled'])]
-    settled = filled[filled['result'].isin(['WIN', 'LOSS', 'VOID'])]
+    settled = filled[filled['result'].isin(['WIN', 'LOSS', 'VOID', 'SCALAR'])]
     wins    = settled[settled['result'] == 'WIN']
     losses  = settled[settled['result'] == 'LOSS']
     pending = filled[filled['result'] == 'PENDING']
@@ -164,7 +164,7 @@ def print_summary(df: pd.DataFrame):
     tbl2.add_column('Result',    width=6)
     tbl2.add_column('PnL',       justify='right', width=8)
 
-    RESULT_C = {'WIN': 'bold green', 'LOSS': 'red', 'VOID': 'dim'}
+    RESULT_C = {'WIN': 'bold green', 'LOSS': 'red', 'VOID': 'dim', 'SCALAR': 'cyan'}
     for _, r in settled_df.sort_values('logged_at').iterrows():
         date = str(r.get('logged_at', ''))[:10]
         rc   = RESULT_C.get(str(r['result']), 'white')

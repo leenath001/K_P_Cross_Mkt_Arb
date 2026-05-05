@@ -95,7 +95,7 @@ def refresh_statuses(path: str) -> int:
 
 def fetch_market_result(ticker: str) -> Optional[str]:
     """
-    Returns 'yes', 'no', 'void', or None (not yet settled).
+    Returns 'yes', 'no', 'void', 'scalar', or None (not yet settled).
     """
     path = f'/trade-api/v2/markets/{ticker}'
     resp = requests.get(f'{BASE_URL}/markets/{ticker}',
@@ -103,7 +103,7 @@ def fetch_market_result(ticker: str) -> Optional[str]:
     if not resp.ok:
         return None
     market = resp.json().get('market', {})
-    result = market.get('result')          # 'yes' | 'no' | 'void' | null
+    result = market.get('result')          # 'yes' | 'no' | 'void' | 'scalar' | null
     status = market.get('status', '')      # 'settled' or 'finalized' when done
     if result and status in ('settled', 'finalized'):
         return result.lower()
@@ -113,13 +113,54 @@ def fetch_market_result(ticker: str) -> Optional[str]:
     return None
 
 
+def fetch_scalar_settlement_value(ticker: str) -> Optional[float]:
+    """
+    For a scalar market (result='scalar'), returns the per-contract payout in
+    dollars (0–1). Kalshi settles these at the last traded price.
+    Returns None if the value cannot be determined.
+    """
+    path = f'/trade-api/v2/markets/{ticker}'
+    resp = requests.get(f'{BASE_URL}/markets/{ticker}',
+                        headers=kalshi_headers('GET', path))
+    if not resp.ok:
+        return None
+    market = resp.json().get('market', {})
+    # Primary field Kalshi uses for scalar settlement value (0–1 dollar range)
+    for field in ('result_value', 'settlement_value', 'final_settlement_price'):
+        v = market.get(field)
+        if v is not None:
+            try:
+                val = float(v)
+                if 0.0 <= val <= 1.0:
+                    return round(val, 4)
+                if 0.0 < val <= 100.0:   # value expressed in cents
+                    return round(val / 100.0, 4)
+            except (ValueError, TypeError):
+                pass
+    # Fallback: last traded mid-price (bid+ask)/2, which is the "last price" Kalshi uses
+    ya = market.get('yes_ask_dollars')
+    yb = market.get('yes_bid_dollars')
+    if ya and yb:
+        try:
+            return round((float(ya) + float(yb)) / 2.0, 4)
+        except (ValueError, TypeError):
+            pass
+    if yb:
+        try:
+            return round(float(yb), 4)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
 def compute_pnl(result: str, contracts: int,
                 entry_price: float, fee_rate: float,
                 side: str = 'yes') -> float:
     """
-    WIN  : receive (1 - entry_price) per contract, minus fee on winnings.
-    LOSS : lose entry_price per contract.
-    VOID : stake returned, no gain or loss.
+    WIN    : receive (1 - entry_price) per contract, minus fee on winnings.
+    LOSS   : lose entry_price per contract.
+    VOID   : stake returned, no gain or loss.
+    SCALAR : handled separately via compute_scalar_pnl.
 
     For side='yes': WIN when Kalshi result='yes'.
     For side='no' : WIN when Kalshi result='no'.
@@ -130,7 +171,22 @@ def compute_pnl(result: str, contracts: int,
         return round(contracts * (1 - entry_price) * (1 - fee_rate), 4)
     if result == losing_result:
         return round(-contracts * entry_price, 4)
-    return 0.0   # void
+    return 0.0   # void or scalar (caller handles scalar separately)
+
+
+def compute_scalar_pnl(contracts: int, entry_price: float, fee_rate: float,
+                        settlement_value: float, side: str = 'yes') -> float:
+    """
+    Scalar / last-price settlement PnL.
+    YES holder receives `settlement_value` dollars per contract.
+    NO  holder receives `1 - settlement_value` dollars per contract.
+    Fee is charged on positive gains only.
+    """
+    our_value = (1 - settlement_value) if side == 'no' else settlement_value
+    gain_per  = our_value - entry_price
+    if gain_per > 0:
+        return round(contracts * gain_per * (1 - fee_rate), 4)
+    return round(contracts * gain_per, 4)
 
 
 def _settle_file(path: str, side: str, dry_run: bool,
@@ -175,6 +231,28 @@ def _settle_file(path: str, side: str, dry_run: bool,
 
         if k_result is None:
             console.print('[dim]not settled yet[/dim]')
+            continue
+
+        if k_result == 'scalar':
+            sv = fetch_scalar_settlement_value(ticker)
+            if sv is None:
+                console.print('[yellow]SCALAR — settlement value unavailable, skipping[/yellow]')
+                continue
+            pnl = compute_scalar_pnl(int(row['contracts']),
+                                     float(row['entry_price']),
+                                     float(row['fee_rate']),
+                                     sv, side=row_side)
+            result_label = 'SCALAR'
+            pnl_c = 'green' if pnl >= 0 else ('red' if pnl < 0 else 'dim')
+            console.print(
+                f'[bold cyan]SCALAR[/bold cyan]  settle={sv:.3f}  '
+                f'[{pnl_c}]pnl=${pnl:+.4f}[/{pnl_c}]'
+                + (' [dim](dry run — not written)[/dim]' if dry_run else '')
+            )
+            if not dry_run:
+                df.at[idx, 'result']     = result_label
+                df.at[idx, 'actual_pnl'] = pnl
+            updates += 1
             continue
 
         if k_result not in label_map:

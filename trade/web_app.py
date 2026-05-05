@@ -21,7 +21,8 @@ from theODDS.p_helpers import pinnacle_odds, fetch_usage, get_api_usage, get_act
 from KALSHI.k_helpers   import kalshi_odds
 from bot                import get_balance, run_all_signals, cross_and_cancel_order
 from dashboard          import StreamlitDashboard
-from settle             import fetch_market_result, compute_pnl
+from settle             import (fetch_market_result, compute_pnl,
+                                fetch_scalar_settlement_value, compute_scalar_pnl)
 
 def _in_season(key: str) -> bool:
     if st.session_state.get('active_sports_ok'):
@@ -689,6 +690,24 @@ with tab_settle:
                         k_result = fetch_market_result(ticker)
                         if k_result is None:
                             st.write('  ⏳ Not settled yet')
+                            continue
+                        if k_result == 'scalar':
+                            sv = fetch_scalar_settlement_value(ticker)
+                            if sv is None:
+                                st.write(f'  ⚠️ SCALAR — settlement value unavailable, skipping')
+                                continue
+                            pnl = compute_scalar_pnl(int(row['contracts']),
+                                                     float(row['entry_price']),
+                                                     float(row['fee_rate']),
+                                                     sv, side=side)
+                            colour = 'green' if pnl >= 0 else ('red' if pnl < 0 else 'grey')
+                            st.markdown(f'  :blue[**SCALAR**]  settle={sv:.3f}  '
+                                        f'  :{colour}[pnl=${pnl:+.4f}]'
+                                        + ('  *(dry run)*' if dry_run else ''))
+                            if not dry_run:
+                                df.at[idx, 'result']     = 'SCALAR'
+                                df.at[idx, 'actual_pnl'] = pnl
+                            updated += 1
                             continue
                         if k_result not in label_map:
                             st.write(f'  ⚠️ Unknown result `{k_result}` — skipping')

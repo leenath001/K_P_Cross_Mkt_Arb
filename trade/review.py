@@ -49,7 +49,7 @@ def load_log() -> pd.DataFrame:
 
 def print_summary(df: pd.DataFrame):
     filled  = df[df['final_status'].isin(['executed', 'filled'])]
-    settled = filled[filled['result'].isin(['WIN', 'LOSS'])]
+    settled = filled[filled['result'].isin(['WIN', 'LOSS', 'VOID', 'SCALAR'])]
 
     # Header stats
     total_ev     = filled['ev_total'].sum()
@@ -116,7 +116,8 @@ def print_summary(df: pd.DataFrame):
         'canceled': 'red', 'signal_flipped': 'red',
         'max_duration_exceeded': 'dim', 'event_imminent': 'dim',
     }
-    RESULT_STYLE = {'WIN': 'bold green', 'LOSS': 'red', 'PENDING': 'yellow'}
+    RESULT_STYLE = {'WIN': 'bold green', 'LOSS': 'red', 'PENDING': 'yellow',
+                    'VOID': 'dim', 'SCALAR': 'cyan'}
 
     _CANCELLED = {'canceled', 'signal_flipped', 'max_duration_exceeded', 'event_imminent', 'user_canceled'}
     for _, r in df[~df['final_status'].isin(_CANCELLED)].sort_values('logged_at').iterrows():
