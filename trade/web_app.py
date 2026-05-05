@@ -19,7 +19,7 @@ from datetime import datetime
 import config
 from theODDS.p_helpers import pinnacle_odds, fetch_usage, get_api_usage, get_active_sports, check_sports_with_events
 from KALSHI.k_helpers   import kalshi_odds
-from bot                import get_balance, run_all_signals, cross_and_cancel_order
+from bot                import get_balance, run_all_signals, cross_and_cancel_order, cancel_and_rerest
 from dashboard          import StreamlitDashboard
 from settle             import (fetch_market_result, compute_pnl,
                                 fetch_scalar_settlement_value, compute_scalar_pnl)
@@ -466,8 +466,8 @@ with tab_trade:
                 _m, _s   = int(_rem // 60), int(_rem % 60)
                 st.progress(_pct, text=f'⏱ {_m}m {_s:02d}s remaining')
 
-                # Header + cancel + cross&cancel buttons
-                hc1, hc2, hc3 = st.columns([3, 1, 1])
+                # Header + cancel + cross&cancel + keep-rest buttons
+                hc1, hc2, hc3, hc4 = st.columns([3, 1, 1, 1])
                 hc1.markdown('#### Dashboard')
                 if thread.is_alive():
                     if hc2.button('🛑 Cancel all', key='_cancel_all_btn'):
@@ -507,6 +507,40 @@ with tab_trade:
                                     st.warning(f"✗ {_r['ticker']}  {_r.get('reason', 'canceled')}")
                                 else:
                                     st.error(f"⚠ {_r['ticker']}  {_r.get('reason', 'error')}")
+                    if hc4.button('⏸ Keep Rest', key='_keep_rest_btn',
+                                  help='Re-rest each resting order until 30 min before game start, '
+                                       'then stop Pinnacle polling to save API credits.'):
+                        _kr_snap    = dash.snapshot()
+                        _kr_pos_now = _kr_snap['positions']
+                        _KR_RESTING = {'resting', 'open', 'pending', 'unknown'}
+                        _kr_targets = [(oid, pos) for oid, pos in _kr_pos_now.items()
+                                       if pos.get('status') in _KR_RESTING
+                                       and pos.get('contracts', 0) - pos.get('filled', 0) > 0]
+                        if not _kr_targets:
+                            st.info('No unfilled resting orders to keep.')
+                        else:
+                            _kr_results = []
+                            for _oid, _pos in _kr_targets:
+                                _r = cancel_and_rerest(
+                                    _pos['ticker'], _oid,
+                                    _pos.get('contracts', 1) - _pos.get('filled', 0),
+                                    _pos['entry_price'],
+                                    _pos.get('side', 'yes'),
+                                    _pos.get('commence', ''),
+                                )
+                                _kr_results.append((_pos['ticker'], _r))
+                            if stop_event:
+                                stop_event.set()
+                            _kr_ok  = sum(1 for _, r in _kr_results if r['action'] == 'rested')
+                            _kr_err = sum(1 for _, r in _kr_results if r['action'] == 'error')
+                            st.info(f'⏸ {_kr_ok} re-rested · {_kr_err} errors — Pinnacle polling stopped')
+                            for _tkr, _r in _kr_results:
+                                if _r['action'] == 'rested':
+                                    st.success(f"✓ {_tkr}  {_r['price_cents']}¢  GTC {_r['expiry']}")
+                                elif _r['action'] == 'skipped':
+                                    st.caption(f"— {_tkr}  {_r.get('reason', 'skipped')}")
+                                else:
+                                    st.error(f"⚠ {_tkr}  {_r.get('reason', 'error')}")
 
                 # Positions table
                 positions = snap['positions']
@@ -1515,7 +1549,7 @@ with tab_prospect:
             _pt_mm, _pt_ss = int(_pt_rm // 60), int(_pt_rm % 60)
             st.progress(_pt_pc, text=f'⏱ {_pt_mm}m {_pt_ss:02d}s remaining')
 
-            hc1, hc2, hc3 = st.columns([3, 1, 1])
+            hc1, hc2, hc3, hc4 = st.columns([3, 1, 1, 1])
             hc1.markdown('#### Prospect Dashboard')
             if _pt_thread.is_alive():
                 if hc2.button('🛑 Cancel all', key='_pt_cancel_btn'):
@@ -1556,6 +1590,40 @@ with tab_prospect:
                                 st.warning(f"✗ {_r['ticker']}  {_r.get('reason', 'canceled')}")
                             else:
                                 st.error(f"⚠ {_r['ticker']}  {_r.get('reason', 'error')}")
+                if hc4.button('⏸ Keep Rest', key='_pt_keep_rest_btn',
+                              help='Re-rest each resting order until 30 min before game start, '
+                                   'then stop Pinnacle polling to save API credits.'):
+                    _pt_kr_snap = _pt_dash_obj.snapshot()
+                    _pt_kr_pos  = _pt_kr_snap['positions']
+                    _PT_KR_REST = {'resting', 'open', 'pending', 'unknown'}
+                    _pt_kr_tgt  = [(oid, pos) for oid, pos in _pt_kr_pos.items()
+                                   if pos.get('status') in _PT_KR_REST
+                                   and pos.get('contracts', 0) - pos.get('filled', 0) > 0]
+                    if not _pt_kr_tgt:
+                        st.info('No unfilled resting orders to keep.')
+                    else:
+                        _pt_kr_res = []
+                        for _oid, _pos in _pt_kr_tgt:
+                            _r = cancel_and_rerest(
+                                _pos['ticker'], _oid,
+                                _pos.get('contracts', 1) - _pos.get('filled', 0),
+                                _pos['entry_price'],
+                                _pos.get('side', 'yes'),
+                                _pos.get('commence', ''),
+                            )
+                            _pt_kr_res.append((_pos['ticker'], _r))
+                        if _pt_stop_ev:
+                            _pt_stop_ev.set()
+                        _pt_kr_ok  = sum(1 for _, r in _pt_kr_res if r['action'] == 'rested')
+                        _pt_kr_err = sum(1 for _, r in _pt_kr_res if r['action'] == 'error')
+                        st.info(f'⏸ {_pt_kr_ok} re-rested · {_pt_kr_err} errors — Pinnacle polling stopped')
+                        for _tkr, _r in _pt_kr_res:
+                            if _r['action'] == 'rested':
+                                st.success(f"✓ {_tkr}  {_r['price_cents']}¢  GTC {_r['expiry']}")
+                            elif _r['action'] == 'skipped':
+                                st.caption(f"— {_tkr}  {_r.get('reason', 'skipped')}")
+                            else:
+                                st.error(f"⚠ {_tkr}  {_r.get('reason', 'error')}")
 
             positions = _pt_snap['positions']
             if positions:

@@ -291,6 +291,48 @@ def cross_and_cancel_order(ticker: str, order_id: str, contracts: int,
         return {'action': 'error', 'ticker': ticker, 'reason': str(exc)}
 
 
+def cancel_and_rerest(
+    ticker: str, order_id: str, remaining_contracts: int,
+    price_cents: int, side: str, commence_str: str,
+    buffer_minutes: int = 30,
+) -> dict:
+    """
+    Cancel a resting order and re-place it with GTC = event_start − buffer_minutes.
+    post_only=True so the order never crosses (stays as a resting maker order).
+    Call stop_event.set() after this to halt the Pinnacle polling loop.
+    """
+    if remaining_contracts <= 0:
+        return {'action': 'skipped', 'ticker': ticker, 'reason': 'no unfilled contracts'}
+
+    try:
+        commence_utc = pd.Timestamp(commence_str).tz_convert('UTC').to_pydatetime()
+    except Exception as exc:
+        return {'action': 'error', 'ticker': ticker, 'reason': f'bad commence: {exc}'}
+
+    new_expiry = commence_utc - timedelta(minutes=buffer_minutes)
+    now_utc    = datetime.now(timezone.utc)
+    if new_expiry <= now_utc:
+        return {'action': 'error', 'ticker': ticker,
+                'reason': f'event starts in under {buffer_minutes}min — too close to re-rest'}
+
+    if not cancel_order(order_id):
+        return {'action': 'error', 'ticker': ticker, 'reason': 'cancel failed'}
+
+    try:
+        order  = place_order(ticker, price_cents, remaining_contracts, side=side,
+                             expiration_ts=int(new_expiry.timestamp()), post_only=True)
+        new_id = order.get('order_id')
+        return {
+            'action':       'rested',
+            'ticker':       ticker,
+            'new_order_id': new_id,
+            'price_cents':  price_cents,
+            'expiry':       new_expiry.strftime('%Y-%m-%d %H:%M UTC'),
+        }
+    except Exception as exc:
+        return {'action': 'error', 'ticker': ticker, 'reason': f'place failed: {exc}'}
+
+
 def get_order_status(order_id: str) -> dict:
     """
     Fetch the current state of an order directly from Kalshi.
@@ -590,7 +632,8 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             dashboard.add_position(order_id, ticker, f'NO:{outcome}', contracts,
                                    price_cents, fair_prob_no, ev,
                                    event_id=event_id, sport=sport,
-                                   raw_outcome=outcome, fee_rate=fee_rate)
+                                   raw_outcome=outcome, fee_rate=fee_rate,
+                                   side='no', commence=str(commence))
 
         reason = _monitor(
             order_id=order_id, ticker=ticker, event_id=event_id,
@@ -718,7 +761,8 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         dashboard.add_position(order_id, ticker, outcome, contracts,
                                price_cents, fair_prob, ev,
                                event_id=event_id, sport=sport,
-                               raw_outcome=outcome, fee_rate=fee_rate)
+                               raw_outcome=outcome, fee_rate=fee_rate,
+                               side='yes', commence=str(commence))
 
     reason = _monitor(
         order_id=order_id, ticker=ticker, event_id=event_id,

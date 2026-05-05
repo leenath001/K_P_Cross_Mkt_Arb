@@ -228,7 +228,8 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
             dashboard.add_position(order_id, ticker, f'NO:{outcome}', contracts,
                                    price_cents, fair_prob_no, ev,
                                    event_id=event_id, sport=sport,
-                                   raw_outcome=outcome, fee_rate=fee_rate)
+                                   raw_outcome=outcome, fee_rate=fee_rate,
+                                   side='no', commence=str(commence))
 
         reason = _monitor(
             order_id=order_id, ticker=ticker, event_id=event_id,
@@ -322,7 +323,8 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
         dashboard.add_position(order_id, ticker, outcome, contracts,
                                price_cents, fair_prob, ev,
                                event_id=event_id, sport=sport,
-                               raw_outcome=outcome, fee_rate=fee_rate)
+                               raw_outcome=outcome, fee_rate=fee_rate,
+                               side='yes', commence=str(commence))
 
     reason = _monitor(
         order_id=order_id, ticker=ticker, event_id=event_id,

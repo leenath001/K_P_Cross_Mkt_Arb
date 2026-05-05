@@ -67,7 +67,8 @@ class Dashboard:
                      contracts: int, yes_price_cents: int,
                      fair_prob: float, edge: float,
                      event_id: str = '', sport: str = '',
-                     raw_outcome: str = '', fee_rate: float = 0.07):
+                     raw_outcome: str = '', fee_rate: float = 0.07,
+                     side: str = 'yes', commence: str = ''):
         with self._lock:
             self._positions[order_id] = {
                 'ticker':       ticker,
@@ -85,6 +86,8 @@ class Dashboard:
                 'sport':        sport,
                 'raw_outcome':  raw_outcome or outcome,
                 'fee_rate':     fee_rate,
+                'side':         side,
+                'commence':     commence,
             }
             self._refresh()
 
@@ -209,7 +212,8 @@ class StreamlitDashboard:
                      contracts: int, yes_price_cents: int,
                      fair_prob: float, edge: float,
                      event_id: str = '', sport: str = '',
-                     raw_outcome: str = '', fee_rate: float = 0.07):
+                     raw_outcome: str = '', fee_rate: float = 0.07,
+                     side: str = 'yes', commence: str = ''):
         with self._lock:
             self._positions[order_id] = {
                 'ticker':      ticker,
@@ -227,6 +231,8 @@ class StreamlitDashboard:
                 'sport':       sport,
                 'raw_outcome': raw_outcome or outcome,
                 'fee_rate':    fee_rate,
+                'side':        side,
+                'commence':    commence,
             }
 
     def update(self, order_id: str, status: Optional[str] = None,
