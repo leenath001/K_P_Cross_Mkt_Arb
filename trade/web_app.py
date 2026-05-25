@@ -20,6 +20,7 @@ import config
 from theODDS.p_helpers import pinnacle_odds, fetch_usage, get_api_usage, get_active_sports, check_sports_with_events
 from KALSHI.k_helpers   import kalshi_odds
 from bot                import get_balance, run_all_signals, cross_and_cancel_order, cancel_and_rerest
+from POLYMARKET.p_helpers import polymarket_signals as _poly_signals, POLY_SPORT_MAP
 from dashboard          import StreamlitDashboard
 from settle             import (fetch_market_result, compute_pnl,
                                 fetch_scalar_settlement_value, compute_scalar_pnl)
@@ -128,8 +129,8 @@ with st.sidebar:
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 
-tab_trade, tab_settle, tab_review, tab_nothing, tab_prospect = st.tabs(
-    ['Trade', 'Settle', 'Review', 'Nothing', 'Prospect'])
+tab_trade, tab_settle, tab_review, tab_nothing, tab_prospect, tab_poly = st.tabs(
+    ['Trade', 'Settle', 'Review', 'Nothing', 'Prospect', 'Polymarket'])
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — TRADE
@@ -1706,3 +1707,123 @@ with tab_prospect:
             st.caption('No trades logged yet.')
     except Exception as exc:
         st.error(f'Failed to read log: {exc}')
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 6 — POLYMARKET
+# ════════════════════════════════════════════════════════════════════════════
+
+with tab_poly:
+    st.header('Polymarket')
+    st.caption(
+        'Cross-reference Pinnacle fair probabilities against live Polymarket '
+        'game-winner markets. Taker fee 3% · Maker fee 0%. '
+        'Order execution requires a Polygon wallet (not yet wired up).'
+    )
+
+    # ── Controls ─────────────────────────────────────────────────────────────
+    _poly_col1, _poly_col2, _poly_col3 = st.columns([2, 1, 1])
+    with _poly_col1:
+        _poly_sports_avail = [s for s in config.SPORTS if s in POLY_SPORT_MAP]
+        _poly_sports_sel   = st.multiselect(
+            'Sports to scan',
+            options=_poly_sports_avail,
+            default=[s for s in ['basketball_nba', 'icehockey_nhl', 'baseball_mlb']
+                     if s in _poly_sports_avail],
+            key='_poly_sports',
+        )
+    with _poly_col2:
+        _poly_hrs = st.number_input('Look-ahead (hrs)', min_value=12, max_value=168,
+                                    value=72, step=12, key='_poly_hrs')
+    with _poly_col3:
+        _poly_clob = st.toggle('Live CLOB prices', value=False, key='_poly_clob',
+                               help='Re-fetch bid/ask from CLOB for each token. '
+                                    'More accurate, uses more requests.')
+
+    _poly_show_all = st.checkbox('Show all matches (including negative EV)', key='_poly_show_all')
+
+    if st.button('Fetch Polymarket Signals', key='_poly_fetch', type='primary'):
+        if not _poly_sports_sel:
+            st.warning('Select at least one sport.')
+        else:
+            with st.spinner('Fetching Pinnacle odds + Polymarket markets…'):
+                try:
+                    _poly_pin = pinnacle_odds(sports=_poly_sports_sel, hrs=int(_poly_hrs))
+                    _poly_sigs = _poly_signals(
+                        _poly_pin,
+                        sports=_poly_sports_sel,
+                        hrs=int(_poly_hrs),
+                        fetch_clob=_poly_clob,
+                    )
+                    st.session_state['_poly_sigs']    = _poly_sigs
+                    st.session_state['_poly_pin_len'] = len(_poly_pin)
+                except Exception as _poly_exc:
+                    st.error(f'Fetch failed: {_poly_exc}')
+                    st.session_state.pop('_poly_sigs', None)
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    _poly_sigs_df = st.session_state.get('_poly_sigs')
+    _poly_pin_len = st.session_state.get('_poly_pin_len', 0)
+
+    if _poly_sigs_df is not None:
+        if _poly_sigs_df.empty:
+            st.info('No Polymarket game-winner markets matched Pinnacle outcomes '
+                    'in the selected window. Try a wider look-ahead or different sports.')
+        else:
+            _display_df = _poly_sigs_df if _poly_show_all else \
+                          _poly_sigs_df[_poly_sigs_df['taker_signal'] | _poly_sigs_df['maker_signal']]
+
+            n_t = int(_poly_sigs_df['taker_signal'].sum())
+            n_m = int(_poly_sigs_df['maker_signal'].sum())
+
+            _sm1, _sm2, _sm3, _sm4 = st.columns(4)
+            _sm1.metric('Pinnacle outcomes',  _poly_pin_len)
+            _sm2.metric('Matched',            len(_poly_sigs_df))
+            _sm3.metric('Taker signals',      n_t)
+            _sm4.metric('Maker signals',       n_m)
+
+            if _display_df.empty:
+                st.info('No positive-EV signals found. Enable "Show all matches" to see all.')
+            else:
+                _poly_rows = []
+                for _, r in _display_df.iterrows():
+                    sig = []
+                    if r['taker_signal']:  sig.append('TAKER')
+                    if r['maker_signal']:  sig.append('MAKER')
+                    _poly_rows.append({
+                        'Market':      r['poly_title'],
+                        'Sport':       r['sport'].split('_')[-1].upper(),
+                        'Outcome':     r['outcome'],
+                        'Side':        r['token_side'].upper(),
+                        'Fair':        round(r['fair_prob'], 3),
+                        'Ask':         round(r['poly_ask'], 3),
+                        'Bid':         round(r['poly_bid'], 3) if r['poly_bid'] is not None else None,
+                        'Rest':        round(r['rest_price'], 3),
+                        'Edge':        round(r['edge'], 4),
+                        'Taker EV':    round(r['taker_ev'], 4),
+                        'Maker EV':    round(r['maker_ev'], 4),
+                        'Signal':      ' + '.join(sig) if sig else '—',
+                        'Game Start':  str(r['game_start'])[:16],
+                        'Token ID':    r['token_id'],
+                    })
+                st.dataframe(
+                    pd.DataFrame(_poly_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        'Edge':      st.column_config.NumberColumn(format='%+.4f'),
+                        'Taker EV':  st.column_config.NumberColumn(format='%+.4f'),
+                        'Maker EV':  st.column_config.NumberColumn(format='%+.4f'),
+                        'Token ID':  st.column_config.TextColumn(width='small'),
+                    },
+                )
+
+                _pos_sigs = _poly_sigs_df[_poly_sigs_df['taker_signal'] | _poly_sigs_df['maker_signal']]
+                if not _pos_sigs.empty:
+                    with st.expander(f'Token IDs for {len(_pos_sigs)} signal(s)'):
+                        for _, r in _pos_sigs.iterrows():
+                            st.code(
+                                f"{r['poly_title']}  |  {r['outcome']}  |  "
+                                f"{'YES' if r['token_side']=='yes' else 'NO '}\n"
+                                f"token_id = {r['token_id']}\n"
+                                f"condition_id = {r['condition_id']}"
+                            )
