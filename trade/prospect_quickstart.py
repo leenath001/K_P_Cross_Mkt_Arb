@@ -27,8 +27,8 @@ parser = argparse.ArgumentParser(
 parser.add_argument('--live',          action='store_true',                      help='Place real orders (default: dry run)')
 parser.add_argument('--bankroll',      type=float, default=None,                 help='Override balance in dollars')
 parser.add_argument('--hrs',           type=int,   default=config.LOOKAHEAD_HRS, help=f'Look-ahead window in hours (default: {config.LOOKAHEAD_HRS})')
-parser.add_argument('--taker-fee',     type=float, default=0.07,                 help='Taker fee rate (default: 0.07)')
-parser.add_argument('--maker-fee',     type=float, default=0.03,                 help='Maker fee rate (default: 0.03)')
+parser.add_argument('--taker-fee',     type=float, default=0.07,                 help='Taker fee rate (default: 0.07, Kalshi general table)')
+parser.add_argument('--maker-fee',     type=float, default=0.0175,               help='Maker fee rate (default: 0.0175, Kalshi general table)')
 parser.add_argument('--threshold',     type=float, default=0.85,                 help='Min fuzzy-match score (default: 0.85)')
 parser.add_argument('--mode',          choices=['rest', 'cross', 'auto'], default='rest',
                                                                           help='Order mode (default: rest)')
@@ -87,8 +87,7 @@ print(f'  Maker fee       : {args.maker_fee * 100:.0f}% of winnings')
 print(f'  Longshot zone   : yes_ask ${args.longshot_lo:.2f}–${args.longshot_hi:.2f}  →  buy NO')
 print(f'  Favorite zone   : yes_ask ${args.favorite_lo:.2f}–${args.favorite_hi:.2f}  →  buy YES\n')
 
-matched_df = kalshi_odds(pinnacle_df, threshold=args.threshold,
-                         fees=args.taker_fee, maker_fees=args.maker_fee)
+matched_df = kalshi_odds(pinnacle_df, threshold=args.threshold)
 pt_df = prospect_signals(
     matched_df,
     longshot_lo=args.longshot_lo, longshot_hi=args.longshot_hi,

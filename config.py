@@ -68,6 +68,14 @@ SEASON_MONTHS = {
 LOOKAHEAD_HRS = 72    # how many hours ahead to search for upcoming events
 LIVE          = False # True = fetch currently live games, False = fetch upcoming
 
+# Sports temporarily excluded from signal generation (enforced in KALSHI.k_helpers.kalshi_odds).
+# aussierules_afl: 2/23 wins (8.7%) against 22.9% predicted in settled trade history
+# (notebooks/win_loss_analysis.ipynb) — AFL rarely has draw markets, so this isn't the
+# same de-vig bias fixed for soccer; likely a timezone/date-boundary matching bug given
+# AFL fixtures run on the furthest-from-UTC schedule of any traded league. Re-enable
+# once the KXAFLGAME <-> Pinnacle matching has been manually audited.
+PAUSED_SPORTS = {"aussierules_afl"}
+
 SPORTS_CONFIG = {
     # ── American Football ────────────────────────────────────────────
     "americanfootball_ncaaf": {

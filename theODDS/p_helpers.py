@@ -1,11 +1,52 @@
 import os
+import sys
 import requests
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
+from scipy.optimize import brentq
 import json
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'))
 import warnings
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from applog import get_logger
+
+log = get_logger(__name__)
+
+
+def _power_devig(implied_probs: list) -> list:
+    """
+    Power-method de-vig. Replaces naive proportional removal (fair_prob = r_i /
+    sum(r_i)), which is well-documented to systematically OVERSTATE lower-probability
+    legs (draws, longshots) relative to favorites — bookmakers load a
+    disproportionate share of their margin onto the draw/longshot side, and
+    proportional removal assumes the margin is spread uniformly, so it doesn't
+    correct for that skew.
+
+    Confirmed empirically on this bot's own trade history (notebooks/win_loss_analysis.ipynb):
+    non-draw soccer bets were near-perfectly calibrated (predicted 30.5% win,
+    actual 30.2%) while draw bets were predicted at 24.1% and actually won only
+    16.1% of the time — proportional de-vig was overpricing the draw leg.
+
+    Method: solve for exponent k such that sum(r_i^k) = 1, then p_i = r_i^k. Since
+    each r_i < 1, raising to a power k > 1 shrinks smaller r_i (draws/longshots)
+    proportionally MORE than larger r_i (favorites), which is exactly the
+    correction needed. Falls back to proportional de-vig if there's no overround
+    to correct, a leg has zero probability, or the market isn't 2+ outcomes.
+    """
+    r = np.array(implied_probs, dtype=float)
+    total = r.sum()
+    if total <= 1.0 or len(r) < 2 or np.any(r <= 0):
+        return (r / total).tolist() if total > 0 else r.tolist()
+    try:
+        k = brentq(lambda k: np.sum(r ** k) - 1.0, 1.0, 100.0)
+    except ValueError:
+        log.warning('_power_devig: could not bracket a root for implied_probs=%s — falling back to proportional', implied_probs)
+        return (r / total).tolist()
+    p = r ** k
+    return (p / p.sum()).tolist()   # renormalize for float safety
 
 def _secret(key: str):
     val = os.getenv(key)
@@ -39,8 +80,12 @@ def fetch_usage() -> tuple:
     Also captures each sport's `active` flag into _active_sports at no extra cost.
     Costs 1 request. Returns (used, remaining).
     """
-    resp = requests.get(f'{BASE_URL}/sports', params={'apiKey': API_KEY})
-    resp.raise_for_status()
+    try:
+        resp = requests.get(f'{BASE_URL}/sports', params={'apiKey': API_KEY})
+        resp.raise_for_status()
+    except requests.exceptions.RequestException:
+        log.exception('fetch_usage failed')
+        raise
     used      = int(resp.headers.get('x-requests-used', 0))
     remaining = int(resp.headers.get('x-requests-remaining', 0))
     _api_usage['used']      = used
@@ -79,8 +124,10 @@ def check_sports_with_events(sport_keys: list, hrs: int) -> dict:
                 _api_usage['remaining'] = int(resp.headers.get('x-requests-remaining',  _api_usage['remaining']))
                 counts[key] = len(resp.json()) if isinstance(resp.json(), list) else 0
             else:
+                log.warning('check_sports_with_events: %s -> %s %s', key, resp.status_code, resp.reason)
                 counts[key] = 0
         except Exception:
+            log.exception('check_sports_with_events failed for %s', key)
             counts[key] = 0
     return counts
 
@@ -107,15 +154,20 @@ def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFram
         'bookmakers': 'pinnacle',
         'commenceTimeFrom': x1,
         'commenceTimeTo':   x2,}
-        resp_odds = requests.get(f'{BASE_URL}/sports/{sport}/odds', params=params)
-        resp_odds.raise_for_status()
+        try:
+            resp_odds = requests.get(f'{BASE_URL}/sports/{sport}/odds', params=params)
+            resp_odds.raise_for_status()
+        except requests.exceptions.RequestException:
+            # One bad/rate-limited sport shouldn't blank out every other sport's odds.
+            log.exception('pinnacle_odds: fetch failed for sport %s — skipping', sport)
+            continue
 
         _api_usage['used']      = int(resp_odds.headers.get('x-requests-used', 0))
         _api_usage['remaining'] = int(resp_odds.headers.get('x-requests-remaining', 500))
 
         events = resp_odds.json()
         if not events:
-            print(f"No events for: {sport}")
+            log.info('pinnacle_odds: no events for %s', sport)
             continue
 
         for event in events:
@@ -126,7 +178,7 @@ def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFram
                     outcomes = market['outcomes']
                     implied = [1 / o['price'] for o in outcomes]
                     overround = sum(implied) - 1
-                    fair_probs = [p / sum(implied) for p in implied]
+                    fair_probs = _power_devig(implied)
                     for o, imp, fair in zip(outcomes, implied, fair_probs):
                         rows.append({
                             'sport': str(sport),

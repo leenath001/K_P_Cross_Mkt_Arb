@@ -18,12 +18,15 @@ import pandas as pd
 from datetime import datetime
 import config
 from theODDS.p_helpers import pinnacle_odds, fetch_usage, get_api_usage, get_active_sports, check_sports_with_events
-from KALSHI.k_helpers   import kalshi_odds
-from bot                import get_balance, run_all_signals, cross_and_cancel_order, cancel_and_rerest
-from POLYMARKET.p_helpers import polymarket_signals as _poly_signals, POLY_SPORT_MAP
+from KALSHI.k_helpers   import kalshi_odds, TAKER_FEE_BASE, MAKER_FEE_BASE
+from bot                import (get_balance, run_all_signals, cross_and_cancel_order,
+                                cancel_and_rerest, already_bet_tickers)
 from dashboard          import StreamlitDashboard
 from settle             import (fetch_market_result, compute_pnl,
                                 fetch_scalar_settlement_value, compute_scalar_pnl)
+from applog             import get_logger
+
+log = get_logger(__name__)
 
 def _in_season(key: str) -> bool:
     if st.session_state.get('active_sports_ok'):
@@ -76,6 +79,7 @@ if 'active_sports' not in st.session_state:
             st.session_state['active_sports_at']  = datetime.utcnow().strftime('%H:%M UTC')
             st.session_state['active_sports_ok']  = True
         except Exception:
+            log.exception('Startup active-sports check failed')
             st.session_state['active_sports']     = {}
             st.session_state['active_sports_at']  = '—'
             st.session_state['active_sports_ok']  = False
@@ -91,6 +95,7 @@ with st.sidebar:
                 st.session_state['api_used']      = used
                 st.session_state['api_remaining'] = remaining
             except Exception as e:
+                log.exception('Refresh usage failed')
                 st.error(f'Failed: {e}')
 
     used      = st.session_state.get('api_used',      0)
@@ -111,6 +116,7 @@ with st.sidebar:
             try:
                 st.session_state['balance'] = get_balance()
             except Exception as e:
+                log.exception('Refresh balance failed')
                 st.error(f'Failed: {e}')
     balance = st.session_state.get('balance', None)
     if balance is not None:
@@ -123,14 +129,22 @@ with st.sidebar:
     st.header('Run Config')
     hrs       = st.slider('Look-ahead (hours)', 1, 168, config.LOOKAHEAD_HRS)
     threshold = st.slider('Match threshold',    0.5, 1.0, 0.85, step=0.01)
-    taker_fee = st.slider('Taker fee %',        0,   15,  7) / 100
-    maker_fee = st.slider('Maker fee %',        0,   15,  3) / 100
     live      = st.toggle('Fetch live games', value=config.LIVE)
+
+    st.caption(
+        'Fees are fetched live per Kalshi series (not a fixed global rate) — verified '
+        'to genuinely vary, e.g. MLB gets a 0.5x multiplier and several soccer/boxing '
+        'series charge no maker fee at all. See the "fee %" columns in the signals table.'
+    )
+    # Fallback-only defaults if a series' live fee lookup fails — see
+    # KALSHI/k_helpers.fee_rate_for(). No longer user-adjustable: a single override
+    # can't be correct across series with genuinely different published fee rates.
+    taker_fee = TAKER_FEE_BASE
+    maker_fee = MAKER_FEE_BASE
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 
-tab_trade, tab_settle, tab_review, tab_nothing, tab_prospect, tab_poly = st.tabs(
-    ['Trade', 'Settle', 'Review', 'Nothing', 'Prospect', 'Polymarket'])
+tab_trade, tab_settle, tab_review = st.tabs(['Trade', 'Settle', 'Review'])
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — TRADE
@@ -183,10 +197,11 @@ with tab_trade:
 
     # Select / Deselect All Active buttons
     _all_keys = list(config.SPORTS_CONFIG.keys())
+    _paused_sports = getattr(config, 'PAUSED_SPORTS', set())
     _b1, _b2, _ = st.columns([1, 1, 6])
     if _b1.button('Select all active'):
         for k in _all_keys:
-            st.session_state[f'sport_{k}'] = _in_season(k)
+            st.session_state[f'sport_{k}'] = _in_season(k) and k not in _paused_sports
     if _b2.button('Deselect all'):
         for k in _all_keys:
             st.session_state[f'sport_{k}'] = False
@@ -199,6 +214,10 @@ with tab_trade:
         with cols[i % 3]:
             st.markdown(f'**{cat}**')
             for key, label in grouped[cat]:
+                if key in _paused_sports:
+                    st.checkbox(f'⏸️ {label} (paused — see notebooks/win_loss_analysis.ipynb)',
+                               value=False, key=f'sport_{key}', disabled=True)
+                    continue
                 active = _in_season(key)
                 dot    = '🟢' if active else '🔴'
                 if st.checkbox(f'{dot} {label}', value=active, key=f'sport_{key}'):
@@ -209,6 +228,9 @@ with tab_trade:
         soccer_cols = st.columns(4)
         for i, (key, label) in enumerate(grouped['Soccer']):
             with soccer_cols[i % 4]:
+                if key in _paused_sports:
+                    st.checkbox(f'⏸️ {label} (paused)', value=False, key=f'sport_{key}', disabled=True)
+                    continue
                 active = _in_season(key)
                 dot    = '🟢' if active else '🔴'
                 if st.checkbox(f'{dot} {label}', value=active, key=f'sport_{key}'):
@@ -229,18 +251,20 @@ with tab_trade:
                 st.write(f'✅ {len(pinnacle_df)} outcome rows  (API: {used} used / {remaining} remaining)')
 
                 st.write('Matching to Kalshi markets...')
-                matched_df = kalshi_odds(pinnacle_df, threshold=threshold, fees=taker_fee)
+                matched_df = kalshi_odds(pinnacle_df, threshold=threshold)
                 st.write(f'✅ {len(matched_df)} matches found')
 
                 st.session_state['matched_df'] = matched_df
                 status.update(label='Done', state='complete')
                 st.rerun()
             except ValueError as e:
+                log.warning('Fetch Signals: no data — %s', e)
                 status.update(label='No data', state='error')
                 st.warning(str(e))
                 st.session_state['matched_df'] = pd.DataFrame()
                 st.rerun()
             except Exception as e:
+                log.exception('Fetch Signals pipeline failed')
                 status.update(label='Error', state='error')
                 st.error(str(e))
                 st.session_state['matched_df'] = pd.DataFrame()
@@ -263,9 +287,13 @@ with tab_trade:
         with _sc2:
             trade_mode = st.radio(
                 'Order mode',
-                ['Rest (maker, 3%)', 'Cross (taker, 7%)', 'Auto (cross if EV+, else rest)'],
-                index=0, horizontal=True, key='_mode_select',
-                help='Rest = post limit at top of book. Cross = take at ask immediately. Auto = cross only when taker EV is positive.'
+                ['Rest (maker)', 'Cross (taker)', 'Auto (cross if EV+, else rest)'],
+                index=2, horizontal=True, key='_mode_select',
+                help='Rest = post limit at top of book (fee varies per series, often 0-1.75%). '
+                     'Cross = take at ask immediately (fee varies per series, ~3.5-7%). '
+                     'Auto = cross only when taker EV is positive, else rest — the default, '
+                     'since REST fills have outperformed CROSS in this bot\'s own trade '
+                     'history (notebooks/win_loss_analysis.ipynb) and carry lower fees.'
             )
         side        = 'no' if trade_side == 'NO' else 'yes'
         force_cross = trade_mode.startswith('Cross')
@@ -310,17 +338,14 @@ with tab_trade:
             if not signals.empty:
                 st.markdown(f'#### {side.upper()} Signals')
 
-                # Pending tickers — check BOTH logs so we don't double-bet across sides.
-                # Only count rows that were ACTUALLY filled (executed/filled). Orphans
-                # (canceled/expired that stayed PENDING) shouldn't block new bets.
-                _log = _load_all_logs()
-                _pending_tickers = set()
-                if not _log.empty and 'result' in _log.columns and 'k_ticker' in _log.columns:
-                    _really_open = _log[
-                        (_log['result'] == 'PENDING') &
-                        (_log['final_status'].isin(['executed', 'filled']))
-                    ]
-                    _pending_tickers = set(_really_open['k_ticker'].tolist())
+                # Pending tickers — must match bot.already_bet_tickers() EXACTLY (same
+                # function, not a re-derived copy), since that's what run_all_signals()
+                # actually dedupes against when Execute is clicked. A UI-only filter that
+                # disagrees (e.g. treating 'resting' as still tradeable) lets the user
+                # check/approve rows that silently get dropped server-side — the
+                # checkbox lies about what will happen, and Execute can appear to do
+                # nothing because everything approved got filtered out internally.
+                _pending_tickers = already_bet_tickers()
 
                 # Compute entry_price (what the bot fills/posts at) before building display
                 # CROSS → taker fills at ask; REST → limit order at bid+1¢ (YES) or ask-1¢ (NO)
@@ -344,26 +369,80 @@ with tab_trade:
                 if side == 'no':
                     _sig['fair_prob'] = (1 - _sig['fair_prob']).round(4)
 
+                # Edge = fair_prob - entry_price (raw, pre-fee) — same definition used
+                # for signal/ev math and in the post-execute log, just visible earlier now.
+                _sig['edge'] = (_sig['fair_prob'] - _sig['entry_price']).round(4)
+
+                # fee_pct = the live per-series rate that actually applies to THIS row's
+                # order type (taker if it'll cross, maker if it'll rest) — fetched by
+                # kalshi_odds() per series, not a single global assumption. Often 0 for
+                # series with no maker fee.
+                if force_cross:
+                    _sig['fee_pct'] = (_sig['taker_fee_rate'] * 100).round(3)
+                elif limit_only_mode:
+                    _sig['fee_pct'] = (_sig['maker_fee_rate'] * 100).round(3)
+                else:  # AUTO: per-row, matching whichever leg actually fired
+                    _cross_col = 'signal_no_cross' if side == 'no' else 'signal'
+                    _sig['fee_pct'] = _sig.apply(
+                        lambda r: round(r['taker_fee_rate'] * 100, 3) if r.get(_cross_col, False)
+                                  else round(r['maker_fee_rate'] * 100, 3),
+                        axis=1,
+                    )
+
+                # EV = edge - fee_rate*price*(1-price) — the fee-adjusted expected
+                # value per contract that actually gates whether a signal fires (see
+                # KALSHI/k_helpers._ev). 'edge' above is the raw, pre-fee mispricing —
+                # useful for spotting bad fuzzy-matches, but overstates true expected
+                # profit since it ignores the fee that gets charged on every fill.
+                _fee_frac = _sig['fee_pct'] / 100
+                _sig['ev'] = (_sig['edge'] - _fee_frac * _sig['entry_price'] * (1 - _sig['entry_price'])).round(4)
+
                 # mkt_ask = Kalshi top-of-book ask (taker price, shown for reference only)
                 mkt_ask_col = 'no_ask' if side == 'no' else 'yes_ask'
                 display_cols = [c for c in ['sport', 'home', 'away', 'commence', 'outcome',
-                                            'fair_prob', 'entry_price', mkt_ask_col,
+                                            'fair_prob', 'entry_price', 'edge', 'ev', 'fee_pct', mkt_ask_col,
                                             'match_score', 'k_ticker']
                                 if c in _sig.columns]
 
                 editable = _sig[display_cols].copy().reset_index(drop=True)
-                editable = editable.rename(columns={mkt_ask_col: 'mkt_ask'})
+                editable = editable.rename(columns={mkt_ask_col: 'mkt_ask', 'fee_pct': 'fee %'})
                 already_traded = editable['k_ticker'].isin(_pending_tickers)
-                editable.insert(0, 'Execute', (~already_traded))
                 editable.insert(1, 'Status', already_traded.map({True: '⚠️ pending', False: ''}))
+
+                # Select all / Deselect all — data_editor only adopts a fresh 'Execute'
+                # column when its widget key changes, so these buttons bump a version
+                # counter to force that instead of trying to mutate editor state in place.
+                _ver_key = f'_signals_editor_version_{side}'
+                st.session_state.setdefault(_ver_key, 0)
+                _sa1, _sa2, _sa3 = st.columns([1, 1, 6])
+                if _sa1.button('Select all', key=f'_select_all_{side}'):
+                    st.session_state[f'_signals_execute_override_{side}'] = True
+                    st.session_state[_ver_key] += 1
+                    st.rerun()
+                if _sa2.button('Deselect all', key=f'_deselect_all_{side}'):
+                    st.session_state[f'_signals_execute_override_{side}'] = False
+                    st.session_state[_ver_key] += 1
+                    st.rerun()
+
+                _override = st.session_state.pop(f'_signals_execute_override_{side}', None)
+                default_execute = (~already_traded) if _override is None else pd.Series(_override, index=editable.index)
+                editable.insert(0, 'Execute', default_execute)
+
                 locked_cols = [c for c in editable.columns if c != 'Execute']
                 edited = st.data_editor(
                     editable,
                     width="stretch",
                     hide_index=True,
                     disabled=locked_cols,
-                    column_config={'Execute': st.column_config.CheckboxColumn('Execute', default=True)},
-                    key=f'signals_editor_{side}',
+                    column_config={
+                        'Execute': st.column_config.CheckboxColumn('Execute', default=True),
+                        'edge':    st.column_config.NumberColumn('edge', format='%+.4f',
+                                                                  help='Raw mispricing: fair_prob - price (pre-fee)'),
+                        'ev':      st.column_config.NumberColumn('ev', format='%+.4f',
+                                                                  help='Fee-adjusted expected value per contract — what actually gates the signal'),
+                        'fee %':   st.column_config.NumberColumn('fee %', format='%.3f%%'),
+                    },
+                    key=f'signals_editor_{side}_{st.session_state[_ver_key]}',
                 )
 
                 approved_mask    = edited['Execute'].values
@@ -375,9 +454,12 @@ with tab_trade:
                 with _opt_c1:
                     limit_only = limit_only_mode
                     if force_cross:
-                        st.caption(f'{n_approved} {side.upper()} signal(s) — **CROSS** at ask (taker, {taker_fee*100:.0f}% fee)')
+                        st.caption(f'{n_approved} {side.upper()} signal(s) — **CROSS** at ask '
+                                   f'(taker fee — varies per series, ~{TAKER_FEE_BASE*100:.2g}% general rate)')
                     elif limit_only:
-                        st.caption(f'{n_approved} {side.upper()} signal(s) — **REST** at top of book (maker, {maker_fee*100:.0f}% fee)')
+                        st.caption(f'{n_approved} {side.upper()} signal(s) — **REST** at top of book '
+                                   f'(maker fee — varies per series, ~{MAKER_FEE_BASE*100:.2g}% general rate, '
+                                   f'often $0 — see "fee %" column)')
                     else:
                         st.caption(f'{n_approved} {side.upper()} signal(s) — **AUTO**: cross if taker EV positive, else rest')
                 with _opt_c2:
@@ -393,8 +475,16 @@ with tab_trade:
                         help='Multiply Kelly contract count by this factor (e.g. 2.0 = double Kelly). Order is skipped if total cost exceeds available balance.'
                     )
 
+                # Explicit, content-independent key: this button's label includes
+                # n_approved, which changes on every checkbox edit (including Select
+                # all/Deselect all). Without a stable key, Streamlit's auto-derived
+                # widget identity (based partly on label text) changes along with it,
+                # so a click can fail to register as THIS button's click on the rerun
+                # that processes it — the click appears to do nothing while the table
+                # still redraws, looking like everything just got deselected.
                 btn_label = f'Execute {n_approved} {side.upper()} Signal(s)'
-                if st.button(btn_label, type='primary', disabled=(n_approved == 0)):
+                if st.button(btn_label, type='primary', disabled=(n_approved == 0),
+                            key=f'_execute_btn_{side}'):
                     if balance is None:
                         st.error('Refresh your Kalshi balance in the sidebar before trading.')
                     else:
@@ -422,6 +512,7 @@ with tab_trade:
                                 )
                                 rh.extend(out or [])
                             except Exception as exc:
+                                log.exception('Trade worker thread failed')
                                 rh.append({'status': 'error', 'ticker': '',
                                            'outcome': '', 'reason': str(exc),
                                            'order_id': None, 'contracts': 0})
@@ -459,22 +550,36 @@ with tab_trade:
                 snap = dash.snapshot()
 
                 # ── Time progress bar ───────────────────────────────────────
+                _extra_sec = snap.get('extra_seconds', 0)
                 _start   = st.session_state.get('_trade_start_time', time.time())
-                _ttl     = st.session_state.get('_trade_ttl_sec', 1800)
+                _ttl     = st.session_state.get('_trade_ttl_sec', 1800) + _extra_sec
                 _elapsed = time.time() - _start
                 _rem     = max(_ttl - _elapsed, 0)
                 _pct     = min(_elapsed / max(_ttl, 1), 1.0)
                 _m, _s   = int(_rem // 60), int(_rem % 60)
-                st.progress(_pct, text=f'⏱ {_m}m {_s:02d}s remaining')
+                _extend_note = f'  (+{_extra_sec // 60}m extended)' if _extra_sec else ''
+                st.progress(_pct, text=f'⏱ {_m}m {_s:02d}s remaining{_extend_note}')
 
-                # Header + cancel + cross&cancel + keep-rest buttons
-                hc1, hc2, hc3, hc4 = st.columns([3, 1, 1, 1])
+                # Header + cancel + cross&cancel + keep-rest + extend buttons
+                #
+                # This whole panel is inside @st.fragment(run_every='1s'). Any output
+                # written directly under a button's `if` only lives for that one script
+                # run — about a second later the timer reruns the fragment, the button
+                # is no longer "clicked", and that output disappears while the table
+                # shifts to fill the gap. To keep results from flickering away under the
+                # user, action results are stashed in session_state and rendered
+                # unconditionally below, so they survive every subsequent auto-refresh
+                # until the next action replaces them.
+                hc1, hc2, hc3, hc4, hc5 = st.columns([2, 1, 1, 1, 1])
                 hc1.markdown('#### Dashboard')
                 if thread.is_alive():
                     if hc2.button('🛑 Cancel all', key='_cancel_all_btn'):
                         if stop_event:
                             stop_event.set()
-                        st.warning('Cancellation requested — monitors will close orders.')
+                        st.session_state['_dash_last_action'] = {
+                            'type': 'cancel_all',
+                            'ts':   datetime.now().strftime('%H:%M:%S'),
+                        }
                     if hc3.button('↑ Cross & Cancel', key='_cross_cancel_btn',
                                   help='Re-check each resting order against Pinnacle fair value. '
                                        'Crosses if EV still positive at current ask, cancels if not.'):
@@ -484,7 +589,10 @@ with tab_trade:
                         _targets  = [(oid, pos) for oid, pos in _pos_now.items()
                                      if pos.get('status') in _RESTING]
                         if not _targets:
-                            st.info('No resting orders to process.')
+                            st.session_state['_dash_last_action'] = {
+                                'type': 'cross_cancel_empty',
+                                'ts':   datetime.now().strftime('%H:%M:%S'),
+                            }
                         else:
                             _xc_results = []
                             for _oid, _pos in _targets:
@@ -496,18 +604,15 @@ with tab_trade:
                                     outcome=_pos.get('raw_outcome', ''),
                                 )
                                 _xc_results.append(_r)
-                            _n_crossed  = sum(1 for r in _xc_results if r['action'] == 'crossed')
-                            _n_canceled = sum(1 for r in _xc_results if r['action'] == 'canceled')
-                            _n_errors   = sum(1 for r in _xc_results if r['action'] == 'error')
-                            st.info(f'↑ {_n_crossed} crossed · {_n_canceled} canceled · {_n_errors} errors')
-                            for _r in _xc_results:
-                                if _r['action'] == 'crossed':
-                                    st.success(f"✓ {_r['ticker']}  {_r.get('contracts')}ct  "
-                                               f"ask={_r['ask']:.2f}  ev={_r['ev']:+.4f}")
-                                elif _r['action'] == 'canceled':
-                                    st.warning(f"✗ {_r['ticker']}  {_r.get('reason', 'canceled')}")
-                                else:
-                                    st.error(f"⚠ {_r['ticker']}  {_r.get('reason', 'error')}")
+                            _n_errors = sum(1 for r in _xc_results if r['action'] == 'error')
+                            if _n_errors:
+                                log.warning('Cross & Cancel: %d error(s) — %s', _n_errors,
+                                           [r for r in _xc_results if r['action'] == 'error'])
+                            st.session_state['_dash_last_action'] = {
+                                'type':    'cross_cancel',
+                                'ts':      datetime.now().strftime('%H:%M:%S'),
+                                'results': _xc_results,
+                            }
                     if hc4.button('⏸ Keep Rest', key='_keep_rest_btn',
                                   help='Re-rest each resting order until 30 min before game start, '
                                        'then stop Pinnacle polling to save API credits.'):
@@ -518,7 +623,10 @@ with tab_trade:
                                        if pos.get('status') in _KR_RESTING
                                        and pos.get('contracts', 0) - pos.get('filled', 0) > 0]
                         if not _kr_targets:
-                            st.info('No unfilled resting orders to keep.')
+                            st.session_state['_dash_last_action'] = {
+                                'type': 'keep_rest_empty',
+                                'ts':   datetime.now().strftime('%H:%M:%S'),
+                            }
                         else:
                             _kr_results = []
                             for _oid, _pos in _kr_targets:
@@ -532,9 +640,64 @@ with tab_trade:
                                 _kr_results.append((_pos['ticker'], _r))
                             if stop_event:
                                 stop_event.set()
-                            _kr_ok  = sum(1 for _, r in _kr_results if r['action'] == 'rested')
                             _kr_err = sum(1 for _, r in _kr_results if r['action'] == 'error')
-                            st.info(f'⏸ {_kr_ok} re-rested · {_kr_err} errors — Pinnacle polling stopped')
+                            if _kr_err:
+                                log.warning('Keep Rest: %d error(s) — %s', _kr_err,
+                                           [r for _, r in _kr_results if r['action'] == 'error'])
+                            st.session_state['_dash_last_action'] = {
+                                'type':    'keep_rest',
+                                'ts':      datetime.now().strftime('%H:%M:%S'),
+                                'results': _kr_results,
+                            }
+                    if hc5.button('⏱ +15 min', key='_extend_time_btn',
+                                  help='Push back the auto-cancel deadline for every resting '
+                                       'order in this session by 15 minutes.'):
+                        dash.extend_time(15 * 60)
+                        st.session_state['_dash_last_action'] = {
+                            'type':    'extend',
+                            'ts':      datetime.now().strftime('%H:%M:%S'),
+                            'minutes': 15,
+                        }
+
+                # Render whatever the last action was — persists across the 1s
+                # auto-refresh instead of disappearing after one script run.
+                _last_action = st.session_state.get('_dash_last_action')
+                if _last_action:
+                    _atype, _ats = _last_action['type'], _last_action['ts']
+                    if _atype == 'cancel_all':
+                        st.warning(f'[{_ats}] Cancellation requested — monitors will close orders.')
+                    elif _atype == 'cross_cancel_empty':
+                        st.info(f'[{_ats}] No resting orders to process.')
+                    elif _atype == 'keep_rest_empty':
+                        st.info(f'[{_ats}] No unfilled resting orders to keep.')
+                    elif _atype == 'extend':
+                        st.success(f"[{_ats}] ⏱ Extended by {_last_action['minutes']}m — "
+                                   f"total extension now +{_extra_sec // 60}m")
+                    elif _atype == 'cross_cancel':
+                        _xc_results = _last_action['results']
+                        _n_crossed  = sum(1 for r in _xc_results if r['action'] == 'crossed')
+                        _n_canceled = sum(1 for r in _xc_results if r['action'] == 'canceled')
+                        _n_errors   = sum(1 for r in _xc_results if r['action'] == 'error')
+                        with st.expander(
+                            f'[{_ats}] ↑ {_n_crossed} crossed · {_n_canceled} canceled · {_n_errors} errors',
+                            expanded=True,
+                        ):
+                            for _r in _xc_results:
+                                if _r['action'] == 'crossed':
+                                    st.success(f"✓ {_r['ticker']}  {_r.get('contracts')}ct  "
+                                               f"ask={_r['ask']:.2f}  ev={_r['ev']:+.4f}")
+                                elif _r['action'] == 'canceled':
+                                    st.warning(f"✗ {_r['ticker']}  {_r.get('reason', 'canceled')}")
+                                else:
+                                    st.error(f"⚠ {_r['ticker']}  {_r.get('reason', 'error')}")
+                    elif _atype == 'keep_rest':
+                        _kr_results = _last_action['results']
+                        _kr_ok  = sum(1 for _, r in _kr_results if r['action'] == 'rested')
+                        _kr_err = sum(1 for _, r in _kr_results if r['action'] == 'error')
+                        with st.expander(
+                            f'[{_ats}] ⏸ {_kr_ok} re-rested · {_kr_err} errors — Pinnacle polling stopped',
+                            expanded=True,
+                        ):
                             for _tkr, _r in _kr_results:
                                 if _r['action'] == 'rested':
                                     st.success(f"✓ {_tkr}  {_r['price_cents']}¢  GTC {_r['expiry']}")
@@ -543,44 +706,69 @@ with tab_trade:
                                 else:
                                     st.error(f"⚠ {_tkr}  {_r.get('reason', 'error')}")
 
-                # Positions table
-                positions = snap['positions']
-                if positions:
-                    rows = []
-                    for pos in positions.values():
-                        cts    = pos['contracts']
-                        filled = pos.get('filled', 0)
-                        if filled == cts and cts > 0:
-                            disp_status = 'executed'
-                        elif 0 < filled < cts:
-                            disp_status = 'partial'
-                        else:
-                            disp_status = pos['status']
-                        rows.append({
-                            'Ticker':    pos['ticker'],
-                            'Outcome':   pos['outcome'],
-                            'Contracts': cts,
-                            'Filled':    filled,
-                            'Entry ¢':   pos['entry_price'],
-                            'Mkt Ask ¢': pos['market_ask'] if pos['market_ask'] is not None else '—',
-                            'Fair entry':f"{pos['fair_entry']:.3f}",
-                            'Fair last': f"{pos['fair_last']:.3f}",
-                            'Edge':      f"{pos['edge_last']:+.3f}",
-                            'Status':    disp_status,
-                            'Last ping': pos['last_ping'],
-                        })
-                    n = len(rows)
-                    st.dataframe(pd.DataFrame(rows), width="stretch",
-                                 hide_index=True,
-                                 height=min(35 * n + 38, 600))
-                else:
-                    st.caption('Waiting for orders to be placed...')
+                # Positions table — wrapped: this renders every 1s off live worker-thread
+                # state, so one malformed row must not repeatedly break the whole fragment.
+                try:
+                    positions = snap['positions']
+                    if positions:
+                        rows = []
+                        for pos in positions.values():
+                            cts    = pos['contracts']
+                            filled = pos.get('filled', 0)
+                            if filled == cts and cts > 0:
+                                disp_status = 'executed'
+                            elif 0 < filled < cts:
+                                disp_status = 'partial'
+                            else:
+                                disp_status = pos['status']
+                            avg_fp = pos.get('avg_fill_price')
+                            rows.append({
+                                'Ticker':    pos['ticker'],
+                                'Outcome':   pos['outcome'],
+                                'Contracts': cts,
+                                'Filled':    filled,
+                                'Avg Fill ¢': round(avg_fp * 100) if avg_fp is not None else '—',
+                                'Entry ¢':   pos['entry_price'],
+                                'Mkt Ask ¢': f"{pos['market_ask']}" if pos['market_ask'] is not None else '—',
+                                'Fair entry':f"{pos['fair_entry']:.3f}",
+                                'Fair last': f"{pos['fair_last']:.3f}",
+                                'Edge':      f"{pos['edge_last']:+.3f}",
+                                'Status':    disp_status,
+                                'Last ping': pos['last_ping'],
+                            })
+                        n = len(rows)
+
+                        # Red = unfilled, yellow = partial, green = fully filled.
+                        def _fill_color(row):
+                            cts_, filled_ = row['Contracts'], row['Filled']
+                            if cts_ > 0 and filled_ >= cts_:
+                                bg = 'rgba(46, 204, 113, 0.25)'    # green
+                            elif filled_ > 0:
+                                bg = 'rgba(241, 196, 15, 0.25)'    # yellow
+                            else:
+                                bg = 'rgba(231, 76, 60, 0.25)'     # red
+                            return [f'background-color: {bg}'] * len(row)
+
+                        positions_df = pd.DataFrame(rows)
+                        styled = positions_df.style.apply(_fill_color, axis=1)
+                        st.dataframe(styled, width="stretch",
+                                     hide_index=True,
+                                     height=min(35 * n + 38, 600))
+                    else:
+                        st.caption('Waiting for orders to be placed...')
+                except Exception:
+                    log.exception('Live dashboard: positions table render failed')
+                    st.error('Dashboard table failed to render — see trade/logs/app.log. '
+                             'Trading continues in the background.')
 
                 # API bar
-                au, al = snap['api_used'], snap['api_limit']
-                ar = max(al - au, 0)
-                pct = min(max(au / max(al, 1), 0.0), 1.0)
-                st.progress(pct, text=f'API  {au} / {al} used  ({ar} remaining)')
+                try:
+                    au, al = snap['api_used'], snap['api_limit']
+                    ar = max(al - au, 0)
+                    pct = min(max(au / max(al, 1), 0.0), 1.0)
+                    st.progress(pct, text=f'API  {au} / {al} used  ({ar} remaining)')
+                except Exception:
+                    log.exception('Live dashboard: API bar render failed')
 
                 if not thread.is_alive():
                     st.success('Trade session complete.')
@@ -644,12 +832,27 @@ with tab_settle:
                       if not no_log.empty else pd.DataFrame()
         pending_count = len(yes_pending) + len(no_pending)
 
+        # Orphans: PENDING rows that never actually filled (resting/canceled/unknown).
+        # Computed here (not just inside the "else" below) because the "no pending
+        # trades" success message must NOT hide these — a ticker with a stale orphan
+        # row is silently blocked from re-trading by already_bet_tickers() even
+        # though pending_count (genuinely open/filled) is 0. Without this, the
+        # cleanup tool that clears them is unreachable whenever ALL pending rows
+        # happen to be orphans rather than truly-open trades.
+        yes_orph = yes_log[(yes_log['result'] == 'PENDING') &
+                           (~yes_log['final_status'].isin(['executed', 'filled']))] \
+                   if not yes_log.empty else pd.DataFrame()
+        no_orph  = no_log[(no_log['result'] == 'PENDING') &
+                          (~no_log['final_status'].isin(['executed', 'filled']))] \
+                   if not no_log.empty else pd.DataFrame()
+        orphan_count = len(yes_orph) + len(no_orph)
+
         col1, col2, col3 = st.columns(3)
         col1.metric('Total trades', total_count)
         col2.metric('Pending',      pending_count)
         col3.metric('Settled',      total_count - pending_count)
 
-        if pending_count == 0:
+        if pending_count == 0 and orphan_count == 0:
             st.success('No pending trades — all settled.')
         else:
             show_cols = ['logged_at', 'k_ticker', 'outcome', 'sport',
@@ -668,13 +871,6 @@ with tab_settle:
 
             # ── Orphan cleanup ──────────────────────────────────────────────
             orphan_cols = ['k_ticker', 'final_status', 'result']
-            yes_orph = yes_log[(yes_log['result'] == 'PENDING') &
-                               (~yes_log['final_status'].isin(['executed', 'filled']))] \
-                       if not yes_log.empty else pd.DataFrame()
-            no_orph  = no_log[(no_log['result'] == 'PENDING') &
-                              (~no_log['final_status'].isin(['executed', 'filled']))] \
-                       if not no_log.empty else pd.DataFrame()
-            orphan_count = len(yes_orph) + len(no_orph)
 
             if orphan_count > 0:
                 with st.expander(f'⚠️ {orphan_count} orphan row(s) — never filled but still PENDING'):
@@ -721,45 +917,51 @@ with tab_settle:
                     updated = 0
                     for idx, row in pending.iterrows():
                         ticker = row['k_ticker']
-                        st.write(f'[{side.upper()}] Checking `{ticker}`...')
-                        k_result = fetch_market_result(ticker)
-                        if k_result is None:
-                            st.write('  ⏳ Not settled yet')
-                            continue
-                        if k_result == 'scalar':
-                            sv = fetch_scalar_settlement_value(ticker)
-                            if sv is None:
-                                st.write(f'  ⚠️ SCALAR — settlement value unavailable, skipping')
+                        try:
+                            st.write(f'[{side.upper()}] Checking `{ticker}`...')
+                            k_result = fetch_market_result(ticker)
+                            if k_result is None:
+                                st.write('  ⏳ Not settled yet')
                                 continue
-                            pnl = compute_scalar_pnl(int(row['contracts']),
-                                                     float(row['entry_price']),
-                                                     float(row['fee_rate']),
-                                                     sv, side=side)
-                            colour = 'green' if pnl >= 0 else ('red' if pnl < 0 else 'grey')
-                            st.markdown(f'  :blue[**SCALAR**]  settle={sv:.3f}  '
-                                        f'  :{colour}[pnl=${pnl:+.4f}]'
+                            if k_result == 'scalar':
+                                sv = fetch_scalar_settlement_value(ticker)
+                                if sv is None:
+                                    st.write(f'  ⚠️ SCALAR — settlement value unavailable, skipping')
+                                    continue
+                                pnl = compute_scalar_pnl(int(row['contracts']),
+                                                         float(row['entry_price']),
+                                                         float(row['fee_rate']),
+                                                         sv, side=side)
+                                colour = 'green' if pnl >= 0 else ('red' if pnl < 0 else 'grey')
+                                st.markdown(f'  :blue[**SCALAR**]  settle={sv:.3f}  '
+                                            f'  :{colour}[pnl=${pnl:+.4f}]'
+                                            + ('  *(dry run)*' if dry_run else ''))
+                                if not dry_run:
+                                    df.at[idx, 'result']     = 'SCALAR'
+                                    df.at[idx, 'actual_pnl'] = pnl
+                                updated += 1
+                                continue
+                            if k_result not in label_map:
+                                st.write(f'  ⚠️ Unknown result `{k_result}` — skipping')
+                                continue
+                            result_label = label_map[k_result]
+                            pnl = compute_pnl(k_result,
+                                              int(row['contracts']),
+                                              float(row['entry_price']),
+                                              float(row['fee_rate']),
+                                              side=side)
+                            colour = 'green' if pnl >= 0 else 'red'
+                            st.markdown(f'  :{colour}[**{result_label}**]  pnl = ${pnl:+.4f}'
                                         + ('  *(dry run)*' if dry_run else ''))
                             if not dry_run:
-                                df.at[idx, 'result']     = 'SCALAR'
+                                df.at[idx, 'result']     = result_label
                                 df.at[idx, 'actual_pnl'] = pnl
                             updated += 1
-                            continue
-                        if k_result not in label_map:
-                            st.write(f'  ⚠️ Unknown result `{k_result}` — skipping')
-                            continue
-                        result_label = label_map[k_result]
-                        pnl = compute_pnl(k_result,
-                                          int(row['contracts']),
-                                          float(row['entry_price']),
-                                          float(row['fee_rate']),
-                                          side=side)
-                        colour = 'green' if pnl >= 0 else 'red'
-                        st.markdown(f'  :{colour}[**{result_label}**]  pnl = ${pnl:+.4f}'
-                                    + ('  *(dry run)*' if dry_run else ''))
-                        if not dry_run:
-                            df.at[idx, 'result']     = result_label
-                            df.at[idx, 'actual_pnl'] = pnl
-                        updated += 1
+                        except Exception:
+                            # One malformed row shouldn't abort settlement for the rest —
+                            # log it and keep going so already-processed rows still get saved.
+                            log.exception('Settle: failed to settle %s row for %s', side, ticker)
+                            st.error(f'  ⚠️ {ticker} — settle failed, see trade/logs/app.log')
                     if updated and not dry_run:
                         df.to_csv(path, index=False)
                     return updated
@@ -944,886 +1146,3 @@ with tab_review:
             except ImportError:
                 st.warning('Install matplotlib to see charts: `pip install matplotlib`')
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 4 — NOTHING EVER HAPPENS
-# ════════════════════════════════════════════════════════════════════════════
-
-with tab_nothing:
-    import nothing as _nothing
-    from nothing_config import NOTHING_SERIES as _NOTHING_SERIES
-    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-
-    st.subheader('"Nothing Ever Happens" — NO-side event bot')
-    st.caption('Buys 1 NO contract per qualifying market. Caps total spend at '
-               'a fraction of Kalshi cash so the K/P bot keeps capital.')
-
-    # ── Series selection ─────────────────────────────────────────────────────
-    if 'nothing_open_counts' not in st.session_state:
-        with st.spinner(f'Checking Kalshi for open markets across {len(_NOTHING_SERIES)} series...'):
-            _counts = {}
-            for _t, _l, _c in _NOTHING_SERIES:
-                try:
-                    _counts[_t] = len(_nothing.fetch_series_markets(_t))
-                except Exception:
-                    _counts[_t] = 0
-            st.session_state['nothing_open_counts'] = _counts
-            st.session_state['nothing_counts_checked_at'] = _dt.now(_tz.utc).strftime('%H:%M UTC')
-
-    _ncounts    = st.session_state['nothing_open_counts']
-    _checked_at = st.session_state.get('nothing_counts_checked_at', '—')
-    _n_active   = sum(1 for v in _ncounts.values() if v > 0)
-    st.caption(f'Kalshi market check: **{_n_active}/{len(_NOTHING_SERIES)} series have open markets** — last checked {_checked_at}')
-
-    _nb1, _nb2, _ = st.columns([1, 1, 6])
-    if _nb1.button('Select all active', key='nothing_sel_all'):
-        for _t, _l, _c in _NOTHING_SERIES:
-            st.session_state[f'nseries_{_t}'] = _ncounts.get(_t, 0) > 0
-    if _nb2.button('Deselect all', key='nothing_desel_all'):
-        for _t, _l, _c in _NOTHING_SERIES:
-            st.session_state[f'nseries_{_t}'] = False
-    if st.button('🔄 Refresh market counts', key='nothing_refresh_counts'):
-        st.session_state.pop('nothing_open_counts', None)
-        st.rerun()
-
-    # Group by category and render as checkboxes (like Trade tab sports)
-    _n_grouped: dict = {}
-    for _t, _l, _c in _NOTHING_SERIES:
-        _n_grouped.setdefault(_c, []).append((_t, _l))
-
-    selected_series: list = []
-    for _cat, _items in _n_grouped.items():
-        st.markdown(f'**{_cat.title()}**')
-        _ncols = st.columns(min(len(_items), 3))
-        for _i, (_t, _l) in enumerate(_items):
-            with _ncols[_i % 3]:
-                _cnt   = _ncounts.get(_t, 0)
-                _dot   = '🟢' if _cnt > 0 else '🔴'
-                _dflt  = _cnt > 0
-                _label = f'{_dot} {_l}  ({_cnt} open)' if _cnt > 0 else f'{_dot} {_l}  (no open markets)'
-                if st.checkbox(_label, value=_dflt, key=f'nseries_{_t}'):
-                    selected_series.append(_t)
-
-    st.caption(f'{len(selected_series)} series selected')
-    st.divider()
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        extra_series_raw = st.text_input('Extra series (optional)',
-                                         key='nothing_extra_series',
-                                         placeholder='KXEXTRASERIES')
-    with c2:
-        tickers_raw = st.text_input('Explicit market tickers (optional)',
-                                    key='nothing_tickers',
-                                    placeholder='MKT-ABC MKT-DEF')
-    with c3:
-        budget_pct = st.slider('Budget % of Kalshi cash', 1, 50, 10,
-                               key='nothing_budget_pct') / 100
-
-    c4, c5, c6, c7, c8 = st.columns(5)
-    with c4:
-        max_no_price = st.slider('Max NO price', 0.05, 0.95, 0.50, step=0.01,
-                                 key='nothing_max_no_price')
-    with c5:
-        ttl_min = st.number_input('TTL (min)', 5, 1440, 30,
-                                  key='nothing_ttl_min',
-                                  help='Cancel unfilled orders after this many minutes (or when market closes)')
-    with c6:
-        rest_mode = st.toggle('Rest (maker)', value=False,
-                              key='nothing_rest',
-                              help='Off = cross at no_ask (taker). On = rest at no_ask−1¢ post_only (maker)')
-    with c7:
-        dynamic_size = st.toggle('Dynamic sizing', value=False,
-                                 key='nothing_dynamic',
-                                 help='Off = 1 contract per market. On = partial Kelly (1–5 contracts) — more when NO is cheap.')
-    with c8:
-        allow_multi = st.toggle('Allow mutex events', value=False,
-                                key='nothing_multi',
-                                help='Off = drop A-vs-B events where yes-asks sum to ~1.0')
-
-    series  = selected_series + [s.strip() for s in extra_series_raw.split() if s.strip()]
-    tickers = [t.strip() for t in tickers_raw.split() if t.strip()]
-
-    preview_col, execute_col, cancel_col = st.columns(3)
-    preview = preview_col.button('Preview', key='nothing_preview',
-                                 width="stretch")
-    execute = execute_col.button('Execute (LIVE)', key='nothing_execute',
-                                 type='primary', width="stretch")
-    cancel  = cancel_col.button('Cancel all tracked', key='nothing_cancel',
-                                width="stretch")
-
-    if cancel:
-        with st.spinner('Canceling tracked orders...'):
-            try:
-                _nothing.cancel_all_tracked()
-                st.success('Cancel pass complete — check stdout.')
-            except Exception as exc:
-                st.error(f'Cancel failed: {exc}')
-
-    if (preview or execute) and not (series or tickers):
-        st.warning('Enter at least one series or ticker.')
-
-    if (preview or execute) and (series or tickers):
-        with st.spinner('Fetching markets...'):
-            markets = []
-            for s in series:
-                if s in _nothing.SPORTS_SERIES:
-                    st.warning(f'Skipping {s} — sports series blocklisted')
-                    continue
-                try:
-                    fetched = _nothing.fetch_series_markets(s)
-                    for m in fetched:
-                        m['_series'] = s
-                    markets.extend(fetched)
-                except Exception as exc:
-                    st.error(f'{s}: {exc}')
-            for t in tickers:
-                m = _nothing.fetch_ticker(t)
-                if m is None:
-                    st.warning(f'{t} — not found')
-                    continue
-                m['_series'] = (m.get('event_ticker') or '').split('-')[0]
-                markets.append(m)
-
-        kept = _nothing.filter_markets(markets, max_no_price=max_no_price,
-                                       mutually_exclusive_only_filter=not allow_multi)
-
-        # Dedup: drop tickers already sitting in nothing_trades.csv as open/pending
-        existing = _nothing.already_bet_tickers()
-        dropped_existing = 0
-        if existing:
-            before = len(kept)
-            kept = [m for m in kept if m['ticker'] not in existing]
-            dropped_existing = before - len(kept)
-
-        cap = (f'fetched={len(markets)} · kept={len(kept)} · '
-               f'single_event={not allow_multi}')
-        if dropped_existing:
-            cap += f' · deduped={dropped_existing} (already open)'
-        st.caption(cap)
-
-        # Resolve budget
-        try:
-            cash = _nothing.get_balance()
-        except Exception as exc:
-            st.error(f'Balance fetch failed: {exc}')
-            cash = 0.0
-        budget = round(cash * budget_pct, 2)
-        st.metric('Budget',
-                  f'${budget:.2f}',
-                  delta=f'{budget_pct*100:.0f}% of ${cash:.2f} cash')
-
-        plans, skipped = _nothing.plan_contracts(kept, budget, rest=rest_mode,
-                                                 dynamic=dynamic_size)
-        if not plans:
-            st.info('No plans — budget cannot afford a single contract.')
-        else:
-            total_cost = sum(n * (c / 100) for _, n, c, _ in plans)
-            total_cts  = sum(n for _, n, _, _ in plans)
-            fee_rate   = _nothing.MAKER_FEE if rest_mode else _nothing.TAKER_FEE
-
-            plan_rows = []
-            for m, n, cents, mode in plans:
-                entry_p = cents / 100
-                plan_rows.append({
-                    'ticker':      m['ticker'],
-                    'title':       (m.get('title') or '')[:60],
-                    'mode':        mode,
-                    'no_price':    f'{cents}¢',
-                    'contracts':   n,
-                    'cost':        round(n * entry_p, 2),
-                    'max_payout':  round(n * (1 - entry_p) * (1 - fee_rate), 2),
-                    'event':       m.get('event_ticker', ''),
-                })
-            st.dataframe(pd.DataFrame(plan_rows), width="stretch",
-                         hide_index=True)
-            st.caption(f'{len(plans)} market(s) · {total_cts} contracts · '
-                       f'est cost ${total_cost:.2f} · skipped {len(skipped)} over budget · '
-                       f'mode = {"REST" if rest_mode else "CROSS"} · '
-                       f'sizing = {"DYNAMIC" if dynamic_size else "EQUAL"}')
-
-            if execute:
-                st.warning('Placing live orders...')
-                expiry_ts = int((_dt.now(_tz.utc) + _td(minutes=int(ttl_min))).timestamp())
-                placed_tracked = []  # feeds the monitor thread
-                errored = []
-                progress = st.progress(0.0)
-                status_placeholder = st.empty()
-
-                for i, (m, n, cents, mode) in enumerate(plans, start=1):
-                    try:
-                        order = _nothing.place_no_order(
-                            m['ticker'], cents, n, mode, expiry_ts)
-                        oid    = order.get('order_id')
-                        status = order.get('status', 'unknown')
-                        entry  = cents / 100
-                        _nothing.log_trade({
-                            'logged_at':         _dt.now(_tz.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
-                            'order_id':          oid,
-                            'series_ticker':     m.get('_series', ''),
-                            'event_ticker':      m.get('event_ticker', ''),
-                            'k_ticker':          m['ticker'],
-                            'title':             (m.get('title') or '')[:120],
-                            'mode':              mode,
-                            'entry_price':       entry,
-                            'entry_price_cents': cents,
-                            'fee_rate':          fee_rate,
-                            'contracts':         n,
-                            'total_cost':        round(n * entry, 4),
-                            'max_payout':        round(n * (1 - entry) * (1 - fee_rate), 4),
-                            'expires_at':        _dt.fromtimestamp(expiry_ts, tz=_tz.utc).isoformat(),
-                            'final_status':      status,
-                            'close_reason':      '',
-                            'result':            'PENDING',
-                            'actual_pnl':        '',
-                        })
-
-                        close_time = None
-                        ct_raw = m.get('close_time')
-                        if ct_raw:
-                            try:
-                                close_time = _dt.fromisoformat(
-                                    str(ct_raw).replace('Z', '+00:00'))
-                            except Exception:
-                                close_time = None
-
-                        if oid:
-                            placed_tracked.append({
-                                'order_id':    oid,
-                                'ticker':      m['ticker'],
-                                'title':       (m.get('title') or '')[:60],
-                                'contracts':   n,
-                                'entry_cents': cents,
-                                'close_time':  close_time,
-                            })
-                    except Exception as exc:
-                        errored.append({'ticker': m['ticker'], 'error': str(exc)})
-                    progress.progress(i / len(plans))
-                    status_placeholder.write(
-                        f'Placed {len(placed_tracked)} · errors {len(errored)} · '
-                        f'{i}/{len(plans)}')
-
-                st.success(f'Placed {len(placed_tracked)}, errors {len(errored)}')
-                if errored:
-                    st.error('Errors:')
-                    st.dataframe(pd.DataFrame(errored), width="stretch",
-                                 hide_index=True)
-
-                # ── Kick off live monitor ───────────────────────────────────
-                if placed_tracked:
-                    state      = {}
-                    stop_event = threading.Event()
-                    ttl_sec    = int(ttl_min) * 60
-
-                    def _monitor_worker(tracked=placed_tracked, state=state,
-                                        stop=stop_event, ttl=ttl_sec):
-                        try:
-                            _nothing.monitor_orders(tracked, stop, state,
-                                                    ttl_seconds=ttl,
-                                                    poll_seconds=10,
-                                                    close_buffer_seconds=300)
-                        except Exception as exc:
-                            state['_error'] = str(exc)
-
-                    t = threading.Thread(target=_monitor_worker, daemon=True)
-                    t.start()
-                    st.session_state['_nothing_thread'] = t
-                    st.session_state['_nothing_state']  = state
-                    st.session_state['_nothing_stop']   = stop_event
-                    st.session_state['_nothing_ttl_min'] = ttl_min
-                    st.rerun()
-
-    # ── Live monitor dashboard ──────────────────────────────────────────────
-    if '_nothing_thread' in st.session_state:
-        _n_thread = st.session_state['_nothing_thread']
-        _n_state  = st.session_state['_nothing_state']
-        _n_stop   = st.session_state['_nothing_stop']
-        _alive    = _n_thread.is_alive()
-
-        @st.fragment(run_every='2s' if _alive else None)
-        def _nothing_live():
-            hc1, hc2, hc3 = st.columns([3, 1, 1])
-            hc1.markdown('#### Live Nothing Dashboard')
-            if _n_thread.is_alive():
-                if hc2.button('🛑 Cancel ALL orders', key='_nothing_live_cancel',
-                              type='primary', width="stretch"):
-                    _n_stop.set()
-                    st.warning('Cancel requested — monitor will kill all open orders.')
-                if hc3.button('↑ Cross & Cancel', key='_nothing_cross_cancel',
-                              help='For each resting order, cross at current ask if price '
-                                   'is unchanged or better, otherwise cancel.'):
-                    _nc_lock = _n_state.get('_lock')
-                    _nc_snap = {}
-                    if _nc_lock:
-                        with _nc_lock:
-                            _nc_snap = {k: dict(v) for k, v in _n_state.items()
-                                        if not k.startswith('_')}
-                    _NC_RESTING = {'pending', 'resting', 'open', 'unknown'}
-                    _nc_ttl     = st.session_state.get('_nothing_ttl_min', 30)
-                    _nc_exp     = int((_dt.now(_tz.utc) + _td(minutes=int(_nc_ttl))).timestamp())
-                    _nc_results = []
-                    for _oid, _rec in _nc_snap.items():
-                        if _rec.get('status') in _NC_RESTING:
-                            _r = _nothing.cross_no_order(
-                                _rec['ticker'], _oid,
-                                _rec.get('entry_cents', 0),
-                                _rec.get('contracts', 1),
-                                _nc_exp,
-                            )
-                            _nc_results.append(_r)
-                    if not _nc_results:
-                        st.info('No resting orders to process.')
-                    else:
-                        _nc_crossed  = sum(1 for r in _nc_results if r['action'] == 'crossed')
-                        _nc_canceled = sum(1 for r in _nc_results if r['action'] == 'canceled')
-                        _nc_errors   = sum(1 for r in _nc_results if r['action'] == 'error')
-                        st.info(f'↑ {_nc_crossed} crossed · {_nc_canceled} canceled · {_nc_errors} errors')
-                        for _r in _nc_results:
-                            if _r['action'] == 'crossed':
-                                st.success(f"✓ {_r['ticker']}  {_r.get('contracts')}ct  @ {_r['ask_cents']}¢")
-                            elif _r['action'] == 'canceled':
-                                st.warning(f"✗ {_r['ticker']}  {_r.get('reason', 'canceled')}")
-                            else:
-                                st.error(f"⚠ {_r['ticker']}  {_r.get('reason', 'error')}")
-
-            if '_error' in _n_state:
-                st.error(f'Monitor error: {_n_state["_error"]}')
-
-            lock = _n_state.get('_lock')
-            snapshot = {}
-            if lock:
-                with lock:
-                    snapshot = {k: dict(v) for k, v in _n_state.items()
-                                if not k.startswith('_')}
-
-            if snapshot:
-                rows = []
-                for oid, rec in snapshot.items():
-                    rows.append({
-                        'Ticker':    rec.get('ticker', ''),
-                        'Title':     rec.get('title', ''),
-                        'Contracts': rec.get('contracts', 0),
-                        'Filled':    rec.get('filled', 0),
-                        'Remaining': rec.get('remaining', 0),
-                        'Price ¢':   rec.get('entry_cents', 0),
-                        'Status':    rec.get('status', 'unknown'),
-                        'Reason':    rec.get('reason', ''),
-                        'Elapsed':   f"{rec.get('elapsed', 0)}s",
-                        'Last ping': rec.get('last_ping', ''),
-                    })
-                st.dataframe(pd.DataFrame(rows),
-                             width="stretch", hide_index=True)
-                filled_ct  = sum(1 for r in snapshot.values()
-                                 if r.get('status') in ('executed', 'filled'))
-                resting_ct = sum(1 for r in snapshot.values()
-                                 if r.get('status') == 'resting')
-                st.caption(f'{filled_ct} filled · {resting_ct} resting · '
-                           f'{len(snapshot)} tracked · poll=10s · '
-                           f'TTL={int(ttl_min)}min')
-            else:
-                st.caption('Monitor starting — waiting for first poll...')
-
-            if not _n_thread.is_alive():
-                st.success('Monitor complete — all orders resolved or canceled.')
-
-        _nothing_live()
-
-        if not _alive:
-            for k in ('_nothing_thread', '_nothing_state', '_nothing_stop'):
-                st.session_state.pop(k, None)
-
-    # ── Performance metrics ─────────────────────────────────────────────────
-    st.divider()
-    st.markdown('#### Nothing Bot Performance')
-    try:
-        import trade.nothing_review as _nr
-        import matplotlib.pyplot as _plt
-        _nr_df = _nr.load_log()
-        if not _nr_df.empty:
-            _nr_fig = _nr.build_charts(_nr_df)
-            if _nr_fig:
-                st.pyplot(_nr_fig)
-                _plt.close(_nr_fig)
-            else:
-                st.caption('No settled trades yet — nothing to chart.')
-        else:
-            st.caption('No trades logged yet.')
-    except Exception as exc:
-        st.error(f'Metrics error: {exc}')
-
-    # ── Log viewer ──────────────────────────────────────────────────────────
-    st.divider()
-    st.caption(f'Log: `{_nothing.LOG_PATH}`')
-    try:
-        if os.path.exists(_nothing.LOG_PATH) and os.path.getsize(_nothing.LOG_PATH) > 0:
-            log_df = pd.read_csv(_nothing.LOG_PATH)
-            st.dataframe(log_df.tail(50), width="stretch", hide_index=True)
-            st.caption(f'{len(log_df)} total rows · showing last 50')
-        else:
-            st.caption('No trades logged yet.')
-    except Exception as exc:
-        st.error(f'Failed to read log: {exc}')
-
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 5 — PROSPECT THEORY
-# ════════════════════════════════════════════════════════════════════════════
-
-with tab_prospect:
-    from KALSHI.k_helpers import prospect_signals as _pt_prospect_signals
-    from prospect import run_prospect_signals as _run_prospect_signals
-    PROSPECT_LOG_PATH = os.path.join(_TRADE, 'logs', 'prospect_trades.csv')
-
-    st.subheader('Prospect Theory Strategy')
-    st.caption(
-        'Exploits cognitive-bias price distortions in Kalshi prediction markets. '
-        '**Favorite zone** (yes_ask $0.75–$0.92): retail underprices high-prob events → buy YES. '
-        '**Longshot zone** (yes_ask $0.05–$0.15): retail overprices low-prob events → buy NO.'
-    )
-
-    # ── Sidebar-shared params ─────────────────────────────────────────────────
-    _pt_hrs        = st.session_state.get('hrs', config.LOOKAHEAD_HRS)
-    _pt_taker_fee  = st.session_state.get('taker_fee', 0.07)
-    _pt_maker_fee  = st.session_state.get('maker_fee', 0.03)
-    _pt_threshold  = st.session_state.get('threshold', 0.85)
-
-    # ── Zone bounds ───────────────────────────────────────────────────────────
-    with st.expander('Zone bounds', expanded=False):
-        _ptc1, _ptc2 = st.columns(2)
-        with _ptc1:
-            st.markdown('**Longshot zone** (buy NO)')
-            _pt_long_lo = st.number_input('Lower bound', min_value=0.01, max_value=0.50,
-                                           value=0.05, step=0.01, format='%.2f',
-                                           key='_pt_long_lo')
-            _pt_long_hi = st.number_input('Upper bound', min_value=0.01, max_value=0.50,
-                                           value=0.15, step=0.01, format='%.2f',
-                                           key='_pt_long_hi')
-        with _ptc2:
-            st.markdown('**Favorite zone** (buy YES)')
-            _pt_fav_lo = st.number_input('Lower bound', min_value=0.50, max_value=0.99,
-                                          value=0.75, step=0.01, format='%.2f',
-                                          key='_pt_fav_lo')
-            _pt_fav_hi = st.number_input('Upper bound', min_value=0.50, max_value=0.99,
-                                          value=0.92, step=0.01, format='%.2f',
-                                          key='_pt_fav_hi')
-
-    _pt_fetch = st.button('Fetch Prospect Signals', key='_pt_fetch',
-                          type='primary',
-                          disabled='_pt_thread' in st.session_state)
-
-    if _pt_fetch:
-        with st.spinner('Fetching Pinnacle odds and matching to Kalshi...'):
-            try:
-                _pt_pinn = pinnacle_odds(config.SPORTS, hrs=_pt_hrs, live=False)
-                _pt_matched = kalshi_odds(
-                    _pt_pinn, threshold=_pt_threshold,
-                    fees=_pt_taker_fee, maker_fees=_pt_maker_fee,
-                )
-                _pt_signals_df = _pt_prospect_signals(
-                    _pt_matched,
-                    longshot_lo=_pt_long_lo, longshot_hi=_pt_long_hi,
-                    favorite_lo=_pt_fav_lo,  favorite_hi=_pt_fav_hi,
-                )
-                # Exclude tickers with open PENDING bets in prospect log
-                if os.path.exists(PROSPECT_LOG_PATH) and os.path.getsize(PROSPECT_LOG_PATH) > 0:
-                    _pt_log = pd.read_csv(PROSPECT_LOG_PATH)
-                    _pt_open = set(_pt_log.loc[_pt_log['result'] == 'PENDING', 'k_ticker'])
-                    if _pt_open:
-                        _pt_signals_df = _pt_signals_df[
-                            ~_pt_signals_df['k_ticker'].isin(_pt_open)]
-                st.session_state['_pt_signals']    = _pt_signals_df
-                st.session_state['_pt_show_table'] = True
-            except Exception as exc:
-                st.error(f'Fetch failed: {exc}')
-
-    # ── Show signals ──────────────────────────────────────────────────────────
-    _pt_showing = (st.session_state.get('_pt_show_table')
-                   and '_pt_thread' not in st.session_state)
-    if _pt_showing and '_pt_signals' in st.session_state:
-        _pt_df  = st.session_state['_pt_signals']
-        _pt_sig = _pt_df[_pt_df['pt_signal']]
-        _pt_fav = _pt_sig[_pt_sig['pt_zone'] == 'favorite']
-        _pt_lng = _pt_sig[_pt_sig['pt_zone'] == 'longshot']
-
-        if _pt_sig.empty:
-            st.info('No prospect theory signals at current zone bounds / fees.')
-        else:
-            if not _pt_fav.empty:
-                st.markdown(f'**Favorite zone — {len(_pt_fav)} signal(s)  (buy YES)**')
-                _pt_fav_disp = _pt_fav[['sport', 'home', 'away', 'outcome',
-                                         'fair_prob', 'yes_ask', 'no_ask',
-                                         'match_score', 'k_ticker']].copy()
-                _pt_fav_disp['ev'] = _pt_fav_disp.apply(
-                    lambda r: round(r['fair_prob'] - r['yes_ask'] -
-                                    _pt_taker_fee * r['yes_ask'] * (1 - r['yes_ask']), 4), axis=1)
-                st.dataframe(_pt_fav_disp, hide_index=True, use_container_width=True)
-
-            if not _pt_lng.empty:
-                st.markdown(f'**Longshot zone — {len(_pt_lng)} signal(s)  (buy NO)**')
-                _pt_lng_disp = _pt_lng[['sport', 'home', 'away', 'outcome',
-                                         'fair_prob', 'yes_ask', 'no_ask',
-                                         'match_score', 'k_ticker']].copy()
-                _pt_lng_disp['no_fair'] = (1 - _pt_lng_disp['fair_prob']).round(3)
-                _pt_lng_disp['ev'] = _pt_lng_disp.apply(
-                    lambda r: round((1 - r['fair_prob']) - r['no_ask'] -
-                                    _pt_taker_fee * r['no_ask'] * (1 - r['no_ask']), 4)
-                    if r['no_ask'] is not None else None, axis=1)
-                st.dataframe(_pt_lng_disp, hide_index=True, use_container_width=True)
-
-            # ── Execute controls ──────────────────────────────────────────────
-            st.divider()
-            _pt_oc1, _pt_oc2, _pt_oc3, _pt_oc4 = st.columns([2, 1, 1, 1])
-            with _pt_oc1:
-                _pt_mode = st.selectbox('Order mode', ['rest', 'cross', 'auto'],
-                                         key='_pt_mode')
-            with _pt_oc2:
-                _pt_ttl = st.number_input('TTL (min)', min_value=5, max_value=1440,
-                                           value=30, key='_pt_ttl')
-            with _pt_oc3:
-                _pt_size = st.number_input('Size ×', min_value=0.1, max_value=10.0,
-                                            value=1.0, step=0.5, key='_pt_size_mult')
-            with _pt_oc4:
-                balance = st.session_state.get('balance')
-
-            _pt_n = len(_pt_sig)
-            if st.button(f'Execute {_pt_n} Prospect Signal(s)',
-                          type='primary', key='_pt_execute',
-                          disabled=(balance is None)):
-                if balance is None:
-                    st.error('Refresh Kalshi balance in the sidebar before trading.')
-                else:
-                    _pt_dash       = StreamlitDashboard(api_limit=1000)
-                    _pt_results_h: list = []
-                    _pt_stop       = threading.Event()
-                    _pt_limit_only = (_pt_mode == 'rest')
-                    _pt_force_cross= (_pt_mode == 'cross')
-
-                    def _pt_worker(sdf=_pt_sig.copy(), bk=balance,
-                                   tf=_pt_taker_fee, mf=_pt_maker_fee,
-                                   lo=_pt_limit_only, fc=_pt_force_cross,
-                                   ttl=int(_pt_ttl) * 60, sm=float(_pt_size),
-                                   d=_pt_dash, rh=_pt_results_h, se=_pt_stop):
-                        try:
-                            out = _run_prospect_signals(
-                                sdf, bankroll=bk,
-                                taker_fee=tf, maker_fee=mf,
-                                limit_only=lo, force_cross=fc,
-                                max_duration=ttl, size_mult=sm,
-                                dashboard=d, stop_event=se,
-                            )
-                            rh.extend(out or [])
-                        except Exception as exc:
-                            rh.append({'status': 'error', 'ticker': '',
-                                       'outcome': '', 'reason': str(exc),
-                                       'order_id': None, 'contracts': 0})
-
-                    _pt_t = threading.Thread(target=_pt_worker, daemon=True)
-                    _pt_t.start()
-                    st.session_state['_pt_thread']      = _pt_t
-                    st.session_state['_pt_dash']        = _pt_dash
-                    st.session_state['_pt_results_h']   = _pt_results_h
-                    st.session_state['_pt_stop']        = _pt_stop
-                    st.session_state['_pt_start_time']  = time.time()
-                    st.session_state['_pt_ttl_sec']     = int(_pt_ttl) * 60
-                    st.session_state['_pt_show_table']  = False
-                    st.rerun()
-
-    # ── Live dashboard ────────────────────────────────────────────────────────
-    if '_pt_thread' in st.session_state:
-        _pt_thread   = st.session_state['_pt_thread']
-        _pt_dash_obj = st.session_state.get('_pt_dash')
-        _pt_results_h= st.session_state.get('_pt_results_h', [])
-        _pt_stop_ev  = st.session_state.get('_pt_stop')
-        _pt_alive    = _pt_thread.is_alive()
-
-        @st.fragment(run_every='1s' if _pt_alive else None)
-        def _pt_live_panel():
-            if _pt_dash_obj is None:
-                return
-            _pt_snap = _pt_dash_obj.snapshot()
-
-            # Progress bar
-            _pt_s  = st.session_state.get('_pt_start_time', time.time())
-            _pt_tl = st.session_state.get('_pt_ttl_sec', 1800)
-            _pt_el = time.time() - _pt_s
-            _pt_rm = max(_pt_tl - _pt_el, 0)
-            _pt_pc = min(_pt_el / max(_pt_tl, 1), 1.0)
-            _pt_mm, _pt_ss = int(_pt_rm // 60), int(_pt_rm % 60)
-            st.progress(_pt_pc, text=f'⏱ {_pt_mm}m {_pt_ss:02d}s remaining')
-
-            hc1, hc2, hc3, hc4 = st.columns([3, 1, 1, 1])
-            hc1.markdown('#### Prospect Dashboard')
-            if _pt_thread.is_alive():
-                if hc2.button('🛑 Cancel all', key='_pt_cancel_btn'):
-                    if _pt_stop_ev:
-                        _pt_stop_ev.set()
-                    st.warning('Cancellation requested.')
-                if hc3.button('↑ Cross & Cancel', key='_pt_cc_btn',
-                              help='Re-ping Pinnacle, cross if EV > 0.005 else cancel.'):
-                    _pt_snap2   = _pt_dash_obj.snapshot()
-                    _pt_pos_now = _pt_snap2['positions']
-                    _PT_REST    = {'resting', 'open', 'pending', 'unknown'}
-                    _pt_targets = [(oid, pos) for oid, pos in _pt_pos_now.items()
-                                   if pos.get('status') in _PT_REST]
-                    if not _pt_targets:
-                        st.info('No resting orders to process.')
-                    else:
-                        _pt_xc = []
-                        for _oid, _pos in _pt_targets:
-                            _pt_side = _pos.get('side', 'yes')
-                            _r = cross_and_cancel_order(
-                                _pos['ticker'], _oid,
-                                _pos.get('contracts', 1),
-                                _pt_taker_fee, _pt_side,
-                                event_id=_pos.get('event_id', ''),
-                                sport=_pos.get('sport', ''),
-                                outcome=_pos.get('raw_outcome', ''),
-                            )
-                            _pt_xc.append(_r)
-                        _nc = sum(1 for r in _pt_xc if r['action'] == 'crossed')
-                        _nx = sum(1 for r in _pt_xc if r['action'] == 'canceled')
-                        _ne = sum(1 for r in _pt_xc if r['action'] == 'error')
-                        st.info(f'↑ {_nc} crossed · {_nx} canceled · {_ne} errors')
-                        for _r in _pt_xc:
-                            if _r['action'] == 'crossed':
-                                st.success(f"✓ {_r['ticker']}  {_r.get('contracts')}ct  "
-                                           f"ev={_r['ev']:+.4f}")
-                            elif _r['action'] == 'canceled':
-                                st.warning(f"✗ {_r['ticker']}  {_r.get('reason', 'canceled')}")
-                            else:
-                                st.error(f"⚠ {_r['ticker']}  {_r.get('reason', 'error')}")
-                if hc4.button('⏸ Keep Rest', key='_pt_keep_rest_btn',
-                              help='Re-rest each resting order until 30 min before game start, '
-                                   'then stop Pinnacle polling to save API credits.'):
-                    _pt_kr_snap = _pt_dash_obj.snapshot()
-                    _pt_kr_pos  = _pt_kr_snap['positions']
-                    _PT_KR_REST = {'resting', 'open', 'pending', 'unknown'}
-                    _pt_kr_tgt  = [(oid, pos) for oid, pos in _pt_kr_pos.items()
-                                   if pos.get('status') in _PT_KR_REST
-                                   and pos.get('contracts', 0) - pos.get('filled', 0) > 0]
-                    if not _pt_kr_tgt:
-                        st.info('No unfilled resting orders to keep.')
-                    else:
-                        _pt_kr_res = []
-                        for _oid, _pos in _pt_kr_tgt:
-                            _r = cancel_and_rerest(
-                                _pos['ticker'], _oid,
-                                _pos.get('contracts', 1) - _pos.get('filled', 0),
-                                _pos['entry_price'],
-                                _pos.get('side', 'yes'),
-                                _pos.get('commence', ''),
-                            )
-                            _pt_kr_res.append((_pos['ticker'], _r))
-                        if _pt_stop_ev:
-                            _pt_stop_ev.set()
-                        _pt_kr_ok  = sum(1 for _, r in _pt_kr_res if r['action'] == 'rested')
-                        _pt_kr_err = sum(1 for _, r in _pt_kr_res if r['action'] == 'error')
-                        st.info(f'⏸ {_pt_kr_ok} re-rested · {_pt_kr_err} errors — Pinnacle polling stopped')
-                        for _tkr, _r in _pt_kr_res:
-                            if _r['action'] == 'rested':
-                                st.success(f"✓ {_tkr}  {_r['price_cents']}¢  GTC {_r['expiry']}")
-                            elif _r['action'] == 'skipped':
-                                st.caption(f"— {_tkr}  {_r.get('reason', 'skipped')}")
-                            else:
-                                st.error(f"⚠ {_tkr}  {_r.get('reason', 'error')}")
-
-            positions = _pt_snap['positions']
-            if positions:
-                rows = []
-                for pos in positions.values():
-                    cts    = pos['contracts']
-                    filled = pos.get('filled', 0)
-                    if filled == cts and cts > 0:
-                        disp_status = 'executed'
-                    elif 0 < filled < cts:
-                        disp_status = 'partial'
-                    else:
-                        disp_status = pos['status']
-                    rows.append({
-                        'Ticker':    pos['ticker'],
-                        'Zone':      pos.get('pt_zone', '—'),
-                        'Side':      pos.get('side', '—'),
-                        'Outcome':   pos['outcome'],
-                        'Contracts': cts,
-                        'Filled':    filled,
-                        'Entry ¢':   pos['entry_price'],
-                        'Fair':      f"{pos['fair_entry']:.3f}",
-                        'Edge':      f"{pos['edge_last']:+.3f}",
-                        'Status':    disp_status,
-                        'Last ping': pos['last_ping'],
-                    })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            else:
-                st.caption('Waiting for orders to be placed...')
-
-            if not _pt_thread.is_alive():
-                st.success('Prospect session complete.')
-
-        _pt_live_panel()
-
-        if not _pt_alive:
-            st.session_state.pop('_pt_thread', None)
-            st.session_state.pop('_pt_dash', None)
-            st.session_state.pop('_pt_results_h', None)
-            st.session_state.pop('_pt_stop', None)
-
-    # ── Review section ────────────────────────────────────────────────────────
-    st.divider()
-    st.markdown('#### Prospect Theory Performance')
-    try:
-        import trade.prospect_review as _ptrv
-        import matplotlib.pyplot as _pt_plt
-        _pt_rv_df = _ptrv.load_log()
-        if not _pt_rv_df.empty:
-            _pt_m = _ptrv.compute_metrics(_pt_rv_df)
-            if _pt_m:
-                _mc1, _mc2, _mc3, _mc4 = st.columns(4)
-                _mc1.metric('Settled', _pt_m['settled'])
-                _mc2.metric('Win Rate',
-                            f'{_pt_m["win_rate"]:.0%}' if _pt_m['win_rate'] is not None else '—')
-                _mc3.metric('PnL',
-                            f'${_pt_m["pnl"]:+.2f}')
-                _mc4.metric('ROI',
-                            f'{_pt_m["emp_ev_dol"]:.1%}' if _pt_m['emp_ev_dol'] is not None else '—')
-            _pt_rv_fig = _ptrv.build_charts(_pt_rv_df)
-            if _pt_rv_fig:
-                st.pyplot(_pt_rv_fig)
-                _pt_plt.close(_pt_rv_fig)
-            else:
-                st.caption('No settled trades yet — nothing to chart.')
-        else:
-            st.caption('No prospect trades logged yet.')
-    except Exception as exc:
-        st.error(f'Prospect metrics error: {exc}')
-
-    # ── Log viewer ────────────────────────────────────────────────────────────
-    st.divider()
-    st.caption(f'Log: `{PROSPECT_LOG_PATH}`')
-    try:
-        if os.path.exists(PROSPECT_LOG_PATH) and os.path.getsize(PROSPECT_LOG_PATH) > 0:
-            _pt_log_df = pd.read_csv(PROSPECT_LOG_PATH)
-            st.dataframe(_pt_log_df.tail(50), use_container_width=True, hide_index=True)
-            st.caption(f'{len(_pt_log_df)} total rows · showing last 50')
-        else:
-            st.caption('No trades logged yet.')
-    except Exception as exc:
-        st.error(f'Failed to read log: {exc}')
-
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 6 — POLYMARKET
-# ════════════════════════════════════════════════════════════════════════════
-
-with tab_poly:
-    st.header('Polymarket')
-    st.caption(
-        'Cross-reference Pinnacle fair probabilities against live Polymarket '
-        'game-winner markets. Taker fee 3% · Maker fee 0%. '
-        'Order execution requires a Polygon wallet (not yet wired up).'
-    )
-
-    # ── Controls ─────────────────────────────────────────────────────────────
-    _poly_col1, _poly_col2, _poly_col3 = st.columns([2, 1, 1])
-    with _poly_col1:
-        _poly_sports_avail = [s for s in config.SPORTS if s in POLY_SPORT_MAP]
-        _poly_sports_sel   = st.multiselect(
-            'Sports to scan',
-            options=_poly_sports_avail,
-            default=[s for s in ['basketball_nba', 'icehockey_nhl', 'baseball_mlb']
-                     if s in _poly_sports_avail],
-            key='_poly_sports',
-        )
-    with _poly_col2:
-        _poly_hrs = st.number_input('Look-ahead (hrs)', min_value=12, max_value=168,
-                                    value=72, step=12, key='_poly_hrs')
-    with _poly_col3:
-        _poly_clob = st.toggle('Live CLOB prices', value=False, key='_poly_clob',
-                               help='Re-fetch bid/ask from CLOB for each token. '
-                                    'More accurate, uses more requests.')
-
-    _poly_show_all = st.checkbox('Show all matches (including negative EV)', key='_poly_show_all')
-
-    if st.button('Fetch Polymarket Signals', key='_poly_fetch', type='primary'):
-        if not _poly_sports_sel:
-            st.warning('Select at least one sport.')
-        else:
-            with st.spinner('Fetching Pinnacle odds + Polymarket markets…'):
-                try:
-                    _poly_pin = pinnacle_odds(sports=_poly_sports_sel, hrs=int(_poly_hrs))
-                    _poly_sigs = _poly_signals(
-                        _poly_pin,
-                        sports=_poly_sports_sel,
-                        hrs=int(_poly_hrs),
-                        fetch_clob=_poly_clob,
-                    )
-                    st.session_state['_poly_sigs']    = _poly_sigs
-                    st.session_state['_poly_pin_len'] = len(_poly_pin)
-                except Exception as _poly_exc:
-                    st.error(f'Fetch failed: {_poly_exc}')
-                    st.session_state.pop('_poly_sigs', None)
-
-    # ── Results ───────────────────────────────────────────────────────────────
-    _poly_sigs_df = st.session_state.get('_poly_sigs')
-    _poly_pin_len = st.session_state.get('_poly_pin_len', 0)
-
-    if _poly_sigs_df is not None:
-        if _poly_sigs_df.empty:
-            st.info('No Polymarket game-winner markets matched Pinnacle outcomes '
-                    'in the selected window. Try a wider look-ahead or different sports.')
-        else:
-            _display_df = _poly_sigs_df if _poly_show_all else \
-                          _poly_sigs_df[_poly_sigs_df['taker_signal'] | _poly_sigs_df['maker_signal']]
-
-            n_t = int(_poly_sigs_df['taker_signal'].sum())
-            n_m = int(_poly_sigs_df['maker_signal'].sum())
-
-            _sm1, _sm2, _sm3, _sm4 = st.columns(4)
-            _sm1.metric('Pinnacle outcomes',  _poly_pin_len)
-            _sm2.metric('Matched',            len(_poly_sigs_df))
-            _sm3.metric('Taker signals',      n_t)
-            _sm4.metric('Maker signals',       n_m)
-
-            if _display_df.empty:
-                st.info('No positive-EV signals found. Enable "Show all matches" to see all.')
-            else:
-                _poly_rows = []
-                for _, r in _display_df.iterrows():
-                    sig = []
-                    if r['taker_signal']:  sig.append('TAKER')
-                    if r['maker_signal']:  sig.append('MAKER')
-                    _poly_rows.append({
-                        'Market':      r['poly_title'],
-                        'Sport':       r['sport'].split('_')[-1].upper(),
-                        'Outcome':     r['outcome'],
-                        'Side':        r['token_side'].upper(),
-                        'Fair':        round(r['fair_prob'], 3),
-                        'Ask':         round(r['poly_ask'], 3),
-                        'Bid':         round(r['poly_bid'], 3) if r['poly_bid'] is not None else None,
-                        'Rest':        round(r['rest_price'], 3),
-                        'Edge':        round(r['edge'], 4),
-                        'Taker EV':    round(r['taker_ev'], 4),
-                        'Maker EV':    round(r['maker_ev'], 4),
-                        'Signal':      ' + '.join(sig) if sig else '—',
-                        'Game Start':  str(r['game_start'])[:16],
-                        'Token ID':    r['token_id'],
-                    })
-                st.dataframe(
-                    pd.DataFrame(_poly_rows),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        'Edge':      st.column_config.NumberColumn(format='%+.4f'),
-                        'Taker EV':  st.column_config.NumberColumn(format='%+.4f'),
-                        'Maker EV':  st.column_config.NumberColumn(format='%+.4f'),
-                        'Token ID':  st.column_config.TextColumn(width='small'),
-                    },
-                )
-
-                _pos_sigs = _poly_sigs_df[_poly_sigs_df['taker_signal'] | _poly_sigs_df['maker_signal']]
-                if not _pos_sigs.empty:
-                    with st.expander(f'Token IDs for {len(_pos_sigs)} signal(s)'):
-                        for _, r in _pos_sigs.iterrows():
-                            st.code(
-                                f"{r['poly_title']}  |  {r['outcome']}  |  "
-                                f"{'YES' if r['token_side']=='yes' else 'NO '}\n"
-                                f"token_id = {r['token_id']}\n"
-                                f"condition_id = {r['condition_id']}"
-                            )

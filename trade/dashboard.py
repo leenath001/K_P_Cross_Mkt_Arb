@@ -48,6 +48,7 @@ class Dashboard:
         self._positions: dict[str, dict] = {}   # order_id → row data
         self._api_used      = 0
         self._api_limit     = api_limit
+        self._extra_seconds = 0   # session-wide extension, added to every order's max_duration
         self._live          = Live(
             self._render(),
             refresh_per_second=4,
@@ -76,6 +77,7 @@ class Dashboard:
                 'contracts':    contracts,
                 'filled':       0,
                 'entry_price':  yes_price_cents,  # our order price (fixed)
+                'avg_fill_price': None,            # VWAP fill price (dollars), once filled
                 'market_ask':   None,              # live Kalshi market ask
                 'fair_entry':   fair_prob,
                 'fair_last':    fair_prob,
@@ -93,7 +95,8 @@ class Dashboard:
 
     def update(self, order_id: str, status: Optional[str] = None,
                fair_prob: Optional[float] = None, edge: Optional[float] = None,
-               filled: Optional[int] = None, market_ask: Optional[int] = None):
+               filled: Optional[int] = None, market_ask: Optional[int] = None,
+               avg_fill_price: Optional[float] = None):
         with self._lock:
             pos = self._positions.get(order_id)
             if pos is None:
@@ -109,6 +112,8 @@ class Dashboard:
                 pos['filled'] = filled
             if market_ask is not None:
                 pos['market_ask'] = market_ask
+            if avg_fill_price is not None:
+                pos['avg_fill_price'] = avg_fill_price
             self._refresh()
 
     def set_api_usage(self, used: int, remaining: int):
@@ -116,6 +121,16 @@ class Dashboard:
             self._api_used  = used
             self._api_limit = used + remaining
             self._refresh()
+
+    def extend_time(self, seconds: int):
+        """Push back every order's max_duration kill condition by `seconds`, cumulative."""
+        with self._lock:
+            self._extra_seconds += seconds
+            self._refresh()
+
+    def get_extra_seconds(self) -> int:
+        with self._lock:
+            return self._extra_seconds
 
     # ── Rendering ────────────────────────────────────────────────────────────
 
@@ -133,6 +148,7 @@ class Dashboard:
         table.add_column('Outcome',      style='white',   width=10)
         table.add_column('Cts',          style='white',   justify='right', width=5)
         table.add_column('Filled',       style='white',   justify='right', width=7)
+        table.add_column('Avg Fill',     style='white',   justify='right', width=9)
         table.add_column('Price',        style='white',   justify='right', width=7)
         table.add_column('Last Mkt Ask', style='white',   justify='right', width=12)
         table.add_column('Fair (entry)', style='white',   justify='right', width=12)
@@ -153,11 +169,14 @@ class Dashboard:
             style   = _STATUS_STYLE.get(disp_status, 'white')
             edge_c  = 'green' if pos['edge_last'] > 0 else 'red'
             mkt_ask = f"{pos['market_ask']}¢" if pos['market_ask'] is not None else '—'
+            avg_fp  = pos.get('avg_fill_price')
+            avg_fill = f"{round(avg_fp * 100)}¢" if avg_fp is not None else '—'
             table.add_row(
                 pos['ticker'][-36:],
                 pos['outcome'],
                 str(cts),
                 str(filled),
+                avg_fill,
                 f"{pos['entry_price']}¢",
                 mkt_ask,
                 f"{pos['fair_entry']:.3f}",
@@ -168,9 +187,12 @@ class Dashboard:
             )
 
         api_bar = self._api_bar()
+        _extend_note = (f'  [dim]· +{self._extra_seconds // 60}m extended[/dim]'
+                        if self._extra_seconds else '')
         return Panel(
             Group(table, Text(''), api_bar),
-            title='[bold blue]K/P Cross-Market Arbitrage[/bold blue]  [dim]Ctrl+C to cancel all & quit[/dim]',
+            title='[bold blue]K/P Cross-Market Arbitrage[/bold blue]  [dim]Ctrl+C to cancel all & quit[/dim]'
+                  + _extend_note,
             border_style='blue',
         )
 
@@ -206,6 +228,7 @@ class StreamlitDashboard:
         self._positions: dict[str, dict] = {}
         self._api_used  = 0
         self._api_limit = api_limit
+        self._extra_seconds = 0   # session-wide extension, added to every order's max_duration
 
     # Same signatures as Dashboard so run_trade can use either
     def add_position(self, order_id: str, ticker: str, outcome: str,
@@ -221,6 +244,7 @@ class StreamlitDashboard:
                 'contracts':   contracts,
                 'filled':      0,
                 'entry_price': yes_price_cents,
+                'avg_fill_price': None,
                 'market_ask':  None,
                 'fair_entry':  fair_prob,
                 'fair_last':   fair_prob,
@@ -237,7 +261,8 @@ class StreamlitDashboard:
 
     def update(self, order_id: str, status: Optional[str] = None,
                fair_prob: Optional[float] = None, edge: Optional[float] = None,
-               filled: Optional[int] = None, market_ask: Optional[int] = None):
+               filled: Optional[int] = None, market_ask: Optional[int] = None,
+               avg_fill_price: Optional[float] = None):
         with self._lock:
             pos = self._positions.get(order_id)
             if pos is None:
@@ -246,20 +271,31 @@ class StreamlitDashboard:
             if fair_prob is not None:
                 pos['fair_last']  = fair_prob
                 pos['last_ping']  = datetime.now().strftime('%H:%M:%S')
-            if edge is not None:       pos['edge_last']  = edge
-            if filled is not None:     pos['filled']     = filled
-            if market_ask is not None: pos['market_ask'] = market_ask
+            if edge is not None:          pos['edge_last']       = edge
+            if filled is not None:        pos['filled']          = filled
+            if market_ask is not None:    pos['market_ask']      = market_ask
+            if avg_fill_price is not None: pos['avg_fill_price'] = avg_fill_price
 
     def set_api_usage(self, used: int, remaining: int):
         with self._lock:
             self._api_used  = used
             self._api_limit = used + remaining
 
+    def extend_time(self, seconds: int):
+        """Push back every order's max_duration kill condition by `seconds`, cumulative."""
+        with self._lock:
+            self._extra_seconds += seconds
+
+    def get_extra_seconds(self) -> int:
+        with self._lock:
+            return self._extra_seconds
+
     def snapshot(self) -> dict:
         """Return a deep-ish copy safe to render outside the lock."""
         with self._lock:
             return {
                 'positions': {k: dict(v) for k, v in self._positions.items()},
+                'extra_seconds': self._extra_seconds,
                 'api_used':  self._api_used,
                 'api_limit': self._api_limit,
             }

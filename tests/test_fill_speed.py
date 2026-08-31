@@ -57,27 +57,28 @@ def get_orderbook(ticker: str) -> dict:
 def place_order(ticker: str, no_price_cents: int, contracts: int,
                 expiry_ts: int, label: str) -> dict:
     """
-    Place a resting NO order (post_only=True).
-    yes_price = 100 - no_price_cents per Kalshi convention.
+    Place a resting NO order (post_only=True) via the V2 order endpoint.
+    V2 quotes everything in YES terms, so buying NO is submitted as `ask`
+    (sell YES) at the complementary price: 1 - no_price.
     """
+    yes_price_cents = 100 - no_price_cents
     body = {
-        'ticker':       ticker,
-        'action':       'buy',
-        'side':         'no',
-        'type':         'limit',
-        'count':        contracts,
-        'no_price':     no_price_cents,
-        'yes_price':    100 - no_price_cents,
-        'post_only':    True,
-        'client_order_id': f'filltest_{label}_{int(time.time())}',
-        'expiration_ts':   expiry_ts,
+        'ticker':                     ticker,
+        'client_order_id':            f'filltest_{label}_{int(time.time())}',
+        'side':                       'ask',
+        'count':                      f'{contracts:.2f}',
+        'price':                      f'{yes_price_cents / 100:.2f}',
+        'time_in_force':              'good_till_canceled',
+        'self_trade_prevention_type': 'taker_at_cross',
+        'post_only':                  True,
+        'expiration_time':            expiry_ts,
     }
-    path = '/trade-api/v2/portfolio/orders'
-    r = requests.post(f'{BASE_URL}/portfolio/orders',
-                      json={'order': body},
+    path = '/trade-api/v2/portfolio/events/orders'
+    r = requests.post(f'{BASE_URL}/portfolio/events/orders',
+                      json=body,
                       headers=kalshi_headers('POST', path))
     r.raise_for_status()
-    return r.json().get('order', {})
+    return r.json()
 
 
 def get_order(order_id: str) -> dict:
@@ -89,8 +90,8 @@ def get_order(order_id: str) -> dict:
 
 
 def cancel_order(order_id: str) -> bool:
-    path = f'/trade-api/v2/portfolio/orders/{order_id}'
-    r = requests.delete(f'{BASE_URL}/portfolio/orders/{order_id}',
+    path = f'/trade-api/v2/portfolio/events/orders/{order_id}'
+    r = requests.delete(f'{BASE_URL}/portfolio/events/orders/{order_id}',
                         headers=kalshi_headers('DELETE', path))
     return r.ok
 

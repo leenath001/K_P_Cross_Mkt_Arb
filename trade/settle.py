@@ -21,6 +21,9 @@ import requests
 import pandas as pd
 from rich.console import Console
 from KALSHI.k_helpers import kalshi_headers
+from applog import get_logger
+
+log = get_logger(__name__)
 
 LOG_DIR              = os.path.join(os.path.dirname(__file__), 'logs')
 LOG_PATH             = os.path.join(LOG_DIR, 'trades.csv')
@@ -36,12 +39,17 @@ TERMINAL_ORDER_STATUSES = {'executed', 'filled', 'canceled', 'expired'}
 
 
 def fetch_order_status(order_id: str) -> Optional[dict]:
-    """Fetch one order directly. Returns the order dict or None on error."""
+    """Fetch one order directly. Returns the order dict or None on error (logged)."""
     path = f'/trade-api/v2/portfolio/orders/{order_id}'
-    resp = requests.get(f'{BASE_URL}/portfolio/orders/{order_id}',
-                        headers=kalshi_headers('GET', path))
+    try:
+        resp = requests.get(f'{BASE_URL}/portfolio/orders/{order_id}',
+                            headers=kalshi_headers('GET', path))
+    except requests.exceptions.RequestException:
+        log.exception('fetch_order_status network failure for %s', order_id)
+        return None
     if resp.ok:
         return resp.json().get('order', {})
+    log.warning('fetch_order_status failed for %s: %s %s', order_id, resp.status_code, resp.reason)
     return None
 
 
@@ -84,7 +92,8 @@ def refresh_statuses(path: str) -> int:
                 filled   = max(original - int(float(remaining)), 0)
                 df.at[idx, 'contracts'] = filled
             except Exception:
-                pass
+                log.debug('refresh_statuses: could not parse remaining_count for order %s',
+                         row.get('order_id'))
         updated += 1
 
     if updated:
@@ -95,12 +104,17 @@ def refresh_statuses(path: str) -> int:
 
 def fetch_market_result(ticker: str) -> Optional[str]:
     """
-    Returns 'yes', 'no', 'void', 'scalar', or None (not yet settled).
+    Returns 'yes', 'no', 'void', 'scalar', or None (not yet settled, or on error — logged).
     """
     path = f'/trade-api/v2/markets/{ticker}'
-    resp = requests.get(f'{BASE_URL}/markets/{ticker}',
-                        headers=kalshi_headers('GET', path))
+    try:
+        resp = requests.get(f'{BASE_URL}/markets/{ticker}',
+                            headers=kalshi_headers('GET', path))
+    except requests.exceptions.RequestException:
+        log.exception('fetch_market_result network failure for %s', ticker)
+        return None
     if not resp.ok:
+        log.warning('fetch_market_result failed for %s: %s %s', ticker, resp.status_code, resp.reason)
         return None
     market = resp.json().get('market', {})
     result = market.get('result')          # 'yes' | 'no' | 'void' | 'scalar' | null
@@ -120,9 +134,15 @@ def fetch_scalar_settlement_value(ticker: str) -> Optional[float]:
     Returns None if the value cannot be determined.
     """
     path = f'/trade-api/v2/markets/{ticker}'
-    resp = requests.get(f'{BASE_URL}/markets/{ticker}',
-                        headers=kalshi_headers('GET', path))
+    try:
+        resp = requests.get(f'{BASE_URL}/markets/{ticker}',
+                            headers=kalshi_headers('GET', path))
+    except requests.exceptions.RequestException:
+        log.exception('fetch_scalar_settlement_value network failure for %s', ticker)
+        return None
     if not resp.ok:
+        log.warning('fetch_scalar_settlement_value failed for %s: %s %s',
+                    ticker, resp.status_code, resp.reason)
         return None
     market = resp.json().get('market', {})
     # Primary field Kalshi uses for scalar settlement value (0–1 dollar range)

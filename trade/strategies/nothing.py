@@ -1,26 +1,38 @@
 """
-nothing.py — "Nothing Ever Happens" bot.
+trade/strategies/nothing.py — "Nothing Ever Happens" NO-side bot.
 
-Fully standalone from the K/P arbitrage pipeline. Places resting or taker
-NO buy orders on single-outcome Kalshi event markets under the assumption
-that most speculative "will X happen?" questions resolve NO. Buys ONE NO
-contract per qualifying market, capped at a % of Kalshi cash (default 10%)
-so the main K/P bot retains capital.
+Doesn't fit the generate_signals()/run_trade() shape the other two strategies
+share (see trade/strategies/base.py) — it scans whole series for cheap markets
+and sizes a budget across all of them in one pass, not one Pinnacle-priced
+signal at a time, so it keeps its own entry point. Still builds on trade/core/
+for order placement, cancellation, and dedup rather than its own copies.
+
+Places resting or taker NO buy orders on single-outcome Kalshi event markets
+under the assumption that most speculative "will X happen?" questions resolve
+NO. Capped at a % of Kalshi cash (default 10%) so the main K/P bot retains
+capital.
 
 What it will NOT touch:
   - Sports series (any ticker that appears in config.SPORTS_CONFIG)
   - Multi-market events (A-vs-B style) — only events with ONE open market
 
 Usage:
-    python trade/nothing.py --series KXSERIES                                 # dry run, 10% of cash
-    python trade/nothing.py --series KXSERIES --live                          # place orders
-    python trade/nothing.py --series KXSERIES --budget-pct 0.15 --live        # 15% of cash
-    python trade/nothing.py --series KXSERIES --budget 20 --live              # override to fixed $
-    python trade/nothing.py --tickers MKT-A MKT-B --live
-    python trade/nothing.py --series KXSERIES --rest --live                   # maker mode
-    python trade/nothing.py --cancel-all                                      # cancel every open NO order this bot placed
+    python trade/nothing_quickstart.py --series KXSERIES                     # dry run, 10% of cash
+    python trade/nothing_quickstart.py --series KXSERIES --live              # place orders
+    python trade/nothing_quickstart.py --series KXSERIES --budget-pct 0.15 --live
+    python trade/nothing_quickstart.py --series KXSERIES --budget 20 --live  # fixed $ override
+    python trade/nothing_quickstart.py --tickers MKT-A MKT-B --live
+    python trade/nothing_quickstart.py --series KXSERIES --rest --live       # maker mode
+    python trade/nothing_quickstart.py --cancel-all                          # cancel every tracked order
 
 Logs to trade/logs/nothing_trades.csv (separate from trades.csv / no_trades.csv).
+Kept as a single evolving log (not split filled/unfilled like kp_arb/prospect):
+orders are logged immediately at placement with whatever status Kalshi returns
+(usually 'resting'), then update_log_row() corrects final_status later — there's
+no synchronous monitor-and-wait in the CLI flow to know the real outcome at log
+time the way run_trade()'s post-_monitor() logging does. This no longer risks
+blocking other strategies' signals either way, since dedup is live-state now
+(trade.core.positions.open_tickers), not CSV-based.
 """
 
 import os, sys, csv, signal, argparse, threading, time
@@ -29,27 +41,24 @@ from typing import Optional
 
 import requests
 
-# ── Paths ────────────────────────────────────────────────────────────────────
-
-_HERE   = os.path.dirname(os.path.abspath(__file__))
-_ROOT   = os.path.dirname(_HERE)
-sys.path.insert(0, _ROOT)
-sys.path.insert(0, _HERE)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config  # read-only: SPORTS_CONFIG for sports-series blocklist
-from nothing_config import NOTHING_SERIES, tickers as _nothing_tickers
+from trade.nothing_config import NOTHING_SERIES, tickers as _nothing_tickers
 from KALSHI.k_helpers import kalshi_headers
-from bot import cancel_order, get_order_status, get_balance, place_order as _bot_place_order
+from trade.core.execution import (
+    place_order as _core_place_order, get_order_status, get_balance,
+    ensure_canceled, TAKER_FEE, MAKER_FEE,
+)
+from trade.core.positions import open_tickers
+from applog import get_logger
 
-LOG_DIR  = os.path.join(_HERE, 'logs')
+log = get_logger(__name__)
+
+LOG_DIR  = os.path.join(os.path.dirname(_HERE), 'logs')
 LOG_PATH = os.path.join(LOG_DIR, 'nothing_trades.csv')
 
 BASE_URL = 'https://api.elections.kalshi.com/trade-api/v2'
-
-TAKER_FEE = 0.07    # Kalshi general-table taker rate
-MAKER_FEE = 0.0175  # Kalshi general-table maker rate (0.25x taker) — was wrongly 0.03;
-                    # see kalshi.com/docs/kalshi-fee-schedule.pdf. Still a flat rate here
-                    # (not per-series like KALSHI/k_helpers.fee_rate_for) since this CLI
-                    # tool's UI tab was removed and it's lower priority to fully rewire.
 
 SPORTS_SERIES = {cfg['ticker'] for cfg in config.SPORTS_CONFIG.values()}
 
@@ -197,11 +206,9 @@ def size_one_each(markets: list, budget: float, rest: bool) -> tuple:
 
 def place_no_order(ticker: str, no_price_cents: int, count: int,
                    mode: str, expiration_ts: int) -> dict:
-    """Buy NO. Delegates to bot.place_order (handles the V2 request shape)."""
-    return _bot_place_order(ticker, no_price_cents, count, side='no',
-                            expiration_ts=expiration_ts, post_only=(mode == 'rest'))
-
-
+    """Buy NO. Delegates to trade.core.execution.place_order (handles the V2 request shape)."""
+    return _core_place_order(ticker, no_price_cents, count, side='no',
+                             expiration_ts=expiration_ts, post_only=(mode == 'rest'))
 
 
 def get_no_ask_cents(ticker: str) -> Optional[int]:
@@ -225,8 +232,8 @@ def cross_no_order(ticker: str, order_id: str, entry_cents: int,
     if current_ask is None:
         return {'action': 'error', 'ticker': ticker, 'reason': 'no ask price available'}
 
-    if not cancel_order(order_id):
-        return {'action': 'error', 'ticker': ticker, 'reason': 'cancel failed'}
+    if not ensure_canceled(ticker, order_id):
+        return {'action': 'error', 'ticker': ticker, 'reason': 'could not confirm cancel'}
 
     if current_ask > entry_cents:
         return {
@@ -246,8 +253,6 @@ def cross_no_order(ticker: str, order_id: str, entry_cents: int,
 
 
 TERMINAL_STATUSES = {'executed', 'filled', 'canceled', 'expired'}
-
-
 
 
 def monitor_orders(tracked: list, stop_event: threading.Event, state: dict,
@@ -290,8 +295,8 @@ def monitor_orders(tracked: list, stop_event: threading.Event, state: dict,
     while open_ids:
         if stop_event.is_set():
             for oid, o in list(open_ids.items()):
-                try: cancel_order(oid)
-                except Exception: pass
+                try: ensure_canceled(o['ticker'], oid)
+                except Exception: log.exception('monitor_orders: cancel failed for %s', oid)
                 with lock:
                     rec = state.setdefault(oid, {'ticker': o['ticker']})
                     rec.update(status='canceled', reason='user_canceled',
@@ -324,7 +329,7 @@ def monitor_orders(tracked: list, stop_event: threading.Event, state: dict,
             elif o.get('close_time'):
                 to_close = (o['close_time'] - now_utc).total_seconds()
                 if to_close <= close_buffer_seconds:
-                    if cancel_order(oid):
+                    if ensure_canceled(o['ticker'], oid):
                         status, reason = 'canceled', 'market_closing'
 
             with lock:
@@ -418,25 +423,6 @@ def update_log_row(order_id: str, *, final_status: Optional[str] = None,
     return found
 
 
-def already_bet_tickers() -> set:
-    """
-    Tickers we shouldn't re-bet on. Includes rows that are still open
-    (final_status in resting/executed/filled) with result=PENDING. Canceled or
-    expired rows are allowed to be re-bet since those positions never filled
-    or already closed out.
-    """
-    if not os.path.exists(LOG_PATH) or os.path.getsize(LOG_PATH) == 0:
-        return set()
-    tickers = set()
-    with open(LOG_PATH, newline='') as f:
-        for row in csv.DictReader(f):
-            if (row.get('result') == 'PENDING' and
-                row.get('final_status', '') in ('resting', 'executed', 'filled')):
-                if row.get('k_ticker'):
-                    tickers.add(row['k_ticker'])
-    return tickers
-
-
 def _order_ids_from_log() -> set:
     if not os.path.exists(LOG_PATH) or os.path.getsize(LOG_PATH) == 0:
         return set()
@@ -478,8 +464,8 @@ def run(args):
     kept = filter_markets(markets, max_no_price=args.max_no_price,
                           mutually_exclusive_only_filter=not args.allow_mutually_exclusive)
 
-    # Drop tickers we already have open positions on (dedup safety)
-    existing = already_bet_tickers()
+    # Drop tickers we already have open positions on — live Kalshi state, not CSV
+    existing = open_tickers()
     if existing:
         before = len(kept)
         kept = [m for m in kept if m['ticker'] not in existing]
@@ -539,15 +525,15 @@ def run(args):
         return
 
     expiry_ts = int((datetime.now(timezone.utc) + timedelta(minutes=args.ttl_min)).timestamp())
-    placed    = []  # order_ids for Ctrl+C safety
+    placed    = []  # (order_id, ticker) pairs for Ctrl+C safety
     summary   = []
 
     def _on_sigint(signum, frame):
         print('\n[shutdown] Ctrl+C — canceling orders...')
         signal.signal(signal.SIGINT, signal.SIG_IGN)
-        for oid in placed:
+        for oid, tkr in placed:
             try:
-                if cancel_order(oid):
+                if ensure_canceled(tkr, oid):
                     print(f'  canceled {oid}')
             except Exception as exc:
                 print(f'  cancel failed {oid}: {exc}')
@@ -566,7 +552,7 @@ def run(args):
         oid     = order.get('order_id')
         status  = order.get('status', 'unknown')
         if oid:
-            placed.append(oid)
+            placed.append((oid, m['ticker']))
         entry_p = price_cents / 100
         row = {
             'logged_at':         datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
@@ -614,7 +600,7 @@ def cancel_all_tracked():
     for o in open_orders:
         oid = o.get('order_id')
         if oid in tracked:
-            if cancel_order(oid):
+            if ensure_canceled(o.get('ticker'), oid):
                 canceled += 1
                 print(f'  canceled {oid}  {o.get("ticker")}')
     print(f'\n  canceled {canceled} tracked order(s)')

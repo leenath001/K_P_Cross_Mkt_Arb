@@ -26,8 +26,8 @@ parser.add_argument('--live',       action='store_true',                        
 parser.add_argument('--bankroll',   type=float, default=None,                     help='Override balance in dollars (default: fetch from Kalshi)')
 parser.add_argument('--hrs',        type=int,   default=config.LOOKAHEAD_HRS,     help=f'Look-ahead window in hours (default: {config.LOOKAHEAD_HRS} from config)')
 parser.add_argument('--fetch-live', action='store_true', default=config.LIVE,     help=f'Fetch live games instead of upcoming (default: {config.LIVE} from config)')
-parser.add_argument('--taker-fee',  type=float, default=0.07,                     help='Taker fee rate as fraction of winnings (default: 0.07)')
-parser.add_argument('--maker-fee',  type=float, default=0.03,                     help='Maker fee rate as fraction of winnings (default: 0.03)')
+parser.add_argument('--taker-fee',  type=float, default=0.07,                     help='Taker fee rate as fraction of winnings (default: 0.07, Kalshi general table — NOTE: kalshi_odds() now uses live per-series rates for signal generation; this only affects this script''s own order placement, which still uses a flat rate)')
+parser.add_argument('--maker-fee',  type=float, default=0.0175,                   help='Maker fee rate as fraction of winnings (default: 0.0175, Kalshi general table — see --taker-fee note)')
 parser.add_argument('--mode',       choices=['rest', 'cross', 'auto'], default='rest',
                                                                           help='Order mode: rest=maker limit (default), cross=taker at ask, auto=cross if EV positive else rest')
 parser.add_argument('--side',       choices=['yes', 'no'], default='yes',         help='Contract side: yes or no')
@@ -82,8 +82,7 @@ print(f'  Match threshold : {args.threshold}')
 print(f'  Taker fee       : {args.taker_fee * 100:.0f}% of winnings')
 print(f'  Maker fee       : {args.maker_fee * 100:.0f}% of winnings\n')
 
-matched_df = kalshi_odds(pinnacle_df, threshold=args.threshold,
-                         fees=args.taker_fee, maker_fees=args.maker_fee)
+matched_df = kalshi_odds(pinnacle_df, threshold=args.threshold)
 signal_col = 'signal_no' if args.side == 'no' else 'signal'
 
 # ── Filter out tickers with open (PENDING) bets ──────────────────────────────

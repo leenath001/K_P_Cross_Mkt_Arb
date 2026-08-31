@@ -29,7 +29,7 @@ FIELDS = [
     'yes_ask_at_signal', # Kalshi ask when signal was generated
     'entry_price',       # actual order price (dollars, e.g. 0.27)
     'entry_price_cents', # same in cents
-    'fee_rate',          # 0.07 for cross, 0.03 for rest
+    'fee_rate',          # live per-series rate (~0.07 taker general table, ~0.0175 maker, often 0 maker)
     'ev_per_contract',   # EV in dollars per contract at entry
     'edge',              # fair_prob - entry_price (raw, pre-fee edge)
     'contracts',

@@ -1,5 +1,5 @@
 """
-prospect.py — Prospect Theory arbitrage bot.
+trade/strategies/prospect.py — Prospect Theory arbitrage strategy.
 
 Exploits cognitive bias (probability-weighting distortion) in Kalshi prediction
 markets using Pinnacle fair_prob as the ground-truth anchor:
@@ -10,42 +10,32 @@ markets using Pinnacle fair_prob as the ground-truth anchor:
   Favorite zone (yes_ask $0.75–$0.92): retail traders underprice high-prob events
     → signal fires when YES EV >= MIN_CROSS_EV (buy YES)
 
-Fully standalone from the K/P arb and Nothing bots. Own logs, own CLI, own
-web tab. Imports execution primitives from bot.py rather than duplicating them.
-
-Usage:
-    python trade/prospect_quickstart.py           # dry run
-    python trade/prospect_quickstart.py --live    # live trading
-    streamlit run trade/web_app.py                # Prospect tab in web UI
+Built on trade/core/ for execution, dedup, and logging — see
+trade/strategies/base.py for the shared contract. CLI-only (no web_app.py tab);
+run via trade/prospect_quickstart.py.
 """
 
-import os, sys, csv, threading, time
+import os, sys, threading, time, signal as _signal
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import pandas as pd
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
-sys.path.insert(0, _ROOT)
-sys.path.insert(0, _HERE)
-
-from bot import (
-    place_order, cancel_order, get_order_status, _final_order_status,
-    get_market_price, get_market_prices, _rest_price_cents,
-    cross_and_cancel_order, kelly_contracts, _ev,
-    _monitor, _recheck_signal,
-    TAKER_FEE, MAKER_FEE, MIN_CROSS_EV,
-    MAX_DURATION, PRE_EVENT_BUFFER,
-    _force_cancel_all, _CLOSED_STATUSES,
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from KALSHI.k_helpers import kalshi_odds, prospect_signals, fee_rate_for
+from trade.core.execution import (
+    place_order, get_market_prices, _rest_price_cents,
+    kelly_contracts, _ev, _monitor, _final_order_status,
+    TAKER_FEE, MAKER_FEE, MIN_CROSS_EV, MAX_DURATION, PRE_EVENT_BUFFER,
+    force_cancel_all,
 )
-from KALSHI.k_helpers import fee_rate_for
+from trade.core.positions import open_tickers
+from trade.core.logging_io import write_row, log_unfilled_attempt, is_filled
+from applog import get_logger
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+log = get_logger(__name__)
 
-LOG_DIR           = os.path.join(_HERE, 'logs')
+LOG_DIR           = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
 PROSPECT_LOG_PATH = os.path.join(LOG_DIR, 'prospect_trades.csv')
 
 PROSPECT_FIELDS = [
@@ -58,6 +48,15 @@ PROSPECT_FIELDS = [
 ]
 
 
+def generate_signals(pinnacle_df: pd.DataFrame, threshold: float = 0.6,
+                     longshot_lo: float = 0.05, longshot_hi: float = 0.15,
+                     favorite_lo: float = 0.75, favorite_hi: float = 0.92) -> pd.DataFrame:
+    """Signal generation for this strategy: kalshi_odds() + prospect-zone filter."""
+    matched = kalshi_odds(pinnacle_df, threshold=threshold)
+    return prospect_signals(matched, longshot_lo=longshot_lo, longshot_hi=longshot_hi,
+                            favorite_lo=favorite_lo, favorite_hi=favorite_hi)
+
+
 def log_prospect_trade(*, order_id: str, sport: str, outcome: str,
                        k_ticker: str, commence, pt_zone: str, pt_side: str,
                        order_type: str, fair_prob: float,
@@ -65,10 +64,7 @@ def log_prospect_trade(*, order_id: str, sport: str, outcome: str,
                        fee_rate: float, ev_per_contract: float,
                        contracts: int, final_status: str,
                        close_reason: str) -> dict:
-    os.makedirs(LOG_DIR, exist_ok=True)
-    write_header = not os.path.exists(PROSPECT_LOG_PATH) or \
-                   os.path.getsize(PROSPECT_LOG_PATH) == 0
-
+    """Log a REAL fill (executed/filled). Non-fills go through log_unfilled_attempt() instead."""
     row = {
         'logged_at':         datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
         'order_id':          order_id,
@@ -94,38 +90,26 @@ def log_prospect_trade(*, order_id: str, sport: str, outcome: str,
         'result':            'PENDING',
         'actual_pnl':        '',
     }
-
-    with open(PROSPECT_LOG_PATH, 'a', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=PROSPECT_FIELDS)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
-
-    return row
+    return write_row(PROSPECT_LOG_PATH, PROSPECT_FIELDS, row)
 
 
-# ---------------------------------------------------------------------------
-# Already-bet dedup
-# ---------------------------------------------------------------------------
+def _log_result(*, order_id, sport, outcome, k_ticker, commence, pt_zone, pt_side,
+                order_type, fair_prob, yes_ask_at_signal, entry_price, fee_rate,
+                ev_per_contract, contracts, final_status, close_reason):
+    if is_filled(final_status):
+        log_prospect_trade(order_id=order_id, sport=sport, outcome=outcome, k_ticker=k_ticker,
+                           commence=commence, pt_zone=pt_zone, pt_side=pt_side,
+                           order_type=order_type, fair_prob=fair_prob,
+                           yes_ask_at_signal=yes_ask_at_signal, entry_price=entry_price,
+                           fee_rate=fee_rate, ev_per_contract=ev_per_contract,
+                           contracts=contracts, final_status=final_status,
+                           close_reason=close_reason)
+    else:
+        log_unfilled_attempt(strategy='prospect', side=pt_side, order_id=order_id,
+                             k_ticker=k_ticker, sport=sport, outcome=outcome,
+                             entry_price=entry_price, contracts=contracts,
+                             final_status=final_status, close_reason=close_reason)
 
-def already_bet_tickers() -> set:
-    """Tickers with an open/pending prospect position — block re-trading."""
-    if not os.path.exists(PROSPECT_LOG_PATH) or \
-       os.path.getsize(PROSPECT_LOG_PATH) == 0:
-        return set()
-    blocked = set()
-    with open(PROSPECT_LOG_PATH, newline='') as f:
-        for row in csv.DictReader(f):
-            if (row.get('result') == 'PENDING' and
-                    row.get('final_status', '') in ('resting', 'executed', 'filled')):
-                if row.get('k_ticker'):
-                    blocked.add(row['k_ticker'])
-    return blocked
-
-
-# ---------------------------------------------------------------------------
-# Single-trade executor
-# ---------------------------------------------------------------------------
 
 def run_prospect_trade(signal_row: pd.Series, bankroll: float,
                        taker_fee: float = TAKER_FEE,
@@ -140,7 +124,7 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
                        order_registry: Optional[list] = None) -> dict:
     """
     Execute one prospect theory trade. Reads pt_side and pt_zone from the row.
-    Logic mirrors run_trade() in bot.py but logs to prospect_trades.csv.
+    Logic mirrors kp_arb.run_trade() but logs to prospect_trades.csv.
     """
     ticker    = signal_row['k_ticker']
     fair_prob = float(signal_row['fair_prob'])
@@ -156,8 +140,7 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
     pt_side   = signal_row.get('pt_side', 'yes')  # 'yes' or 'no'
 
     # Real fee rates vary per series (see KALSHI/k_helpers.fee_rate_for) — override
-    # the passed-in taker_fee/maker_fee (defaults sourced from bot.py's module
-    # constants) with the live per-series rate for this ticker, same as run_trade().
+    # the passed-in taker_fee/maker_fee with the live per-series rate for this ticker.
     _series = str(ticker).split('-')[0]
     if signal_row.get('taker_fee_rate') is not None:
         taker_fee = float(signal_row['taker_fee_rate'])
@@ -198,7 +181,6 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
             return {'status': 'skipped', 'reason': 'no_ask_too_low',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
 
-        # Re-fetch live prices before placing for spread-aware rest price
         live_prices = get_market_prices(ticker)
         live_na = live_prices.get('no_ask')
         if live_na is not None:
@@ -236,7 +218,7 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
                                post_only=(order_type == 'no_rest'))
         order_id = order.get('order_id')
         if order_registry is not None and order_id:
-            order_registry.append(order_id)
+            order_registry.append((order_id, ticker))
 
         if dashboard:
             dashboard.add_position(order_id, ticker, f'NO:{outcome}', contracts,
@@ -255,7 +237,7 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
             dashboard=dashboard, stop_event=stop_event,
         )
         final_status = _final_order_status(order_id).get('status', 'unknown')
-        log_prospect_trade(
+        _log_result(
             order_id=order_id, sport=sport, outcome=f'NO:{outcome}',
             k_ticker=ticker, commence=commence, pt_zone=pt_zone, pt_side='no',
             order_type=order_type, fair_prob=fair_prob_no,
@@ -302,13 +284,12 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
         return {'status': 'skipped', 'reason': 'event_too_soon',
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
 
-    # Re-fetch live prices before placing for spread-aware rest price
     live_prices = get_market_prices(ticker)
     live_ya = live_prices.get('yes_ask')
     if live_ya is not None:
         if order_type == 'cross':
             order_price = live_ya / 100
-        else:  # rest: spread-aware
+        else:
             live_yb     = live_prices.get('yes_bid')
             order_price = _rest_price_cents(live_yb, live_ya) / 100
         ev = _ev(fair_prob, order_price, fee_rate)
@@ -331,7 +312,7 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
                            post_only=(order_type == 'rest'))
     order_id = order.get('order_id')
     if order_registry is not None and order_id:
-        order_registry.append(order_id)
+        order_registry.append((order_id, ticker))
 
     if dashboard:
         dashboard.add_position(order_id, ticker, outcome, contracts,
@@ -350,7 +331,7 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
         dashboard=dashboard, stop_event=stop_event,
     )
     final_status = _final_order_status(order_id).get('status', 'unknown')
-    log_prospect_trade(
+    _log_result(
         order_id=order_id, sport=sport, outcome=outcome,
         k_ticker=ticker, commence=commence, pt_zone=pt_zone, pt_side='yes',
         order_type=order_type, fair_prob=fair_prob,
@@ -366,34 +347,29 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
     }
 
 
-# ---------------------------------------------------------------------------
-# Batch runner
-# ---------------------------------------------------------------------------
-
-def run_prospect_signals(signals_df: pd.DataFrame, bankroll: float,
-                         taker_fee: float = TAKER_FEE,
-                         maker_fee: float = MAKER_FEE,
-                         limit_only: bool = False,
-                         force_cross: bool = False,
-                         size_mult: float = 1.0,
-                         max_duration: int = MAX_DURATION,
-                         dashboard=None,
-                         stop_event: Optional[threading.Event] = None) -> list:
+def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
+                    taker_fee: float = TAKER_FEE,
+                    maker_fee: float = MAKER_FEE,
+                    limit_only: bool = False,
+                    force_cross: bool = False,
+                    size_mult: float = 1.0,
+                    max_duration: int = MAX_DURATION,
+                    dashboard=None,
+                    stop_event: Optional[threading.Event] = None) -> list:
     """
     Run prospect trades in parallel (one thread per signal).
     Reads pt_side per row — handles mixed YES/NO in a single session.
+    Dedup via live Kalshi state (trade.core.positions.open_tickers), not CSV.
     """
-    import signal as _signal
-
     active = signals_df[signals_df['pt_signal']].drop_duplicates('k_ticker').copy()
 
-    _open = already_bet_tickers()
+    _open = open_tickers()
     if _open:
         before = len(active)
         active = active[~active['k_ticker'].isin(_open)].copy()
         dropped = before - len(active)
         if dropped:
-            print(f'  [dedup] Skipped {dropped} ticker(s) with existing open positions')
+            log.info('[dedup] Skipped %d ticker(s) with existing open positions', dropped)
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -412,12 +388,12 @@ def run_prospect_signals(signals_df: pd.DataFrame, bankroll: float,
                 order_registry=order_registry,
             )
         except Exception as exc:
-            print(f'  [error] {row.get("k_ticker", "?")}  {type(exc).__name__}: {exc}')
+            log.exception('run_prospect_trade failed for %s', row.get('k_ticker', '?'))
             result = {'status': 'error', 'ticker': row.get('k_ticker', ''),
                       'outcome': row.get('outcome', ''), 'reason': str(exc),
                       'order_id': None, 'contracts': 0}
         if result.get('status') in ('skipped', 'error'):
-            print(f'  [skip]  {result.get("ticker", "?")}  reason={result.get("reason", "?")}')
+            log.info('[skip] %s  reason=%s', result.get('ticker', '?'), result.get('reason', '?'))
         with lock:
             results[idx] = result
 
@@ -433,7 +409,8 @@ def run_prospect_signals(signals_df: pd.DataFrame, bankroll: float,
     try:
         for batch_start in range(0, len(threads), BATCH_SIZE):
             batch = threads[batch_start : batch_start + BATCH_SIZE]
-            print(f'  [batch] firing {len(batch)} order(s)  ({batch_start}/{len(threads)} sent so far)')
+            log.info('[batch] firing %d order(s)  (%d/%d sent so far)',
+                    len(batch), batch_start, len(threads))
             for t in batch:
                 t.start()
             if batch_start + BATCH_SIZE < len(threads):
@@ -441,7 +418,7 @@ def run_prospect_signals(signals_df: pd.DataFrame, bankroll: float,
         for t in threads:
             t.join()
     except KeyboardInterrupt:
-        print('\n[shutdown] Ctrl+C — canceling ALL prospect orders...')
+        log.warning('[shutdown] Ctrl+C — canceling ALL prospect orders...')
         prev = _signal.signal(_signal.SIGINT, _signal.SIG_IGN)
         try:
             stop_event.set()
@@ -451,8 +428,8 @@ def run_prospect_signals(signals_df: pd.DataFrame, bankroll: float,
             _signal.signal(_signal.SIGINT, prev)
         raise
     finally:
-        n = _force_cancel_all(order_registry)
+        n = force_cancel_all(order_registry)
         if n > 0:
-            print(f'[shutdown] force-canceled {n} open order(s)')
+            log.info('[shutdown] force-canceled %d open order(s)', n)
 
     return results

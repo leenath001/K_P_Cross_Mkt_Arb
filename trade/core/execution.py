@@ -1,24 +1,23 @@
 """
-bot.py — Trading execution module.
+trade/core/execution.py — Kalshi order execution primitives.
 
-Implements strategy steps 6-9:
-  6. Place resting YES limit order at Kalshi ask (limit order, no market crossing)
-  7. Re-ping Pinnacle every 2 min while order is live; cancel if signal flips
-  8. Cancel if 30 min elapsed OR event start is imminent (<5 min away)
-  9. Size with partial Kelly, fraction scaled by edge magnitude
+Strategy-agnostic: placing/canceling/monitoring orders, Kelly sizing, and EV math.
+Every strategy in trade/strategies/ builds on these rather than reimplementing them
+— the three-way drift between bot.py/prospect.py/nothing.py (three different
+already_bet_tickers() implementations, inconsistent fee handling before this
+module existed) is exactly the bug class this consolidation removes.
 """
 
-import os, sys, time, uuid, signal, threading, random
+import os, sys, time, uuid, threading, random
 import requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from math import floor
 from typing import Optional
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from KALSHI.k_helpers import kalshi_headers, fee_rate_for, kalshi_fee_dollars
 from theODDS.p_helpers import pinnacle_odds, get_api_usage
-from logger import log_trade, LOG_PATH, NO_LOG_PATH
 from applog import get_logger
 
 log = get_logger(__name__)
@@ -35,13 +34,14 @@ KALSHI_POLL       = 10     # seconds between Kalshi status checks
 PINNACLE_POLL     = 120    # seconds between Pinnacle re-checks
 MAX_DURATION      = 1800   # 30 min max order lifetime (seconds)
 PRE_EVENT_BUFFER  = 300    # cancel 5 min before event start (seconds)
+MIN_NOTIONAL      = 5.0    # floor $ risked per trade — see kelly_contracts() docstring
 
 # Statuses Kalshi uses to indicate an order is no longer open
 _CLOSED_STATUSES = {'filled', 'executed', 'canceled', 'expired'}
 
 
 # ---------------------------------------------------------------------------
-# Step 9 — Kelly Sizing + Edge Calculation
+# Kelly Sizing + Edge Calculation
 # ---------------------------------------------------------------------------
 
 def _exact_ev_ok(fair_prob: float, price: float, contracts: int, series: str,
@@ -82,9 +82,6 @@ def _kelly_fraction(roi: float) -> float:
         return 0.50
 
 
-MIN_NOTIONAL = 5.0  # floor $ risked per trade — see kelly_contracts() docstring
-
-
 def kelly_contracts(fair_prob: float, price: float, bankroll: float,
                     fee_rate: float) -> int:
     """
@@ -117,7 +114,7 @@ def kelly_contracts(fair_prob: float, price: float, bankroll: float,
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — Order Placement, Cancellation, Status
+# Order Placement, Cancellation, Status
 # ---------------------------------------------------------------------------
 
 def place_order(ticker: str, price_cents: int, count: int,
@@ -210,9 +207,16 @@ def get_balance() -> float:
     return resp.json().get('balance', 0) / 100
 
 
-def cancel_order(order_id: str, max_retries: int = 4) -> bool:
+def cancel_order(ticker: str, order_id: str, max_retries: int = 4) -> bool:
     """
     Cancel an open Kalshi order. Returns True on success, False on any failure (logged).
+
+    `ticker` is REQUIRED and passed as the `market_ticker` query param so Kalshi can
+    auto-route the DELETE to the correct exchange shard. Without it, Kalshi defaults
+    to shard 0 and 404s on anything else — confirmed live: MLB/Tennis lives on shard 3,
+    Combos on 1, Crypto on 2, and every cancel attempt against those was silently
+    failing (this is what made cancel_all.py look "broken for MLB games" — it wasn't
+    MLB-specific, every non-default-shard order was affected the same way).
 
     Retries with exponential backoff + jitter on 429 (rate limit). Bulk-cancel paths
     ("Cancel all" waking every _monitor() thread at once, _force_cancel_all() looping
@@ -225,9 +229,10 @@ def cancel_order(order_id: str, max_retries: int = 4) -> bool:
     for attempt in range(max_retries + 1):
         try:
             resp = requests.delete(f'{BASE_URL}/portfolio/events/orders/{order_id}',
-                                   headers=kalshi_headers('DELETE', path))
+                                   headers=kalshi_headers('DELETE', path),
+                                   params={'market_ticker': ticker})
         except requests.exceptions.RequestException as exc:
-            log.error('cancel_order network failure for %s: %s', order_id, exc)
+            log.error('cancel_order network failure for %s (%s): %s', order_id, ticker, exc)
             return False
         if resp.status_code in (200, 204):
             return True
@@ -242,9 +247,43 @@ def cancel_order(order_id: str, max_retries: int = 4) -> bool:
                        order_id, delay, attempt + 1, max_retries)
             time.sleep(delay)
             continue
-        log.warning('cancel_order failed for %s: %s %s — %s',
-                    order_id, resp.status_code, resp.reason, resp.text)
+        log.warning('cancel_order failed for %s (%s): %s %s — %s',
+                    order_id, ticker, resp.status_code, resp.reason, resp.text)
         return False
+    return False
+
+
+def ensure_canceled(ticker: str, order_id: str, max_attempts: int = 5,
+                    poll_delay: float = 0.5) -> bool:
+    """
+    Cancel an order and VERIFY it actually closed — don't just trust cancel_order()'s
+    return value as proof the order is dead. A 200/204 means Kalshi accepted the
+    cancel REQUEST; eventual consistency means a follow-up GET can still show it
+    resting for a beat (see _final_order_status). Re-issues the cancel if a
+    confirming GET still shows the order open, instead of firing one DELETE and
+    hoping. Checks status FIRST each loop so an already-closed order costs one GET,
+    not a wasted DELETE.
+
+    Use this (not bare cancel_order) anywhere the caller is about to act on the
+    assumption the order is gone — e.g. re-placing as a cross, re-resting at a new
+    price. A false "canceled" there risks double exposure (old + new order both live).
+
+    Returns True once Kalshi confirms closed, False if it gives up after
+    max_attempts (logged as an error — this is a real "still can't confirm cancel"
+    situation, not a routine retry).
+    """
+    status = 'unknown'
+    for attempt in range(max_attempts):
+        status = get_order_status(order_id).get('status', 'unknown')
+        if status in _CLOSED_STATUSES:
+            return True
+        cancel_order(ticker, order_id)
+        time.sleep(poll_delay * (attempt + 1))
+    status = get_order_status(order_id).get('status', 'unknown')
+    if status in _CLOSED_STATUSES:
+        return True
+    log.error('ensure_canceled: gave up on %s (%s) after %d attempts — still %s',
+             order_id, ticker, max_attempts, status)
     return False
 
 
@@ -349,7 +388,7 @@ def cross_and_cancel_order(ticker: str, order_id: str, contracts: int,
                 (fresh_df['outcome']  == outcome)
             ]
             if match.empty:
-                cancel_order(order_id)
+                ensure_canceled(ticker, order_id)
                 return {'action': 'canceled', 'ticker': ticker,
                         'reason': 'outcome not found in Pinnacle — canceled without cross'}
             yes_fair = float(match.iloc[0]['fair_prob'])
@@ -365,10 +404,10 @@ def cross_and_cancel_order(ticker: str, order_id: str, contracts: int,
     # ── 3. EV check with fresh fair prob ────────────────────────────────────
     ev = _ev(fair, ask, taker_fee)
 
-    # ── 4. Always cancel the resting order ───────────────────────────────────
-    if not cancel_order(order_id):
-        log.warning('cross_and_cancel_order: cancel failed for %s / order %s', ticker, order_id)
-        return {'action': 'error', 'ticker': ticker, 'reason': 'cancel failed'}
+    # ── 4. Always cancel the resting order — verified, not just requested, since
+    #        we're about to place a NEW order and can't risk both being live ──
+    if not ensure_canceled(ticker, order_id):
+        return {'action': 'error', 'ticker': ticker, 'reason': 'could not confirm cancel'}
 
     if ev < MIN_CROSS_EV:
         return {
@@ -436,9 +475,8 @@ def cancel_and_rerest(
         return {'action': 'error', 'ticker': ticker,
                 'reason': f'event starts in under {buffer_minutes}min — too close to re-rest'}
 
-    if not cancel_order(order_id):
-        log.warning('cancel_and_rerest: cancel failed for %s / order %s', ticker, order_id)
-        return {'action': 'error', 'ticker': ticker, 'reason': 'cancel failed'}
+    if not ensure_canceled(ticker, order_id):
+        return {'action': 'error', 'ticker': ticker, 'reason': 'could not confirm cancel'}
 
     try:
         order  = place_order(ticker, price_cents, remaining_contracts, side=side,
@@ -462,6 +500,10 @@ def get_order_status(order_id: str) -> dict:
     Tries the single-order endpoint first; falls back to searching
     the open orders list if that returns 404.
     Status is always taken verbatim from Kalshi — never assumed.
+
+    Both underlying calls are unaffected by the exchange-sharding issue that hits
+    cancel_order(): the list endpoint returns cross-shard results by default
+    (verified live), so no ticker/exchange_index is needed here.
     """
     try:
         # 1. Try direct lookup
@@ -491,15 +533,15 @@ def _final_order_status(order_id: str, retries: int = 4, delay: float = 0.5) -> 
     """
     Fetch the definitive post-monitor order status for logging.
 
-    _monitor() may have just called cancel_order() moments before returning —
-    Kalshi's cancellation can lag behind the DELETE response by a beat, so a
-    GET issued immediately after can catch a stale 'resting' snapshot. If that
-    gets written to log_trade() as the "final" status, the CSV permanently
-    shows result=PENDING/final_status=resting even though the order is long
-    since canceled — and already_bet_tickers() then blocks that ticker from
-    ever being re-traded, since nothing ever goes back and corrects the row.
-    (Confirmed empirically: every "PENDING+resting" row sampled from the log
-    showed 'canceled' or aged-out 'unknown' when queried live, never resting.)
+    _monitor() may have just canceled moments before returning — Kalshi's
+    cancellation can lag behind the DELETE response by a beat, so a GET issued
+    immediately after can catch a stale 'resting' snapshot. If that gets written to
+    log_trade() as the "final" status, the CSV permanently shows
+    result=PENDING/final_status=resting even though the order is long since
+    canceled. (Confirmed empirically: every "PENDING+resting" row sampled from the
+    log showed 'canceled' or aged-out 'unknown' when queried live, never resting.)
+    ensure_canceled() at the call site now makes this far less likely, but this
+    retry stays as a second line of defense for the final status read itself.
 
     Retry briefly until the status is no longer 'resting', or give up and
     return the last read after `retries` attempts.
@@ -511,13 +553,12 @@ def _final_order_status(order_id: str, retries: int = 4, delay: float = 0.5) -> 
             return order
         time.sleep(delay)
     log.warning('_final_order_status: %s still showing resting after %d retries '
-               '(%.1fs) — logging as-is; may need manual orphan cleanup if stale',
-               order_id, retries, retries * delay)
+               '(%.1fs) — logging as-is', order_id, retries, retries * delay)
     return order
 
 
 # ---------------------------------------------------------------------------
-# Step 7 — Signal Re-validation
+# Signal Re-validation
 # ---------------------------------------------------------------------------
 
 def _recheck_signal(event_id: str, sport: str, outcome: str,
@@ -562,7 +603,7 @@ def _recheck_signal(event_id: str, sport: str, outcome: str,
 
 
 # ---------------------------------------------------------------------------
-# Steps 7 & 8 — Monitor Loop
+# Monitor Loop
 # ---------------------------------------------------------------------------
 
 def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str,
@@ -642,7 +683,7 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
                 # Kalshi's write-token rate limit (cancel_order() retries on 429, but
                 # avoiding the burst in the first place is cheaper and faster).
                 time.sleep(random.uniform(0, 0.5))
-                cancel_order(order_id)
+                ensure_canceled(ticker, order_id)
                 if dashboard:
                     dashboard.update(order_id, status='canceled')
                 return 'user_canceled'
@@ -664,7 +705,7 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
                     )
                     _action = _xc.get('action', 'error')
                 else:
-                    cancel_order(order_id)
+                    ensure_canceled(ticker, order_id)
                     _action = 'exceeded'
                 if dashboard:
                     dashboard.update(order_id, status='canceled')
@@ -672,7 +713,7 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
 
             to_event = (commence_utc - now_utc).total_seconds()
             if to_event <= pre_event_buffer:
-                cancel_order(order_id)
+                ensure_canceled(ticker, order_id)
                 if dashboard:
                     dashboard.update(order_id, status='canceled')
                 return 'event_imminent'
@@ -684,7 +725,7 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
                                            order_id=order_id, side=side)
                 last_pinnacle = time.time()
                 if not valid:
-                    cancel_order(order_id)
+                    ensure_canceled(ticker, order_id)
                     if dashboard:
                         dashboard.update(order_id, status='signal_flipped')
                     return 'signal_flipped'
@@ -703,7 +744,7 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
                 # leave an unmonitored resting order alive indefinitely.
                 log.error('_monitor giving up on order %s after %d consecutive errors — canceling',
                          order_id, consecutive_errors)
-                cancel_order(order_id)
+                ensure_canceled(ticker, order_id)
                 if dashboard:
                     dashboard.update(order_id, status='canceled')
                 return 'monitor_error_giveup'
@@ -716,504 +757,30 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
             time.sleep(kalshi_poll)
 
 
-# ---------------------------------------------------------------------------
-# Main Orchestrator
-# ---------------------------------------------------------------------------
-
-def run_trade(signal_row: pd.Series, bankroll: float,
-              taker_fee: float = TAKER_FEE,
-              maker_fee: float = MAKER_FEE,
-              limit_only: bool = False,
-              force_cross: bool = False,
-              side: str = 'yes',
-              max_duration: int = MAX_DURATION,
-              pre_event_buffer: int = PRE_EVENT_BUFFER,
-              size_mult: float = 1.0,
-              dashboard=None,
-              stop_event: Optional[threading.Event] = None,
-              order_registry: Optional[list] = None) -> dict:
+def force_cancel_all(order_registry: list) -> int:
     """
-    Execute a single trade for one signaled row from kalshi_odds().
-
-    Both sides share the same logic structure:
-      AUTO  : cross at ask (taker fee) if EV > 0, else rest at ask-1¢ (maker fee) if EV > 0, else skip.
-      CROSS : cross at ask (taker fee); skip if EV <= 0.
-      REST  : rest at ask-1¢ (maker fee); skip if EV <= 0.
-
-    YES: ask = yes_ask,  fair = fair_prob
-    NO : ask = no_ask,   fair = 1 - fair_prob
+    Cancel every (order_id, ticker) in the registry that isn't already terminal.
+    order_registry: list of (order_id, ticker) tuples.
     """
-    ticker    = signal_row['k_ticker']
-    fair_prob = float(signal_row['fair_prob'])
-    yes_ask   = float(signal_row['yes_ask'])
-    yes_bid   = float(signal_row['yes_bid']) if signal_row['yes_bid'] is not None else None
-    no_ask    = float(signal_row['no_ask'])  if signal_row.get('no_ask') is not None else None
-    no_bid    = float(signal_row['no_bid'])  if signal_row.get('no_bid') is not None else None
-    commence  = signal_row['commence']
-    event_id  = signal_row['event_id']
-    sport     = signal_row['sport']
-    outcome   = signal_row['outcome']
-
-    # Real fee rates vary per series (see KALSHI/k_helpers.fee_rate_for) — override
-    # whatever taker_fee/maker_fee was passed in (e.g. a UI slider) with the live rate
-    # for THIS ticker's series, so execution can't diverge from the signal it's acting
-    # on. Prefer the rate kalshi_odds() already computed for this exact row when present.
-    _series = str(ticker).split('-')[0]
-    if signal_row.get('taker_fee_rate') is not None:
-        taker_fee = float(signal_row['taker_fee_rate'])
-    else:
-        taker_fee = fee_rate_for(_series, maker=False)
-    if signal_row.get('maker_fee_rate') is not None:
-        maker_fee = float(signal_row['maker_fee_rate'])
-    else:
-        maker_fee = fee_rate_for(_series, maker=True)
-
-    # ── NO side: same AUTO/CROSS/REST logic as YES, using no_ask ────────────
-    if side == 'no':
-        if no_ask is None:
-            return {'status': 'skipped', 'reason': 'no_ask_unavailable',
-                    'ticker': ticker, 'order_id': None, 'contracts': 0}
-        fair_prob_no  = 1 - fair_prob
-        no_bid_c      = round(no_bid * 100) if no_bid is not None else None
-        no_ask_c      = round(no_ask * 100)
-        rest_price_no = _rest_price_cents(no_bid_c, no_ask_c) / 100
-        taker_ev_no   = _ev(fair_prob_no, no_ask,      taker_fee)
-        maker_ev_no   = _ev(fair_prob_no, rest_price_no, maker_fee)
-        if force_cross:
-            if taker_ev_no < MIN_CROSS_EV:
-                return {'status': 'skipped', 'reason': 'no_edge_after_fees',
-                        'ticker': ticker, 'order_id': None, 'contracts': 0}
-            order_price = no_ask
-            fee_rate    = taker_fee
-            order_type  = 'no_cross'
-        elif not limit_only and taker_ev_no >= MIN_CROSS_EV:
-            order_price = no_ask
-            fee_rate    = taker_fee
-            order_type  = 'no_cross'
-        elif maker_ev_no > 0:
-            order_price = rest_price_no
-            fee_rate    = maker_fee
-            order_type  = 'no_rest'
-        else:
-            return {'status': 'skipped', 'reason': 'no_edge_after_fees',
-                    'ticker': ticker, 'order_id': None, 'contracts': 0}
-        if order_price < 0.01:
-            return {'status': 'skipped', 'reason': 'no_ask_too_low',
-                    'ticker': ticker, 'order_id': None, 'contracts': 0}
-
-        # Re-fetch live prices before placing to use fresh spread-aware rest price
-        live_prices = get_market_prices(ticker)
-        live_na = live_prices.get('no_ask')
-        if live_na is not None:
-            if order_type == 'no_rest':
-                live_nb   = live_prices.get('no_bid')
-                live_rest = _rest_price_cents(live_nb, live_na) / 100
-                live_ev   = _ev(fair_prob_no, live_rest, fee_rate)
-                if live_ev <= 0:
-                    return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
-                            'ticker': ticker, 'order_id': None, 'contracts': 0}
-                order_price = live_rest
-            else:  # no_cross
-                live_cross = round(live_na / 100, 2)
-                live_ev    = _ev(fair_prob_no, live_cross, fee_rate)
-                if live_ev <= 0:
-                    return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
-                            'ticker': ticker, 'order_id': None, 'contracts': 0}
-                order_price = live_cross
-
-        ev          = _ev(fair_prob_no, order_price, fee_rate)
-        price_cents = round(order_price * 100)
-        contracts   = kelly_contracts(fair_prob_no, order_price, bankroll, fee_rate)
-        if contracts <= 0:
-            return {'status': 'skipped', 'reason': 'zero_contracts',
-                    'ticker': ticker, 'order_id': None, 'contracts': 0}
-        contracts = max(1, round(contracts * size_mult))
-        if contracts * order_price > bankroll:
-            return {'status': 'skipped', 'reason': 'insufficient_cash',
-                    'ticker': ticker, 'order_id': None, 'contracts': 0}
-
-        _min_ev = MIN_CROSS_EV if order_type == 'no_cross' else 0
-        if not _exact_ev_ok(fair_prob_no, order_price, contracts, _series,
-                            maker=(order_type == 'no_rest'), min_ev=_min_ev):
-            return {'status': 'skipped', 'reason': 'no_edge_after_exact_fee_rounding',
-                    'ticker': ticker, 'order_id': None, 'contracts': 0}
-
-        now_utc      = datetime.now(timezone.utc)
-        commence_utc = pd.Timestamp(commence).tz_convert('UTC').to_pydatetime()
-        expiry_dt    = min(now_utc + timedelta(seconds=max_duration),
-                           commence_utc - timedelta(seconds=pre_event_buffer))
-        if expiry_dt <= now_utc:
-            return {'status': 'skipped', 'reason': 'event_too_soon',
-                    'ticker': ticker, 'order_id': None, 'contracts': 0}
-
-        order    = place_order(ticker, price_cents, contracts, side='no',
-                               expiration_ts=int(expiry_dt.timestamp()),
-                               post_only=not force_cross)
-        order_id = order.get('order_id')
-        if order_registry is not None and order_id:
-            order_registry.append(order_id)
-        print(f'[no order] {ticker}  no_ask={no_ask}  contracts={contracts}  ev={ev:.4f}')
-
-        if dashboard:
-            dashboard.add_position(order_id, ticker, f'NO:{outcome}', contracts,
-                                   price_cents, fair_prob_no, ev,
-                                   event_id=event_id, sport=sport,
-                                   raw_outcome=outcome, fee_rate=fee_rate,
-                                   side='no', commence=str(commence))
-
-        reason = _monitor(
-            order_id=order_id, ticker=ticker, event_id=event_id,
-            sport=sport, outcome=outcome,
-            order_price=order_price, fee_rate=fee_rate,
-            commence_utc=commence_utc, side='no',
-            contracts=contracts, taker_fee=taker_fee,
-            max_duration=max_duration, pre_event_buffer=pre_event_buffer,
-            dashboard=dashboard, stop_event=stop_event,
-        )
-        final        = _final_order_status(order_id)
-        final_status = final.get('status', 'unknown')
-        log_trade(
-            order_id=order_id, sport=sport, outcome=f'NO:{outcome}',
-            k_ticker=ticker, commence=commence, order_type=order_type,
-            fair_prob=fair_prob_no, yes_ask_at_signal=yes_ask,
-            entry_price=order_price, fee_rate=fee_rate,
-            ev_per_contract=ev, contracts=contracts,
-            final_status=final_status, close_reason=reason,
-            side='no',
-        )
-        return {
-            'order_id':   order_id,
-            'ticker':     ticker,
-            'outcome':    f'NO:{outcome}',
-            'contracts':  contracts,
-            'no_price':   price_cents,
-            'fair_prob':  fair_prob_no,
-            'ev':         round(ev, 4),
-            'order_type': order_type,
-            'status':     final_status,
-            'reason':     reason,
-        }
-
-    # ── YES side: same AUTO/CROSS/REST logic as NO, using yes_ask ───────────
-    yes_bid_c      = round(yes_bid * 100) if yes_bid is not None else None
-    yes_ask_c      = round(yes_ask * 100)
-    rest_price_yes = _rest_price_cents(yes_bid_c, yes_ask_c) / 100
-    taker_ev_yes   = _ev(fair_prob, yes_ask,       taker_fee)
-    maker_ev_yes   = _ev(fair_prob, rest_price_yes, maker_fee)
-    if force_cross:
-        if taker_ev_yes < MIN_CROSS_EV:
-            if dashboard:
-                skip_id = f'skip_{ticker}'
-                dashboard.add_position(skip_id, ticker, outcome, 0,
-                                       round(yes_ask * 100), fair_prob, taker_ev_yes)
-                dashboard.update(skip_id, status='skipped')
-            return {'status': 'skipped', 'reason': 'no_edge_after_fees',
-                    'ticker': ticker, 'order_id': None, 'contracts': 0}
-        order_price = yes_ask
-        fee_rate    = taker_fee
-        order_type  = 'cross'
-    elif not limit_only and taker_ev_yes >= MIN_CROSS_EV:
-        order_price = yes_ask
-        fee_rate    = taker_fee
-        order_type  = 'cross'
-    elif maker_ev_yes > 0:
-        order_price = rest_price_yes
-        fee_rate    = maker_fee
-        order_type  = 'rest'
-    else:
-        if dashboard:
-            skip_id = f'skip_{ticker}'
-            dashboard.add_position(skip_id, ticker, outcome, 0,
-                                   round(yes_ask * 100), fair_prob, taker_ev_yes)
-            dashboard.update(skip_id, status='skipped')
-        return {'status': 'skipped', 'reason': 'no_edge_after_fees',
-                'ticker': ticker, 'order_id': None, 'contracts': 0}
-
-    ev            = _ev(fair_prob, order_price, fee_rate)
-    price_cents   = round(order_price * 100)
-    contracts     = kelly_contracts(fair_prob, order_price, bankroll, fee_rate)
-
-    now_utc      = datetime.now(timezone.utc)
-    commence_utc = pd.Timestamp(commence).tz_convert('UTC').to_pydatetime()
-    expiry_dt    = min(now_utc + timedelta(seconds=max_duration),
-                       commence_utc - timedelta(seconds=pre_event_buffer))
-
-    if expiry_dt <= now_utc:
-        if dashboard:
-            skip_id = f'skip_{ticker}'
-            dashboard.add_position(skip_id, ticker, outcome, 0,
-                                   price_cents, fair_prob, ev)
-            dashboard.update(skip_id, status='skipped')
-        return {'status': 'skipped', 'reason': 'event_too_soon',
-                'ticker': ticker, 'order_id': None, 'contracts': 0}
-
-    # Re-fetch live prices before placing to use fresh spread-aware rest price
-    live_prices = get_market_prices(ticker)
-    live_ya = live_prices.get('yes_ask')
-    if live_ya is not None:
-        if order_type == 'cross':
-            order_price = live_ya / 100
-        else:  # rest: spread-aware — 2¢ wide → bid+1, 1¢ wide → bid
-            live_yb     = live_prices.get('yes_bid')
-            order_price = _rest_price_cents(live_yb, live_ya) / 100
-        ev = _ev(fair_prob, order_price, fee_rate)
-        if ev <= 0:
-            return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
-                    'ticker': ticker, 'order_id': None, 'contracts': 0}
-        price_cents = round(order_price * 100)
-        contracts   = kelly_contracts(fair_prob, order_price, bankroll, fee_rate)
-
-    if contracts <= 0:
-        return {'status': 'skipped', 'reason': 'zero_contracts',
-                'ticker': ticker, 'order_id': None, 'contracts': 0}
-    contracts = max(1, round(contracts * size_mult))
-    if contracts * order_price > bankroll:
-        return {'status': 'skipped', 'reason': 'insufficient_cash',
-                'ticker': ticker, 'order_id': None, 'contracts': 0}
-
-    _min_ev = MIN_CROSS_EV if order_type == 'cross' else 0
-    if not _exact_ev_ok(fair_prob, order_price, contracts, _series,
-                        maker=(order_type == 'rest'), min_ev=_min_ev):
-        return {'status': 'skipped', 'reason': 'no_edge_after_exact_fee_rounding',
-                'ticker': ticker, 'order_id': None, 'contracts': 0}
-
-    order    = place_order(ticker, price_cents, contracts, side='yes',
-                           expiration_ts=int(expiry_dt.timestamp()),
-                           post_only=(order_type == 'rest' or limit_only))
-    order_id = order.get('order_id')
-    if order_registry is not None and order_id:
-        order_registry.append(order_id)
-
-    actual_taker_fee = float(order.get('taker_fees_dollars') or 0)
-    actual_maker_fee = float(order.get('maker_fees_dollars') or 0)
-    print(f'[fee check] actual taker=${actual_taker_fee:.4f}  maker=${actual_maker_fee:.4f}'
-          f'  assumed_rate={fee_rate*100:.0f}%  contracts={contracts}  price={price_cents}¢')
-
-    if dashboard:
-        dashboard.add_position(order_id, ticker, outcome, contracts,
-                               price_cents, fair_prob, ev,
-                               event_id=event_id, sport=sport,
-                               raw_outcome=outcome, fee_rate=fee_rate,
-                               side='yes', commence=str(commence))
-
-    reason = _monitor(
-        order_id=order_id, ticker=ticker, event_id=event_id,
-        sport=sport, outcome=outcome,
-        order_price=order_price, fee_rate=fee_rate,
-        commence_utc=commence_utc,
-        contracts=contracts, taker_fee=taker_fee,
-        max_duration=max_duration, pre_event_buffer=pre_event_buffer,
-        dashboard=dashboard, stop_event=stop_event,
-    )
-
-    final        = _final_order_status(order_id)
-    final_status = final.get('status', 'unknown')
-
-    log_trade(
-        order_id          = order_id,
-        sport             = sport,
-        outcome           = outcome,
-        k_ticker          = ticker,
-        commence          = commence,
-        order_type        = order_type,
-        fair_prob         = fair_prob,
-        yes_ask_at_signal = yes_ask,
-        entry_price       = order_price,
-        fee_rate          = fee_rate,
-        ev_per_contract   = ev,
-        contracts         = contracts,
-        final_status      = final_status,
-        close_reason      = reason,
-    )
-
-    return {
-        'order_id':   order_id,
-        'ticker':     ticker,
-        'outcome':    outcome,
-        'contracts':  contracts,
-        'yes_price':  price_cents,
-        'fair_prob':  fair_prob,
-        'ev':         round(ev, 4),
-        'order_type': order_type,
-        'status':     final_status,
-        'reason':     reason,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Batch Runner (threaded — one thread per signal)
-# ---------------------------------------------------------------------------
-
-def _force_cancel_all(order_ids: list) -> int:
-    """Cancel any order_id in the list that isn't already in a terminal state."""
     canceled = 0
-    for i, oid in enumerate(list(order_ids)):
+    for i, entry in enumerate(list(order_registry)):
+        if not entry:
+            continue
+        oid, ticker = entry
         if not oid:
             continue
         try:
             status = get_order_status(oid).get('status', 'unknown')
             if status in _CLOSED_STATUSES:
                 continue
-            if cancel_order(oid):
+            if ensure_canceled(ticker, oid):
                 canceled += 1
         except Exception:
             # Best-effort — try remaining orders even if one fails
-            log.exception('_force_cancel_all: failed to cancel order %s', oid)
+            log.exception('force_cancel_all: failed to cancel order %s (%s)', oid, ticker)
         # Small throttle between orders — this loop can run 20-30+ cancels back to
         # back (e.g. Ctrl+C mid-session), which was enough on its own to trip
         # Kalshi's write-token rate limit even before cancel_order()'s own retry logic.
-        if i < len(order_ids) - 1:
+        if i < len(order_registry) - 1:
             time.sleep(0.15)
     return canceled
-
-
-def already_bet_tickers() -> set:
-    """
-    Tickers with an open or pending position across both log files.
-    Blocks re-trading any ticker where result=PENDING and the order is
-    still active (resting / executed / filled).
-    Canceled/expired rows and settled WIN/LOSS rows are not blocked.
-    """
-    import csv as _csv
-    blocked = set()
-    for path in (LOG_PATH, NO_LOG_PATH):
-        if not os.path.exists(path) or os.path.getsize(path) == 0:
-            continue
-        with open(path, newline='') as f:
-            for row in _csv.DictReader(f):
-                if (row.get('result') == 'PENDING' and
-                        row.get('final_status', '') in ('resting', 'executed', 'filled')):
-                    ticker = row.get('k_ticker') or row.get('ticker', '')
-                    if ticker:
-                        blocked.add(ticker)
-    return blocked
-
-
-def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
-                    taker_fee: float = TAKER_FEE,
-                    maker_fee: float = MAKER_FEE,
-                    limit_only: bool = False,
-                    force_cross: bool = False,
-                    side: str = 'yes',
-                    max_duration: int = MAX_DURATION,
-                    size_mult: float = 1.0,
-                    dashboard=None,
-                    stop_event: Optional[threading.Event] = None) -> list:
-    """
-    Run trades in parallel (one thread per signal).
-    Deduplicates on k_ticker — each Kalshi market is traded at most once.
-
-    Ctrl+C behavior: sets stop_event, waits for monitors to cancel their own
-    orders, then runs a force-cancel pass over any tracked order_id that is
-    still open. A second Ctrl+C during cleanup is ignored so cancellation
-    always completes.
-    """
-    # Build the same mask web_app uses so REST/CROSS/AUTO modes are consistent
-    def _scol(name):
-        if name in signals_df.columns:
-            return signals_df[name]
-        return pd.Series(False, index=signals_df.index)
-
-    if side == 'no':
-        if force_cross:
-            sig_mask = _scol('signal_no_cross')
-        elif limit_only:
-            sig_mask = _scol('signal_no')
-        else:
-            sig_mask = _scol('signal_no_cross') | _scol('signal_no')
-    else:
-        if force_cross:
-            sig_mask = _scol('signal')
-        elif limit_only:
-            sig_mask = _scol('signal_yes_rest')
-        else:
-            sig_mask = _scol('signal') | _scol('signal_yes_rest')
-
-    active = (signals_df[sig_mask]
-              .drop_duplicates(subset='k_ticker')
-              .copy())
-
-    # Drop tickers with existing open/pending positions (dedup across runs)
-    _open = already_bet_tickers()
-    if _open:
-        before = len(active)
-        active = active[~active['k_ticker'].isin(_open)].copy()
-        dropped = before - len(active)
-        if dropped:
-            log.info('[dedup] Skipped %d ticker(s) with existing open positions', dropped)
-
-    # Owned by run_all_signals — every order this run places gets tracked here
-    if stop_event is None:
-        stop_event = threading.Event()
-    order_registry: list = []
-    results = [None] * len(active)
-    lock    = threading.Lock()
-
-    def _trade(row, idx):
-        try:
-            result = run_trade(row, bankroll=bankroll,
-                               taker_fee=taker_fee, maker_fee=maker_fee,
-                               limit_only=limit_only, force_cross=force_cross,
-                               side=side, max_duration=max_duration,
-                               size_mult=size_mult,
-                               dashboard=dashboard, stop_event=stop_event,
-                               order_registry=order_registry)
-        except Exception as exc:
-            log.exception('run_trade failed for %s', row.get('k_ticker', '?'))
-            result = {
-                'status':  'error',
-                'ticker':  row.get('k_ticker', ''),
-                'outcome': row.get('outcome', ''),
-                'reason':  str(exc),
-                'order_id': None,
-                'contracts': 0,
-            }
-        if result.get('status') in ('skipped', 'error'):
-            log.info('[skip] %s  reason=%s', result.get('ticker', '?'), result.get('reason', '?'))
-        with lock:
-            results[idx] = result
-
-    BATCH_SIZE  = 10   # orders fired per wave
-    BATCH_DELAY = 10   # seconds to wait between waves
-
-    rows_list = list(active.iterrows())
-    threads   = [
-        threading.Thread(target=_trade, args=(row, i), daemon=True)
-        for i, (_, row) in enumerate(rows_list)
-    ]
-
-    try:
-        # Fire each batch then immediately move on — don't wait for monitors to finish.
-        # All threads run concurrently once started; we join ALL at the end.
-        for batch_start in range(0, len(threads), BATCH_SIZE):
-            batch   = threads[batch_start : batch_start + BATCH_SIZE]
-            n_total = len(threads)
-            log.info('[batch] firing %d order(s)  (%d/%d sent so far)',
-                     len(batch), batch_start, n_total)
-            for t in batch:
-                t.start()
-            if batch_start + BATCH_SIZE < len(threads):
-                time.sleep(BATCH_DELAY)
-
-        # Wait for every thread (all batches) to complete
-        for t in threads:
-            t.join()
-
-    except KeyboardInterrupt:
-        log.warning('[shutdown] Ctrl+C received — canceling ALL orders...')
-        # Block further SIGINTs so cleanup always completes
-        prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        try:
-            stop_event.set()
-            for t in threads:
-                t.join(timeout=15)
-        finally:
-            signal.signal(signal.SIGINT, prev_handler)
-        raise
-    finally:
-        # Cancel every order placed this run, across all batches
-        n = _force_cancel_all(order_registry)
-        if n > 0:
-            log.info('[shutdown] force-canceled %d open order(s)', n)
-
-    return results
