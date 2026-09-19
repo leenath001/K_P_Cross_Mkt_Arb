@@ -17,13 +17,13 @@ What it will NOT touch:
   - Multi-market events (A-vs-B style) — only events with ONE open market
 
 Usage:
-    python trade/nothing_quickstart.py --series KXSERIES                     # dry run, 10% of cash
-    python trade/nothing_quickstart.py --series KXSERIES --live              # place orders
-    python trade/nothing_quickstart.py --series KXSERIES --budget-pct 0.15 --live
-    python trade/nothing_quickstart.py --series KXSERIES --budget 20 --live  # fixed $ override
-    python trade/nothing_quickstart.py --tickers MKT-A MKT-B --live
-    python trade/nothing_quickstart.py --series KXSERIES --rest --live       # maker mode
-    python trade/nothing_quickstart.py --cancel-all                          # cancel every tracked order
+    python trade/strategies/nothing.py --series KXSERIES                     # dry run, 10% of cash
+    python trade/strategies/nothing.py --series KXSERIES --live              # place orders
+    python trade/strategies/nothing.py --series KXSERIES --budget-pct 0.15 --live
+    python trade/strategies/nothing.py --series KXSERIES --budget 20 --live  # fixed $ override
+    python trade/strategies/nothing.py --tickers MKT-A MKT-B --live
+    python trade/strategies/nothing.py --series KXSERIES --rest --live       # maker mode
+    python trade/strategies/nothing.py --cancel-all                         # cancel every tracked order
 
 Logs to trade/logs/nothing_trades.csv (separate from trades.csv / no_trades.csv).
 Kept as a single evolving log (not split filled/unfilled like kp_arb/prospect):
@@ -66,7 +66,7 @@ FIELDS = [
     'logged_at', 'order_id', 'series_ticker', 'event_ticker', 'k_ticker',
     'title', 'mode', 'entry_price', 'entry_price_cents', 'fee_rate',
     'contracts', 'total_cost', 'max_payout', 'expires_at',
-    'final_status', 'close_reason', 'result', 'actual_pnl',
+    'final_status', 'close_reason', 'result', 'actual_pnl', 'settled_at',
 ]
 
 
@@ -573,6 +573,7 @@ def run(args):
             'close_reason':      '',
             'result':            'PENDING',
             'actual_pnl':        '',
+            'settled_at':        '',
         }
         log_trade(row)
         summary.append({'ticker': m['ticker'], 'status': status, 'order_id': oid,

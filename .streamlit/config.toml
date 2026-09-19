@@ -1,0 +1,17 @@
+# Production-feel settings — the Streamlit equivalent of Dash's debug=False.
+# toolbarMode "minimal" drops the Deploy button / hamburger menu (GitHub link,
+# "Fork", "About", record-a-screencast, etc.) that otherwise makes every
+# Streamlit app look like a half-finished dev tool.
+[client]
+toolbarMode = "minimal"
+
+# Hot-reload-on-save: ON for now while we're actively making changes together
+# (otherwise a running `streamlit run` process silently keeps serving old code
+# after every edit, with no visible sign anything's stale). Once you're past
+# active development and just running this live, flip back to `false` — you
+# won't want a stray file save interrupting a live-trading session.
+[server]
+runOnSave = true
+
+[browser]
+gatherUsageStats = false

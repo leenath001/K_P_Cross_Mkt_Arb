@@ -25,11 +25,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from KALSHI.k_helpers import kalshi_odds, prospect_signals, fee_rate_for
 from trade.core.execution import (
     place_order, get_market_prices, _rest_price_cents,
-    kelly_contracts, _ev, _monitor, _final_order_status,
+    resolve_contracts, _ev, _monitor, _final_order_status, filled_count,
     TAKER_FEE, MAKER_FEE, MIN_CROSS_EV, MAX_DURATION, PRE_EVENT_BUFFER,
     force_cancel_all,
 )
-from trade.core.positions import open_tickers
+from trade.core.positions import open_tickers, opposite_leg_blocked
 from trade.core.logging_io import write_row, log_unfilled_attempt, is_filled
 from applog import get_logger
 
@@ -44,7 +44,7 @@ PROSPECT_FIELDS = [
     'order_type', 'fair_prob', 'yes_ask_at_signal',
     'entry_price', 'entry_price_cents', 'fee_rate',
     'ev_per_contract', 'edge', 'contracts', 'total_cost', 'ev_total',
-    'final_status', 'close_reason', 'result', 'actual_pnl',
+    'final_status', 'close_reason', 'result', 'actual_pnl', 'settled_at',
 ]
 
 
@@ -89,20 +89,30 @@ def log_prospect_trade(*, order_id: str, sport: str, outcome: str,
         'close_reason':      close_reason,
         'result':            'PENDING',
         'actual_pnl':        '',
+        'settled_at':        '',
     }
     return write_row(PROSPECT_LOG_PATH, PROSPECT_FIELDS, row)
 
 
 def _log_result(*, order_id, sport, outcome, k_ticker, commence, pt_zone, pt_side,
                 order_type, fair_prob, yes_ask_at_signal, entry_price, fee_rate,
-                ev_per_contract, contracts, final_status, close_reason):
-    if is_filled(final_status):
+                ev_per_contract, contracts, final_status, close_reason,
+                filled: int = None):
+    """
+    Route to the real trade log if any contracts actually filled, else the
+    unfilled-attempts log. See kp_arb._log_result for why this checks `filled`
+    (Kalshi's fill_count_fp) rather than final_status alone — a partial fill
+    that gets canceled at max_duration must not vanish into the unfilled log.
+    """
+    if filled is None:
+        filled = contracts if is_filled(final_status) else 0
+    if filled > 0:
         log_prospect_trade(order_id=order_id, sport=sport, outcome=outcome, k_ticker=k_ticker,
                            commence=commence, pt_zone=pt_zone, pt_side=pt_side,
                            order_type=order_type, fair_prob=fair_prob,
                            yes_ask_at_signal=yes_ask_at_signal, entry_price=entry_price,
                            fee_rate=fee_rate, ev_per_contract=ev_per_contract,
-                           contracts=contracts, final_status=final_status,
+                           contracts=filled, final_status=final_status,
                            close_reason=close_reason)
     else:
         log_unfilled_attempt(strategy='prospect', side=pt_side, order_id=order_id,
@@ -196,11 +206,11 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
 
         ev          = _ev(fair_prob_no, order_price, fee_rate)
         price_cents = round(order_price * 100)
-        contracts   = kelly_contracts(fair_prob_no, order_price, bankroll, fee_rate)
-        if contracts <= 0:
+        contracts   = resolve_contracts(signal_row, fair_prob_no, order_price, bankroll,
+                                        fee_rate, size_mult)
+        if contracts is None:
             return {'status': 'skipped', 'reason': 'zero_contracts',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
-        contracts = max(1, round(contracts * size_mult))
         if contracts * order_price > bankroll:
             return {'status': 'skipped', 'reason': 'insufficient_cash',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
@@ -236,7 +246,8 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
             max_duration=max_duration, pre_event_buffer=pre_event_buffer,
             dashboard=dashboard, stop_event=stop_event,
         )
-        final_status = _final_order_status(order_id).get('status', 'unknown')
+        final = _final_order_status(order_id)
+        final_status = final.get('status', 'unknown')
         _log_result(
             order_id=order_id, sport=sport, outcome=f'NO:{outcome}',
             k_ticker=ticker, commence=commence, pt_zone=pt_zone, pt_side='no',
@@ -244,6 +255,7 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
             yes_ask_at_signal=yes_ask, entry_price=order_price,
             fee_rate=fee_rate, ev_per_contract=ev, contracts=contracts,
             final_status=final_status, close_reason=reason,
+            filled=filled_count(final),
         )
         return {
             'order_id': order_id, 'ticker': ticker, 'outcome': f'NO:{outcome}',
@@ -274,7 +286,11 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
 
     ev          = _ev(fair_prob, order_price, fee_rate)
     price_cents = round(order_price * 100)
-    contracts   = kelly_contracts(fair_prob, order_price, bankroll, fee_rate)
+    contracts   = resolve_contracts(signal_row, fair_prob, order_price, bankroll,
+                                    fee_rate, size_mult)
+    if contracts is None:
+        return {'status': 'skipped', 'reason': 'zero_contracts',
+                'ticker': ticker, 'order_id': None, 'contracts': 0}
 
     now_utc      = datetime.now(timezone.utc)
     commence_utc = pd.Timestamp(commence).tz_convert('UTC').to_pydatetime()
@@ -297,12 +313,12 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
             return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
         price_cents = round(order_price * 100)
-        contracts   = kelly_contracts(fair_prob, order_price, bankroll, fee_rate)
+        contracts   = resolve_contracts(signal_row, fair_prob, order_price, bankroll,
+                                        fee_rate, size_mult)
 
-    if contracts <= 0:
+    if contracts is None:
         return {'status': 'skipped', 'reason': 'zero_contracts',
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
-    contracts = max(1, round(contracts * size_mult))
     if contracts * order_price > bankroll:
         return {'status': 'skipped', 'reason': 'insufficient_cash',
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
@@ -330,7 +346,8 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
         max_duration=max_duration, pre_event_buffer=pre_event_buffer,
         dashboard=dashboard, stop_event=stop_event,
     )
-    final_status = _final_order_status(order_id).get('status', 'unknown')
+    final = _final_order_status(order_id)
+    final_status = final.get('status', 'unknown')
     _log_result(
         order_id=order_id, sport=sport, outcome=outcome,
         k_ticker=ticker, commence=commence, pt_zone=pt_zone, pt_side='yes',
@@ -338,6 +355,7 @@ def run_prospect_trade(signal_row: pd.Series, bankroll: float,
         yes_ask_at_signal=yes_ask, entry_price=order_price,
         fee_rate=fee_rate, ev_per_contract=ev, contracts=contracts,
         final_status=final_status, close_reason=reason,
+        filled=filled_count(final),
     )
     return {
         'order_id': order_id, 'ticker': ticker, 'outcome': outcome,
@@ -370,6 +388,10 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
         dropped = before - len(active)
         if dropped:
             log.info('[dedup] Skipped %d ticker(s) with existing open positions', dropped)
+        _opp = opposite_leg_blocked(active['k_ticker'].tolist(), _open)
+        if _opp:
+            log.info('[dedup] Skipped %d ticker(s) — opposite leg of the event already held', len(_opp))
+            active = active[~active['k_ticker'].isin(_opp)].copy()
 
     if stop_event is None:
         stop_event = threading.Event()

@@ -34,7 +34,7 @@ KALSHI_POLL       = 10     # seconds between Kalshi status checks
 PINNACLE_POLL     = 120    # seconds between Pinnacle re-checks
 MAX_DURATION      = 1800   # 30 min max order lifetime (seconds)
 PRE_EVENT_BUFFER  = 300    # cancel 5 min before event start (seconds)
-MIN_NOTIONAL      = 5.0    # floor $ risked per trade — see kelly_contracts() docstring
+MIN_NOTIONAL      = 2.0    # floor $ risked per trade — see kelly_contracts() docstring (halved from 5.0 per user request)
 
 # Statuses Kalshi uses to indicate an order is no longer open
 _CLOSED_STATUSES = {'filled', 'executed', 'canceled', 'expired'}
@@ -111,6 +111,29 @@ def kelly_contracts(fair_prob: float, price: float, bankroll: float,
     partial    = _kelly_fraction(ev / price)   # ROI = ev per dollar at risk
     dollar_bet = max(bankroll * full_kelly * partial, MIN_NOTIONAL)
     return max(floor(dollar_bet / price), 1)
+
+
+def resolve_contracts(signal_row, fair_prob: float, price: float, bankroll: float,
+                      fee_rate: float, size_mult: float = 1.0) -> Optional[int]:
+    """
+    Contract count for one order: a manual size typed directly into the web
+    UI's signals table (signal_row['contracts_override']) always wins over
+    Kelly sizing when present and positive — the trader took direct control,
+    so size_mult (a blanket Kelly multiplier) doesn't apply on top of it.
+    Absent an override, falls back to kelly_contracts() * size_mult, same as
+    before this existed.
+
+    Returns None if the resulting size is non-positive — the caller should
+    treat that exactly like kelly_contracts() returning 0 (skip the trade),
+    not place a zero-contract order.
+    """
+    override = signal_row.get('contracts_override') if hasattr(signal_row, 'get') else None
+    if override is not None and not pd.isna(override) and override > 0:
+        return int(round(override))
+    contracts = kelly_contracts(fair_prob, price, bankroll, fee_rate)
+    if contracts <= 0:
+        return None
+    return max(1, round(contracts * size_mult))
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +270,14 @@ def cancel_order(ticker: str, order_id: str, max_retries: int = 4) -> bool:
                        order_id, delay, attempt + 1, max_retries)
             time.sleep(delay)
             continue
+        if resp.status_code == 404:
+            # Kalshi 404s a DELETE on an order that's already gone. Concurrent cancellers
+            # (a monitor thread + "Cancel all", or ensure_canceled's retry after a
+            # first success) routinely race — the loser sees 404 even though the order
+            # IS canceled. Confirm with a GET rather than reporting a false failure.
+            if get_order_status(order_id).get('status') in _CLOSED_STATUSES:
+                log.info('cancel_order: %s already closed (lost a cancel race) — ok', order_id)
+                return True
         log.warning('cancel_order failed for %s (%s): %s %s — %s',
                     order_id, ticker, resp.status_code, resp.reason, resp.text)
         return False
@@ -329,6 +360,77 @@ def get_market_prices(ticker: str) -> dict:
         return result
     log.warning('get_market_prices failed for %s: %s %s', ticker, resp.status_code, resp.reason)
     return {}
+
+
+def get_orderbook_depth(ticker: str, levels: int = 2) -> dict:
+    """
+    Fetch the top `levels` YES-side bid and ask levels for a market, each with
+    the resting notional (price × quantity, in dollars), plus the last traded
+    price. For the click-to-inspect order panel in the live dashboard.
+
+    Kalshi's V2 orderbook (GET /markets/{ticker}/orderbook) only carries two
+    ladders — 'yes_dollars' (YES bids) and 'no_dollars' (NO bids), both
+    ascending by price with the LAST entry being the best (highest, i.e.
+    top-of-book). There's no separate YES-ask ladder because an order to sell
+    YES at price P is economically identical to a bid to buy NO at (1 - P), so
+    YES asks are derived from the NO-bid ladder: yes_ask = 1 - no_bid, same
+    quantity, best NO bid -> best (lowest) YES ask.
+
+    Returns {'last_price_cents': int|None, 'bids': [...], 'asks': [...]} where
+    each level is {'price_cents', 'qty', 'dollars'}, best-of-book first. On
+    any failure (network/HTTP/malformed body) returns {} (logged) — callers
+    should treat that as "depth unavailable right now", not a fatal error.
+    """
+    path = f'/trade-api/v2/markets/{ticker}/orderbook'
+    try:
+        resp = requests.get(f'{BASE_URL}/markets/{ticker}/orderbook',
+                            headers=kalshi_headers('GET', path),
+                            params={'depth': max(levels, 5)})
+    except requests.exceptions.RequestException as exc:
+        log.warning('get_orderbook_depth network failure for %s: %s', ticker, exc)
+        return {}
+    if not resp.ok:
+        log.warning('get_orderbook_depth failed for %s: %s %s', ticker, resp.status_code, resp.reason)
+        return {}
+
+    try:
+        book    = resp.json().get('orderbook_fp') or {}
+        yes_raw = book.get('yes_dollars') or []
+        no_raw  = book.get('no_dollars')  or []
+
+        def _parse(raw_levels):
+            out = []
+            for p_str, q_str in raw_levels:
+                try:
+                    out.append((float(p_str), float(q_str)))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        yes_bids = sorted(_parse(yes_raw), key=lambda t: -t[0])[:levels]
+        no_bids  = sorted(_parse(no_raw),  key=lambda t: -t[0])[:levels]
+        yes_asks = sorted(((round(1 - p, 2), q) for p, q in no_bids), key=lambda t: t[0])
+
+        def _fmt(pairs):
+            return [{'price_cents': round(p * 100), 'qty': round(q, 2), 'dollars': round(p * q, 2)}
+                    for p, q in pairs]
+
+        result = {'last_price_cents': None, 'bids': _fmt(yes_bids), 'asks': _fmt(yes_asks)}
+    except Exception:
+        log.exception('get_orderbook_depth: malformed orderbook response for %s', ticker)
+        return {}
+
+    m_path = f'/trade-api/v2/markets/{ticker}'
+    try:
+        m_resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=kalshi_headers('GET', m_path))
+        if m_resp.ok:
+            lp = m_resp.json().get('market', {}).get('last_price_dollars')
+            if lp is not None:
+                result['last_price_cents'] = round(float(lp) * 100)
+    except Exception:
+        log.warning('get_orderbook_depth: last-price lookup failed for %s (depth still returned)', ticker)
+
+    return result
 
 
 def _rest_price_cents(bid_cents: Optional[int], ask_cents: int) -> int:
@@ -451,6 +553,60 @@ def cross_and_cancel_order(ticker: str, order_id: str, contracts: int,
         return {'action': 'error', 'ticker': ticker, 'reason': str(exc)}
 
 
+def resize_resting_order(ticker: str, order_id: str, side: str,
+                         new_total_contracts: int, price_cents: int,
+                         expiration_ts: Optional[int] = None) -> dict:
+    """
+    Resize a resting order to a new TOTAL contract count. Kalshi has no
+    amend-in-place, so this cancels the current resting order and re-places
+    one for (new_total - already_filled) at the same price, still post_only
+    (stays a resting maker order, never crosses).
+
+    new_total_contracts is the desired FINAL size, not "add N more" — e.g. an
+    order resting for 10 with 3 already filled, resized to 8, places a new
+    order for 5 (8 - 3), not 8. The already-filled 3 are a done trade; you
+    can't shrink below what's already filled, and this refuses to try rather
+    than silently placing something that doesn't match what was asked for.
+
+    If expiration_ts is left unset, the new order gets a fresh MAX_DURATION
+    window from now — Kalshi's order response doesn't reliably echo back the
+    original expiration_time to reuse it, and giving the resized order no TTL
+    at all would leave it resting indefinitely with none of the bot's usual
+    auto-cancel-before-event-start monitoring (this was placed manually, so
+    there's no monitor thread watching it).
+    """
+    order    = get_order_status(order_id)
+    fill_fp  = order.get('fill_count_fp')
+    already_filled = round(float(fill_fp)) if fill_fp is not None else 0
+    if expiration_ts is None:
+        expiration_ts = int(time.time()) + MAX_DURATION
+
+    if new_total_contracts <= already_filled:
+        return {'action': 'error', 'ticker': ticker,
+                'reason': f'{already_filled} already filled — cannot resize to '
+                         f'{new_total_contracts} (must be greater)'}
+
+    new_remaining = new_total_contracts - already_filled
+
+    if not ensure_canceled(ticker, order_id):
+        return {'action': 'error', 'ticker': ticker, 'reason': 'could not confirm cancel'}
+
+    try:
+        new_order = place_order(ticker, price_cents, new_remaining, side=side,
+                                expiration_ts=expiration_ts, post_only=True)
+        return {
+            'action':         'resized',
+            'ticker':         ticker,
+            'new_order_id':   new_order.get('order_id'),
+            'already_filled': already_filled,
+            'new_remaining':  new_remaining,
+            'new_total':      new_total_contracts,
+        }
+    except Exception as exc:
+        log.exception('resize_resting_order: re-place failed for %s', ticker)
+        return {'action': 'error', 'ticker': ticker, 'reason': f'place failed: {exc}'}
+
+
 def cancel_and_rerest(
     ticker: str, order_id: str, remaining_contracts: int,
     price_cents: int, side: str, commence_str: str,
@@ -494,6 +650,43 @@ def cancel_and_rerest(
         return {'action': 'error', 'ticker': ticker, 'reason': f'place failed: {exc}'}
 
 
+OPEN_ORDER_STATUSES = {'resting', 'open', 'pending'}
+
+
+def list_resting_orders() -> list:
+    """
+    Every currently-resting order on Kalshi, live — the same live-first
+    principle as positions.open_tickers(): don't infer "what's open" from our
+    own logs, ask Kalshi. Used by cancel_all.py and the web UI's "Cancel All
+    Orders" panic button, which both cancel EVERYTHING resting regardless of
+    which strategy or session placed it.
+    """
+    path = '/trade-api/v2/portfolio/orders'
+    resp = requests.get(f'{BASE_URL}/portfolio/orders',
+                        headers=kalshi_headers('GET', path),
+                        params={'status': 'resting', 'limit': 200})
+    resp.raise_for_status()
+    orders = resp.json().get('orders', [])
+    return [o for o in orders if o.get('status') in OPEN_ORDER_STATUSES]
+
+
+def cancel_all_resting_orders() -> dict:
+    """
+    Cancel every resting order on Kalshi, verified (via ensure_canceled — ping
+    and keep trying, not trust-the-first-response). Returns
+    {'total', 'canceled', 'failed': [(order_id, ticker), ...]}.
+    """
+    orders = list_resting_orders()
+    result = {'total': len(orders), 'canceled': 0, 'failed': []}
+    for o in orders:
+        oid, ticker = o.get('order_id'), o.get('ticker')
+        if ensure_canceled(ticker, oid):
+            result['canceled'] += 1
+        else:
+            result['failed'].append((oid, ticker))
+    return result
+
+
 def get_order_status(order_id: str) -> dict:
     """
     Fetch the current state of an order directly from Kalshi.
@@ -527,6 +720,12 @@ def get_order_status(order_id: str) -> dict:
 
     # 3. Could not confirm status — return unknown so monitor keeps running
     return {'status': 'unknown', 'order_id': order_id}
+
+
+def filled_count(order: dict) -> int:
+    """Contracts actually filled on an order, per Kalshi's fill_count_fp."""
+    fill_fp = order.get('fill_count_fp')
+    return round(float(fill_fp)) if fill_fp is not None else 0
 
 
 def _final_order_status(order_id: str, retries: int = 4, delay: float = 0.5) -> dict:

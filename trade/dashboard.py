@@ -72,6 +72,9 @@ class Dashboard:
                      side: str = 'yes', commence: str = ''):
         with self._lock:
             self._positions[order_id] = {
+                'order_id':     order_id,          # also the dict key — kept as a field
+                                                    # too so callers iterating .values()
+                                                    # (e.g. the live-resize UI) still have it
                 'ticker':       ticker,
                 'outcome':      outcome,
                 'contracts':    contracts,
@@ -239,6 +242,9 @@ class StreamlitDashboard:
                      side: str = 'yes', commence: str = ''):
         with self._lock:
             self._positions[order_id] = {
+                'order_id':    order_id,          # also the dict key — kept as a field
+                                                   # too so callers iterating .values()
+                                                   # (e.g. the live-resize UI) still have it
                 'ticker':      ticker,
                 'outcome':     outcome,
                 'contracts':   contracts,

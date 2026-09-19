@@ -89,10 +89,18 @@ def get_order(order_id: str) -> dict:
     return r.json().get('order', {})
 
 
-def cancel_order(order_id: str) -> bool:
-    path = f'/trade-api/v2/portfolio/events/orders/{order_id}'
+def cancel_order(order_id: str, ticker: str = None) -> bool:
+    """
+    `ticker` should always be passed when known — without it (or its
+    market_ticker query param) Kalshi routes the DELETE to exchange shard 0 and
+    silently 404s on anything sharded elsewhere (MLB/Tennis = shard 3, Combos =
+    1, Crypto = 2). See trade/core/execution.py's cancel_order for the same fix
+    applied to the production path.
+    """
+    path   = f'/trade-api/v2/portfolio/events/orders/{order_id}'
+    params = {'market_ticker': ticker} if ticker else None
     r = requests.delete(f'{BASE_URL}/portfolio/events/orders/{order_id}',
-                        headers=kalshi_headers('DELETE', path))
+                        headers=kalshi_headers('DELETE', path), params=params)
     return r.ok
 
 
@@ -104,8 +112,10 @@ def run_test(ticker: str, contracts: int, ttl_minutes: int,
     # Cancel-only mode: cancel provided order IDs and exit
     if cancel_only:
         for oid in cancel_only:
-            ok = cancel_order(oid)
-            print(f'Cancel {oid}: {"OK" if ok else "FAILED"}')
+            order  = get_order(oid)
+            ticker = order.get('ticker')
+            ok = cancel_order(oid, ticker)
+            print(f'Cancel {oid} ({ticker}): {"OK" if ok else "FAILED"}')
         return
 
     # ── Fetch current order book ──────────────────────────────────────────
@@ -266,7 +276,7 @@ def run_test(ticker: str, contracts: int, ttl_minutes: int,
     # Cancel anything still open
     for label, oid in [('A', oid_a), ('B', oid_b)]:
         if results.get(label) is None and oid:
-            ok = cancel_order(oid)
+            ok = cancel_order(oid, ticker)
             print(f'  Canceled order {label} ({oid}): {"OK" if ok else "FAILED"}')
             results[label] = 'canceled_by_test'
 

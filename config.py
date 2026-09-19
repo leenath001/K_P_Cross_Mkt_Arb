@@ -22,6 +22,7 @@ SPORTS = [
 # Used in the dashboard to show an in-season indicator per sport.
 SEASON_MONTHS = {
     "americanfootball_ncaaf":               [8, 9, 10, 11, 12, 1],
+    "americanfootball_nfl":                 [9, 10, 11, 12, 1],
     "aussierules_afl":                      [3, 4, 5, 6, 7, 8, 9],
     "baseball_mlb":                         [3, 4, 5, 6, 7, 8, 9, 10],
     "basketball_euroleague":                [10, 11, 12, 1, 2, 3, 4, 5],
@@ -81,6 +82,10 @@ SPORTS_CONFIG = {
     "americanfootball_ncaaf": {
         "label": "College Football",
         "ticker": "KXNCAAFGAME"      # confirmed
+    },
+    "americanfootball_nfl": {
+        "label": "NFL",
+        "ticker": "KXNFLGAME"        # confirmed
     },
     # ── Aussie Rules ─────────────────────────────────────────────────
     "aussierules_afl": {

@@ -17,7 +17,7 @@ import pandas as pd
 import config
 from theODDS.p_helpers import pinnacle_odds, get_api_usage, fetch_usage
 from KALSHI.k_helpers import kalshi_odds, prospect_signals
-from bot import get_balance, kelly_contracts, _ev, TAKER_FEE, MAKER_FEE
+from trade.core.execution import get_balance, kelly_contracts, _ev, TAKER_FEE, MAKER_FEE
 
 # ── Args ────────────────────────────────────────────────────────────────────
 
@@ -235,7 +235,7 @@ else:
     print(f'\n  {len(approved_df)} signal(s) approved — launching...\n')
 
     import threading
-    from prospect import run_prospect_signals
+    from trade.strategies.prospect import run_all_signals as run_prospect_signals
     from dashboard import Dashboard
 
     stop_event = threading.Event()

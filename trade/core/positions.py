@@ -83,3 +83,71 @@ def open_tickers() -> set:
     not per-row — two cheap GETs regardless of how many signals are being scanned.
     """
     return _open_position_tickers() | _resting_order_tickers()
+
+
+def position_open(ticker: str) -> bool:
+    """
+    True if we currently hold a non-zero position on this exact ticker, live
+    from Kalshi. Used by settle.py to notice a position that was manually
+    closed (sold back) before the market settled — something a pure
+    "did the market settle" check would never catch on its own.
+    """
+    return ticker in _open_position_tickers()
+
+
+# ── Opposite-leg (same-event) exposure ───────────────────────────────────────
+# On a 2-outcome event (A vs B) Kalshi lists one market per side, so "YES A" and
+# "NO B" are the SAME bet on different tickers (and YES A + YES B is a guaranteed
+# partial loss). Ticker-keyed dedup can't see that. 3-way events (a -TIE market
+# exists) are left alone — YES A and NO B are genuinely different bets there.
+
+_EVENT_MARKET_COUNT: dict = {}
+
+
+def event_of(ticker: str) -> str:
+    return ticker.rsplit('-', 1)[0]
+
+
+def is_two_way_event(event_ticker: str) -> bool:
+    """True if the Kalshi event has exactly 2 markets. Fails CLOSED (True) if it can't be checked."""
+    if event_ticker in _EVENT_MARKET_COUNT:
+        return _EVENT_MARKET_COUNT[event_ticker] == 2
+    path = '/trade-api/v2/markets'
+    try:
+        resp = requests.get(f'{BASE_URL}/markets', headers=kalshi_headers('GET', path),
+                            params={'event_ticker': event_ticker, 'limit': 20})
+        if not resp.ok:
+            log.warning('is_two_way_event %s failed: %s', event_ticker, resp.status_code)
+            return True
+        n = len(resp.json().get('markets', []))
+    except requests.exceptions.RequestException:
+        log.exception('is_two_way_event: network failure for %s', event_ticker)
+        return True
+    _EVENT_MARKET_COUNT[event_ticker] = n
+    return n == 2
+
+
+def opposite_leg_blocked(tickers, open_set: set) -> set:
+    """Subset of `tickers` whose 2-way event already has exposure on a DIFFERENT ticker."""
+    open_events: dict = {}
+    for t in open_set:
+        open_events.setdefault(event_of(t), set()).add(t)
+    blocked = set()
+    for t in tickers:
+        ev = event_of(t)
+        if open_events.get(ev, set()) - {t} and is_two_way_event(ev):
+            blocked.add(t)
+    return blocked
+
+
+def drop_same_event_duplicates(df, score_col: str = '_score'):
+    """Within one batch, keep only the best-scoring row per 2-way event."""
+    if df.empty:
+        return df
+    keep = []
+    for _, grp in df.groupby(df['k_ticker'].map(event_of), sort=False):
+        if len(grp) > 1 and is_two_way_event(event_of(grp['k_ticker'].iloc[0])):
+            keep.append(grp[score_col].idxmax())
+        else:
+            keep.extend(grp.index)
+    return df.loc[[i for i in df.index if i in set(keep)]]

@@ -17,7 +17,7 @@ import pandas as pd
 import config
 from theODDS.p_helpers import pinnacle_odds, get_api_usage, fetch_usage
 from KALSHI.k_helpers import kalshi_odds
-from bot import get_balance, kelly_contracts
+from trade.core.execution import get_balance, kelly_contracts
 
 # ── Args ────────────────────────────────────────────────────────────────────
 
@@ -109,7 +109,7 @@ print(matched_df[['sport', 'outcome', 'fair_prob', 'yes_ask', 'match_score', 'si
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-from bot import _ev, TAKER_FEE, MAKER_FEE
+from trade.core.execution import _ev, TAKER_FEE, MAKER_FEE
 
 def _order_params(row, taker_fee, maker_fee, mode='rest'):
     """
@@ -231,7 +231,7 @@ else:
     print(f'\n  {len(approved_df)} signal(s) approved — launching...\n')
 
     import threading
-    from bot import run_all_signals
+    from trade.strategies.kp_arb import run_all_signals
     from dashboard import Dashboard
 
     stop_event = threading.Event()
@@ -255,7 +255,7 @@ else:
     # ── Trade summary ────────────────────────────────────────────────────────
     filled = [r for r in (results or []) if r and r.get('status') in ('executed', 'filled')]
     if filled:
-        from bot import _ev
+        from trade.core.execution import _ev
         print('=' * 60)
         print('TRADE SUMMARY')
         print('=' * 60)

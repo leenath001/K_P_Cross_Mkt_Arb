@@ -10,26 +10,11 @@ import os, sys, argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import requests
-from KALSHI.k_helpers import kalshi_headers
-from bot import cancel_order
-
-BASE_URL = 'https://api.elections.kalshi.com/trade-api/v2'
-OPEN_STATUSES = {'resting', 'open', 'pending'}
-
-
-def list_open_orders() -> list:
-    path = '/trade-api/v2/portfolio/orders'
-    resp = requests.get(f'{BASE_URL}/portfolio/orders',
-                        headers=kalshi_headers('GET', path),
-                        params={'status': 'resting', 'limit': 200})
-    resp.raise_for_status()
-    return resp.json().get('orders', [])
+from trade.core.execution import ensure_canceled, list_resting_orders
 
 
 def main(dry_run: bool):
-    orders = list_open_orders()
-    orders = [o for o in orders if o.get('status') in OPEN_STATUSES]
+    orders = list_resting_orders()
     if not orders:
         print('No open orders.')
         return
@@ -43,12 +28,17 @@ def main(dry_run: bool):
     print()
     ok = 0
     for o in orders:
-        oid = o.get('order_id')
-        if cancel_order(oid):
-            print(f'  canceled {oid}')
+        oid    = o.get('order_id')
+        ticker = o.get('ticker')
+        # ensure_canceled passes ticker as market_ticker so Kalshi routes the
+        # DELETE to the correct exchange shard (MLB/Tennis = shard 3, Combos = 1,
+        # Crypto = 2) instead of silently defaulting to shard 0, and verifies the
+        # cancel actually took by re-polling status rather than trusting one call.
+        if ensure_canceled(ticker, oid):
+            print(f'  canceled {oid}  {ticker}')
             ok += 1
         else:
-            print(f'  FAILED  {oid}')
+            print(f'  FAILED  {oid}  {ticker}')
     print(f'\nCanceled {ok}/{len(orders)} orders.')
 
 
