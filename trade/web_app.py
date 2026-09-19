@@ -1362,7 +1362,8 @@ with tab_review:
 
                     _NO_DATA = dict(showarrow=False, xref='paper', yref='paper', x=0.5, y=0.5,
                                     font=dict(color='gray'))
-                    _CHART_LAYOUT = dict(height=340, margin=dict(t=40, b=30))
+                    _CHART_LAYOUT = dict(height=340, margin=dict(t=40, b=30),
+                                         xaxis=dict(hoverformat='.3f'), yaxis=dict(hoverformat='.3f'))
 
                     filled_sorted = filled.sort_values('logged_at').copy()
 
@@ -1455,20 +1456,34 @@ with tab_review:
                             _hi   = max(_sim_m.max(), _sim_k.max(), _real)
                             _bins = np.linspace(_lo, _hi, 70)
                             _mid  = (_bins[:-1] + _bins[1:]) / 2
-                            _dm, _ = np.histogram(_sim_m, bins=_bins, density=True)
-                            _dk, _ = np.histogram(_sim_k, bins=_bins, density=True)
-                            fig1.add_trace(go.Scatter(x=_mid, y=_dm, mode='lines', fill='tozeroy',
+                            _w = _bins[1] - _bins[0]
+                            def _smooth(d, sigma=2.0):
+                                # Gaussian-kernel smoothing of the histogram (edge-normalised),
+                                # then renormalised to sum to 1 so bin probabilities stay valid.
+                                k  = np.arange(-int(4 * sigma), int(4 * sigma) + 1)
+                                ker = np.exp(-0.5 * (k / sigma) ** 2); ker /= ker.sum()
+                                sm = np.convolve(d, ker, 'same') / np.convolve(np.ones_like(d), ker, 'same')
+                                return sm / sm.sum()          # probability mass per bin
+                            _pm = _smooth(np.histogram(_sim_m, bins=_bins)[0].astype(float))
+                            _pk = _smooth(np.histogram(_sim_k, bins=_bins)[0].astype(float))
+                            _tip = ('EV $%{customdata[0]:.3f}<br>P(this outcome) %{customdata[1]:.3f}'
+                                    '<extra>%{fullData.name}</extra>')
+                            # Tooltip EV = PnL × probability of landing in that PnL bin.
+                            fig1.add_trace(go.Scatter(x=_mid, y=_pm / _w, mode='lines', fill='tozeroy',
                                                       name='Model (fair_prob)',
-                                                      line=dict(color='#3498db', width=2),
+                                                      line=dict(color='#3498db', width=2, shape='spline'),
                                                       fillcolor='rgba(52,152,219,0.25)',
-                                                      hovertemplate='PnL $%{x:+.0f}<extra>model</extra>'))
-                            fig1.add_trace(go.Scatter(x=_mid, y=_dk, mode='lines',
+                                                      customdata=np.stack([_mid * _pm, _pm], axis=-1),
+                                                      hovertemplate=_tip))
+                            fig1.add_trace(go.Scatter(x=_mid, y=_pk / _w, mode='lines',
                                                       name='Market (price = odds)',
-                                                      line=dict(color='#888', width=2, dash='dash'),
-                                                      hovertemplate='PnL $%{x:+.0f}<extra>market</extra>'))
+                                                      line=dict(color='#888', width=2, dash='dash',
+                                                                shape='spline'),
+                                                      customdata=np.stack([_mid * _pk, _pk], axis=-1),
+                                                      hovertemplate=_tip))
                             fig1.add_vline(x=_real, line_color='#f39c12', line_width=2.5)
                             fig1.add_vline(x=0, line_color='#888', line_width=1)
-                            fig1.add_annotation(x=_real, y=1, yref='paper', text=f'Realized ${_real:+.0f}',
+                            fig1.add_annotation(x=_real, y=1, yref='paper', text=f"Realized {'-' if _real < 0 else ''}${abs(_real):.3f}",
                                                 showarrow=False, yanchor='bottom', font=dict(color='#f39c12'))
                             fig1.update_layout(legend=dict(orientation='h', yanchor='top', y=-0.22,
                                                            xanchor='center', x=0.5))
