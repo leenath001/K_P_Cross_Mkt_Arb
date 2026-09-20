@@ -1,0 +1,291 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+:root{--bg:#0e1117;--fg:#e6e6e6;--card:#161a23;--line:#2a2f3a;--muted:#8b93a1;--green:#2ecc71;--red:#e74c3c;--gold:#f5b301;--blue:#4c9be8}
+*{box-sizing:border-box}
+body{margin:0;background:transparent;color:var(--fg);font:12px/1.35 "Source Sans Pro",system-ui,sans-serif}
+#board{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:stretch}
+#board.one{grid-template-columns:minmax(0,1fr)}
+#board:not(.one) .card{display:flex;flex-direction:column;min-height:318px}
+#board:not(.one) .dyn{flex:1;min-height:0}
+#board:not(.one) .ctl{margin-top:auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:0}
+.card.dragging{opacity:.4}.card.over{outline:2px dashed var(--gold)}.card.hidden{display:none}
+.hd{display:flex;align-items:flex-start;gap:8px;margin-bottom:4px}
+.hd .main{flex:1;min-width:0}
+.grip{cursor:grab;color:var(--muted);font-size:16px;user-select:none;padding:0 2px}
+.ttl{font-weight:700;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sub{color:var(--muted);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badges{display:flex;flex-wrap:nowrap;gap:4px;margin-top:3px;overflow:hidden}
+.badge{border:1px solid var(--line);border-radius:10px;padding:0 7px;font-size:10px;color:var(--muted);white-space:nowrap}
+.badge.q{background:#5a1f1f;border-color:#a33;color:#ffb3b3}
+.badge.zero{border-color:#2c6b45;color:#7fd9a2}
+.badge.warn{color:#f5b301;border-color:#8a6d10;min-width:0;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto}
+.badge.pause{background:#4a3a12;border-color:#a8801a;color:#ffd97a}
+button{background:transparent;border:1px solid var(--line);color:var(--fg);border-radius:4px;cursor:pointer;font:inherit}
+button.xp{font-size:14px;padding:0 7px;line-height:20px}
+.pane h4{margin:6px 0 4px;font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.card.wide .dyn{display:grid;grid-template-columns:260px minmax(0,1fr) 300px;gap:14px}
+.ladder{font-variant-numeric:tabular-nums}
+.row{position:relative;display:flex;justify-content:space-between;align-items:center;padding:1px 6px;height:17px;overflow:hidden}
+.row .bar{position:absolute;top:0;bottom:0;right:0;opacity:.25}
+.row.ask .bar{background:var(--red)}.row.bid .bar{background:var(--green)}
+.row .px,.row .sz{position:relative;z-index:1}
+.row.ask .px{color:var(--red)}.row.bid .px{color:var(--green)}.row.mid .px{color:var(--muted)}
+.you{color:var(--gold);font-weight:700;font-size:10px;margin-left:6px}
+.row.our{border-left:3px solid var(--gold);background:rgba(245,179,1,.10);cursor:ns-resize;touch-action:none}
+.row.drop{outline:2px solid var(--gold);outline-offset:-2px;background:rgba(245,179,1,.25)}
+.row.bad{outline:2px solid var(--red)}.row.qdrag{opacity:.6}
+.xbtn{position:relative;z-index:2;margin-left:6px;cursor:pointer;color:var(--gold);font-size:12px}
+.gapdots{text-align:center;color:var(--muted);line-height:8px;height:8px;font-size:10px}
+.spread{text-align:center;color:var(--muted);border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:2px;margin:2px 0;font-size:11px}
+svg{width:100%;height:auto;display:block;background:rgba(255,255,255,.02);border-radius:4px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}
+.tile{border:1px solid var(--line);border-radius:5px;padding:3px 6px}
+.tile .k{color:var(--muted);font-size:10px}.tile .v{font-weight:700;font-variant-numeric:tabular-nums}
+.pos{color:var(--green)}.neg{color:var(--red)}
+table.ord{width:100%;border-collapse:collapse;margin-top:4px;font-size:11px}
+table.ord td,table.ord th{padding:1px 4px;text-align:left;border-bottom:1px solid var(--line)}
+.note{color:var(--gold);margin-top:4px;font-size:11px}
+.inv{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;margin-top:4px}
+.inv .tile{padding:2px 6px}
+.inv .tile .v{font-size:12px}
+.empty{color:var(--muted);padding:30px;text-align:center}
+.ctl{display:flex;align-items:center;gap:8px;margin-top:8px;padding-top:6px;border-top:1px solid var(--line)}
+.ctl label{color:var(--muted);font-size:11px}
+.ctl input{width:72px;background:transparent;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:3px 8px;font:inherit;text-align:center;cursor:text}
+.ctl input:focus{outline:none;border-color:var(--gold);box-shadow:0 0 0 1px var(--gold)}
+.ctl button{padding:2px 12px}
+.ctl button.cancel{border-color:#a33;color:#ffb3b3}.ctl button.resume{border-color:#2c6b45;color:#7fd9a2}
+.ctl .sp{flex:1}
+</style>
+</head>
+<body>
+<div id="board"></div>
+<script>
+const KEY='mm_layout_v2';
+let layout={order:[]}, state=null, dragging=null, qdrag=null, expanded=null;
+try{layout=Object.assign(layout,JSON.parse(localStorage.getItem(KEY)||'{}'))}catch(e){}
+const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(layout))}catch(e){}};
+const send=(type,data)=>window.parent.postMessage(Object.assign({isStreamlitMessage:true,type},data||{}),'*');
+const fmt=(v,d=3)=>v==null?'—':(+v).toFixed(d);
+const cls=v=>v==null?'':(v>0?'pos':(v<0?'neg':''));
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const board=document.getElementById('board');
+let lastH=0;
+function setHeight(){const h=Math.max(120,Math.ceil(document.getElementById('board').getBoundingClientRect().bottom+window.scrollY)+6);if(Math.abs(h-lastH)>2){lastH=h;send('streamlit:setFrameHeight',{height:h})}}
+window.addEventListener('error',e=>{document.body.insertAdjacentHTML('afterbegin','<div class="note" style="color:#ff8080">board error: '+String(e.message).replace(/</g,'&lt;')+'</div>')});
+
+// ---- actions to Python: queued, one in flight, released when the engine acks the nonce
+const queue=[]; let inflight=null, inflightAt=0;
+function pump(){
+  if(inflight&&Date.now()-inflightAt<4000)return;
+  if(!queue.length){inflight=null;return}
+  inflight=queue[0]; inflightAt=Date.now();
+  send('streamlit:setComponentValue',{value:inflight,dataType:'json'});
+}
+function act(a){a.nonce=Date.now()+Math.random();queue.push(a);pump()}
+const pending={};   // ticker|side -> {price,t}: a dragged quote is shown at its new price until the engine confirms
+const pendingSize={};
+function applyPending(ms){ms.forEach(m=>{
+  m.orders=m.orders.map(o=>{const k=m.ticker+'|'+o.side,pd=pending[k]; if(!pd)return o;
+    if(Date.now()-pd.t>8000||Math.abs(o.price_c-pd.price)<1e-6){delete pending[k];return o}
+    return Object.assign({},o,{price_c:pd.price,manual:true})});
+  const ps=pendingSize[m.ticker]; if(ps){if(Date.now()-ps.t>8000||m.size===ps.v)delete pendingSize[m.ticker];else m.size=ps.v}})}
+
+// ---- pieces
+function ladder(m,n,compact){
+  const tick=m.tick_c||1, bb=m.bids.length?m.bids[0][0]:null, ba=m.asks.length?m.asks[0][0]:null;
+  if(bb==null||ba==null)return '<div class="empty">no book</div>';
+  const K=p=>(+p).toFixed(3), sizes=new Map();
+  m.bids.forEach(b=>sizes.set(K(b[0]),b[1])); m.asks.forEach(a=>sizes.set(K(a[0]),a[1]));
+  const our={}; m.orders.forEach(o=>{our[K(o.price_c)]=o});
+  const prices=new Set(), add=p=>prices.add(K(p));
+  for(let i=0;i<=n;i++){add(ba+i*tick);add(bb-i*tick)}
+  const gap=Math.round((ba-bb)/tick);
+  const showAll=compact?2:12, edge=compact?1:3;
+  if(gap<=showAll){for(let i=1;i<gap;i++)add(bb+i*tick)}else{for(let i=1;i<=edge;i++){add(bb+i*tick);add(ba-i*tick)}}
+  Object.keys(our).forEach(k=>{const p=+k; if(p<ba+n*tick+1e-9&&p>bb-n*tick-1e-9)add(p)});
+  const list=[...prices].map(Number).sort((a,b)=>b-a), maxSz=Math.max(1,...[...sizes.values()]);
+  let out='',prev=null;
+  list.forEach(p=>{
+    if(prev!=null&&prev-p>tick*1.5+1e-9&&prev>bb+1e-9&&p<ba-1e-9)out+='<div class="gapdots">⋮</div>';
+    prev=p; const k=K(p), sz=sizes.get(k)||0, o=our[k];
+    const side=p>=ba-1e-9?'ask':(p<=bb+1e-9?'bid':'mid');
+    const mine=o?`<span class="you">◀ YOU ${o.size}${o.manual?' · pinned':''}</span>`+(o.manual?`<span class="xbtn" data-action="clear" data-side="${o.side}" title="back to auto">↺</span>`:''):'';
+    out+=`<div class="row ${side}${o?' our':''}" data-p="${k}" ${o?`data-side="${o.side}"`:''}><span class="bar" style="width:${Math.min(100,sz/maxSz*100)}%"></span><span class="sz">${sz?fmt(sz,0):'·'}</span><span class="px">${fmt(p,1)}${mine}</span></div>`;
+  });
+  return `<div class="ladder" data-bb="${bb}" data-ba="${ba}" data-tick="${tick}">${out}<div class="spread">spread ${fmt(m.stats.spread_c,1)}¢${m.last_c!=null?' · last '+fmt(m.last_c,1)+'¢':''}</div></div>`;
+}
+function depth(m,w,h){
+  const bids=m.bids, asks=m.asks;
+  if(!bids.length||!asks.length)return '<div class="empty">no book</div>';
+  const mid=m.mid_c, own=m.orders.map(o=>o.price_c), ref=[mid,m.fair_c,...own].filter(v=>v!=null);
+  const half=Math.max(6,Math.max(...ref.map(v=>Math.abs(v-mid)))+2), lo=mid-half, hi=mid+half, X=p=>(p-lo)/(hi-lo)*w;
+  const bv=bids.filter(b=>b[0]>=lo), av=asks.filter(a=>a[0]<=hi);
+  let cb=0,ca=0; const bc=bv.map(b=>(cb+=b[1],cb)), ac=av.map(a=>(ca+=a[1],ca));
+  const ymax=Math.max(cb,ca,1)*1.1, Y=v=>h-18-v/ymax*(h-28);
+  const path=(lv,cu,dir)=>{if(!lv.length)return '';let d=`M${X(lv[0][0])},${Y(0)} L${X(lv[0][0])},${Y(cu[0])}`;
+    for(let i=1;i<lv.length;i++)d+=` L${X(lv[i][0])},${Y(cu[i-1])} L${X(lv[i][0])},${Y(cu[i])}`;
+    d+=` L${dir<0?0:w},${Y(cu[cu.length-1])} L${dir<0?0:w},${Y(0)} Z`;return d};
+  const vline=(p,col,dash,lab,yy)=>p==null?'':`<line x1="${X(p)}" x2="${X(p)}" y1="6" y2="${h-18}" stroke="${col}" stroke-width="1.6" ${dash?'stroke-dasharray="4 3"':''}/><text x="${X(p)+3}" y="${yy}" font-size="9" fill="${col}">${lab} ${fmt(p,1)}</text>`;
+  let ticks='';for(let i=0;i<=4;i++){const p=lo+(hi-lo)*i/4;ticks+=`<text x="${X(p)}" y="${h-4}" font-size="9" fill="#8b93a1" text-anchor="${i==0?'start':(i==4?'end':'middle')}">${fmt(p,1)}</text>`}
+  let lines=vline(m.fair_c,'#4c9be8',true,'fair',14);
+  m.orders.forEach((o,i)=>{lines+=vline(o.price_c,'#f5b301',false,o.side==='bid'?'our bid':'our ask',24+i*10)});
+  return `<svg viewBox="0 0 ${w} ${h}"><path d="${path(bv,bc,-1)}" fill="rgba(46,204,113,.25)" stroke="#2ecc71" stroke-width="1.5"/><path d="${path(av,ac,1)}" fill="rgba(231,76,76,.25)" stroke="#e74c3c" stroke-width="1.5"/>${lines}${ticks}</svg>`;
+}
+function stats(m){
+  const s=m.stats, T=(k,v,c)=>`<div class="tile"><div class="k">${k}</div><div class="v ${c||''}">${v}</div></div>`;
+  const usd=v=>(v<0?'-':'')+'$'+Math.abs(v).toFixed(3);
+  return `<div class="stats">`+
+   T('fair (Pinnacle)',fmt(m.fair_c,1)+'¢ <span class="sub">'+m.fair_age_s+'s ago</span>')+
+   T('mid − fair',s.mid_minus_fair_c==null?'—':fmt(s.mid_minus_fair_c,2)+'¢')+
+   T('book spread',fmt(s.spread_c,1)+'¢')+
+   T('our spread',s.quote_spread_c==null?'—':fmt(s.quote_spread_c,1)+'¢','pos')+
+   T('bid off top',s.bid_off_top_ticks==null?'—':s.bid_off_top_ticks+' ticks')+
+   T('ask off top',s.ask_off_top_ticks==null?'—':s.ask_off_top_ticks+' ticks')+
+   T('depth ±5¢ (b/a)',fmt(s.depth_bid_5c,0)+' / '+fmt(s.depth_ask_5c,0))+
+   T('two-sided',s.two_sided_pct+'%')+
+   T('size / side',m.size+' contracts')+
+   T('avg bid fill',s.avg_bid_fill_c==null?'—':fmt(s.avg_bid_fill_c,2)+'¢ <span class="sub">×'+s.bid_qty+'</span>')+
+   T('avg ask fill',s.avg_ask_fill_c==null?'—':fmt(s.avg_ask_fill_c,2)+'¢ <span class="sub">×'+s.ask_qty+'</span>')+
+   T('fills b / a',s.fills_bid+' / '+s.fills_ask)+
+   T('matched pairs',s.matched)+
+   T('locked spread',usd(s.capture_usd),cls(s.capture_usd))+
+   T('inventory',s.inventory,s.inventory?'neg':'')+
+   T('inv mark vs fair',usd(s.mtm_usd),cls(s.mtm_usd))+
+   T('avg edge @ fill',s.avg_edge_at_fill_c==null?'—':fmt(s.avg_edge_at_fill_c,2)+'¢',cls(s.avg_edge_at_fill_c))+
+   T('re-quotes / errors',s.requotes+' / '+s.api_err)+`</div>`;
+}
+function orders(m){
+  if(!m.orders.length)return '<div class="sub" style="margin-top:4px">no quotes resting</div>';
+  return `<table class="ord"><tr><th>side</th><th>price</th><th>size</th><th>filled</th></tr>`+
+    m.orders.map(o=>`<tr><td>${o.side==='bid'?'BUY YES':'SELL YES (buy NO @ '+fmt(100-o.price_c,1)+')'}${o.manual?' · pinned':''}</td><td>${fmt(o.price_c,1)}¢</td><td>${o.size}</td><td>${fmt(o.filled,2)}</td></tr>`).join('')+`</table>`;
+}
+function headHTML(m,wide){
+  const mins=m.mins_to_start, st=mins>=60?(mins/60).toFixed(1)+'h':Math.round(mins)+'m';
+  const b={quoting:['q','QUOTING'],paused:['pause','PAUSED'],waiting:['','WAITING'],off:['','OFF']}[m.status]||['',''];
+  return `<span class="grip" title="drag to move">⠿</span><div class="main"><div class="ttl" title="${esc(m.title)}">${esc(m.title)}</div><div class="sub">${esc(m.outcome)} · ${esc(m.ticker)}</div>`+
+    `<div class="badges"><span class="badge zero">0% fee</span><span class="badge ${b[0]}">${b[1]}</span><span class="badge">starts in ${st}</span>${m.note?`<span class="badge warn" title="${esc(m.note)}">${esc(m.note)}</span>`:''}</div></div>`+
+    `<button class="xp" title="${wide?'back to grid':'expand'}">${wide?'⤡':'⤢'}</button>`;
+}
+function invStrip(m){
+  const s=m.stats, net=s.inventory||0, usd=v=>(v<0?'-':'')+'$'+Math.abs(v).toFixed(3);
+  const T=(k,v,sub,c,tip)=>`<div class="tile" title="${tip}"><div class="k">${k}</div><div class="v ${c||''}">${v}</div>${sub?`<div class="sub">${sub}</div>`:''}</div>`;
+  return `<div class="inv">`+
+    T('Inventory',(net>0?'+':'')+net,net>0?'long YES':(net<0?'long NO':'flat'),net?'neg':'','Net contracts held from market making: bought YES − sold YES. Carried across sessions.')+
+    T('Avg buy',s.avg_bid_fill_c==null?'—':fmt(s.avg_bid_fill_c,1)+'¢',s.bid_qty?'×'+s.bid_qty+' filled':'','','Average price of your bid (buy YES) fills')+
+    T('Avg sell',s.avg_ask_fill_c==null?'—':fmt(s.avg_ask_fill_c,1)+'¢',s.ask_qty?'×'+s.ask_qty+' filled':'','','Average price of your ask (sell YES / buy NO) fills')+
+  `</div>`;
+}
+function dynHTML(m,wide){
+  const note=m.note?`<div class="note">${esc(m.note)}</div>`:'';
+  if(!wide)return ladder(m,3,true)+invStrip(m);   // (the status note shows as a badge in the header)
+  return `<div class="pane"><h4>Order book · drag YOU to move</h4>${ladder(m,8)}</div><div class="pane"><h4>Depth &amp; our quotes</h4>${depth(m,640,300)}${orders(m)}${note}</div><div class="pane"><h4>Stats</h4>${stats(m)}</div>`;
+}
+
+// ---- cards
+function makeCard(t){
+  const el=document.createElement('div'); el.className='card'; el.dataset.t=t;
+  el.innerHTML='<div class="hd"></div><div class="dyn"></div><div class="ctl"><label>Contracts / side</label><input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off" spellcheck="false"><span class="sp"></span><button class="cancel">Cancel</button></div>';
+  board.appendChild(el);
+  el.addEventListener('dragover',e=>{if(!dragging||dragging===el||expanded)return;e.preventDefault();el.classList.add('over');
+    const r=el.getBoundingClientRect(),after=(e.clientX-r.left)>r.width/2;board.insertBefore(dragging,after?el.nextSibling:el)});
+  el.addEventListener('dragleave',()=>el.classList.remove('over'));
+  el.addEventListener('drop',e=>{e.preventDefault();el.classList.remove('over')});
+  el.addEventListener('dragstart',e=>{dragging=el;el.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',t)});
+  el.addEventListener('dragend',()=>{el.classList.remove('dragging');el.draggable=false;dragging=null;
+    layout.order=[...board.children].map(c=>c.dataset.t).filter(Boolean);save();render()});
+  el.addEventListener('mousedown',e=>{el.draggable=!!e.target.closest('.grip')&&!expanded});
+  const inp=el.querySelector('input');
+  const commit=()=>{const cur=state&&state.markets.find(x=>x.ticker===t); let v=Math.max(1,Math.min(25,parseInt(inp.value,10)||(cur?cur.size:1)));
+    inp.value=v; if(cur&&cur.size===v)return; pendingSize[t]={v,t:Date.now()}; act({action:'set_size',ticker:t,size:v})};
+  inp.addEventListener('mousedown',e=>e.stopPropagation());
+  inp.addEventListener('pointerdown',e=>e.stopPropagation());
+  inp.addEventListener('focus',()=>inp.select());
+  inp.addEventListener('input',()=>{inp.value=inp.value.replace(/[^0-9]/g,'')});
+  inp.addEventListener('keydown',e=>{if(e.key==='Enter'){inp.blur()}else if(e.key==='Escape'){const cur=state&&state.markets.find(x=>x.ticker===t);inp.value=cur?cur.size:1;inp.blur()}});
+  inp.addEventListener('blur',commit);
+  return el;
+}
+function render(){
+  if(!state||dragging)return;      // (a quote drag no longer pauses updates; only reordering cards does)
+  const ms=JSON.parse(JSON.stringify(state.markets)); applyPending(ms);
+  if(!ms.length){board.innerHTML='<div class="empty" style="grid-column:1/-1">No zero-fee markets with a Pinnacle line in this window.</div>';setHeight();return}
+  if(board.querySelector('.empty'))board.innerHTML='';
+  const tk=ms.map(m=>m.ticker);
+  layout.order=layout.order.filter(t=>tk.includes(t)); tk.forEach(t=>{if(!layout.order.includes(t))layout.order.push(t)});
+  if(expanded&&!tk.includes(expanded)){expanded=null;act({action:'focus',ticker:null})}
+  const by=Object.fromEntries(ms.map(m=>[m.ticker,m]));
+  board.classList.toggle('one',!!expanded);
+  layout.order.forEach(t=>{
+    const el=board.querySelector(`[data-t="${CSS.escape(t)}"]`)||makeCard(t);
+    const m=by[t], wide=expanded===t;
+    el.classList.toggle('wide',wide); el.classList.toggle('hidden',!!expanded&&!wide);
+    const hh=headHTML(m,wide), dd=dynHTML(m,wide);
+    if(el._hh!==hh){el.querySelector('.hd').innerHTML=hh;el._hh=hh}
+    if(el._dd!==dd){el.querySelector('.dyn').innerHTML=dd;el._dd=dd}
+    const inp=el.querySelector('input'); if(document.activeElement!==inp)inp.value=m.size;
+    const cb=el.querySelector('.ctl button'), paused=m.status==='paused';
+    cb.textContent=paused?'Resume':'Cancel'; cb.className=paused?'resume':'cancel';
+  });
+  [...board.children].forEach(c=>{if(c.dataset&&c.dataset.t&&!by[c.dataset.t])c.remove()});
+  layout.order.forEach(t=>{const el=board.querySelector(`[data-t="${CSS.escape(t)}"]`);if(el)board.appendChild(el)});
+  paintDrag();
+  setHeight();
+}
+
+// ---- drag our quote rows
+board.addEventListener('pointerdown',e=>{
+  const card=e.target.closest('.card');
+  if(card&&e.target.closest('button.xp')){const t=card.dataset.t;expanded=expanded===t?null:t;act({action:'focus',ticker:expanded});render();e.preventDefault();return}
+  if(card&&e.target.closest('.ctl button')){const t=card.dataset.t,m=state&&state.markets.find(x=>x.ticker===t);
+    act({action:(m&&m.status==='paused')?'resume_market':'cancel_market',ticker:t});e.preventDefault();return}
+  const x=e.target.closest('.xbtn'); if(x){const t=x.closest('.card').dataset.t;delete pending[t+'|'+x.dataset.side];act({action:'clear_quote',ticker:t,side:x.dataset.side});e.preventDefault();return}
+  const r=e.target.closest('.row.our'); if(!r)return;
+  // The drag is tracked by ticker/side/price, not by DOM node, so the book keeps ticking (rows are rebuilt on every
+  // update) while a quote is being dragged. Pointer capture sits on the board, which is never replaced.
+  qdrag={t:r.closest('.card').dataset.t,side:r.dataset.side,from:+r.dataset.p,hover:null,ok:false,target:null};
+  board.setPointerCapture(e.pointerId); e.preventDefault(); paintDrag();
+});
+function paintDrag(){
+  if(!qdrag)return;
+  const card=board.querySelector(`[data-t="${CSS.escape(qdrag.t)}"]`); if(!card)return;
+  card.querySelectorAll('.drop,.bad,.qdrag').forEach(n=>n.classList.remove('drop','bad','qdrag'));
+  const mine=card.querySelector(`.row.our[data-side="${qdrag.side}"]`); if(mine)mine.classList.add('qdrag');
+  if(qdrag.hover!=null){const row=card.querySelector(`.row[data-p="${qdrag.hover.toFixed(3)}"]`); if(row)row.classList.add(qdrag.ok?'drop':'bad')}
+}
+board.addEventListener('pointermove',e=>{
+  if(!qdrag)return; qdrag.hover=null; qdrag.target=null;
+  const el=document.elementFromPoint(e.clientX,e.clientY), row=el&&el.closest('.row[data-p]'), lad=row&&row.closest('.ladder'), card=lad&&lad.closest('.card');
+  if(row&&card&&card.dataset.t===qdrag.t){
+    const p=+row.dataset.p, ok=qdrag.side==='bid'?p<+lad.dataset.ba-1e-9:p>+lad.dataset.bb+1e-9;   // post-only: bid below the ask, ask above the bid
+    qdrag.hover=p; qdrag.ok=ok; if(ok&&Math.abs(p-qdrag.from)>1e-9)qdrag.target=p;
+  }
+  paintDrag();
+});
+function endDrag(commit){
+  if(!qdrag)return; const q=qdrag; qdrag=null;
+  const card=board.querySelector(`[data-t="${CSS.escape(q.t)}"]`); if(card)card.querySelectorAll('.drop,.bad,.qdrag').forEach(n=>n.classList.remove('drop','bad','qdrag'));
+  if(commit&&q.target!=null){pending[q.t+'|'+q.side]={price:q.target,t:Date.now()}; act({action:'set_quote',ticker:q.t,side:q.side,price_c:q.target})}
+  render();
+}
+board.addEventListener('pointerup',()=>endDrag(true));
+board.addEventListener('pointercancel',()=>endDrag(false));
+
+window.addEventListener('message',e=>{
+  if(!e.data||e.data.type!=='streamlit:render')return;
+  const th=e.data.theme; if(th){const r=document.documentElement.style;
+    if(th.secondaryBackgroundColor)r.setProperty('--card',th.secondaryBackgroundColor); if(th.textColor)r.setProperty('--fg',th.textColor);
+    if(th.base==='light'){r.setProperty('--line','#d5d9e0');r.setProperty('--muted','#5b6472')}}
+  state=e.data.args.state;
+  if(inflight&&state.ack===inflight.nonce){queue.shift();inflight=null}
+  pump(); render();
+});
+window.addEventListener('resize',setHeight);
+send('streamlit:componentReady',{apiVersion:1});
+</script>
+</body>
+</html>

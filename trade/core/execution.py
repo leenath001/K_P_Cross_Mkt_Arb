@@ -152,7 +152,8 @@ def _price_str(cents: float) -> str:
 def place_order(ticker: str, price_cents: float, count: int,
                 side: str = 'yes',
                 expiration_ts: Optional[int] = None,
-                post_only: bool = False) -> dict:
+                post_only: bool = False,
+                client_order_id: Optional[str] = None) -> dict:
     """
     Place a limit buy order on Kalshi for YES or NO contracts.
     post_only=True guarantees the order rests (maker fee) — rejected if it would cross.
@@ -168,7 +169,7 @@ def place_order(ticker: str, price_cents: float, count: int,
     yes_price_cents = round(100 - price_cents, 3) if side == 'no' else price_cents
     body: dict = {
         'ticker':                     ticker,
-        'client_order_id':            str(uuid.uuid4()),
+        'client_order_id':            client_order_id or str(uuid.uuid4()),
         'side':                       'ask' if side == 'no' else 'bid',
         'count':                      f'{count:.2f}',
         'price':                      _price_str(yes_price_cents),

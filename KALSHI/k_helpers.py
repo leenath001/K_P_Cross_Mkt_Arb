@@ -276,16 +276,21 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
 
     # 2. Load all Kalshi markets, tagging each row with its series ticker
     series_dfs = []
-    for series in set(sport_to_series.values()):
+
+    def _load(series):
         try:
             mkt_df = load_all_mkts(series)
         except Exception:
             # Don't let one bad series (rate limit, transient 5xx, etc.) blank out
             # every other sport's matches — skip it and keep going.
             log.exception('kalshi_odds: skipping series %s after fetch failure', series)
-            continue
+            return None
         mkt_df['series_ticker'] = series
-        series_dfs.append(mkt_df)
+        return mkt_df
+
+    from concurrent.futures import ThreadPoolExecutor      # series loads are independent — fetch in parallel
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        series_dfs = [d for d in pool.map(_load, sorted(set(sport_to_series.values()))) if d is not None]
 
     if not series_dfs:
         log.warning('kalshi_odds: no Kalshi series loaded successfully — returning empty result')

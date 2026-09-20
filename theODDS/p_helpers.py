@@ -108,7 +108,8 @@ def check_sports_with_events(sport_keys: list, hrs: int) -> dict:
     t_to    = soon.strftime('%Y-%m-%dT%H:%M:%SZ')
 
     counts = {}
-    for key in sport_keys:
+
+    def _one(key):
         try:
             resp = requests.get(
                 f'{BASE_URL}/sports/{key}/events',
@@ -122,13 +123,17 @@ def check_sports_with_events(sport_keys: list, hrs: int) -> dict:
             if resp.ok:
                 _api_usage['used']      = int(resp.headers.get('x-requests-used',      _api_usage['used']))
                 _api_usage['remaining'] = int(resp.headers.get('x-requests-remaining',  _api_usage['remaining']))
-                counts[key] = len(resp.json()) if isinstance(resp.json(), list) else 0
-            else:
-                log.warning('check_sports_with_events: %s -> %s %s', key, resp.status_code, resp.reason)
-                counts[key] = 0
+                return key, (len(resp.json()) if isinstance(resp.json(), list) else 0)
+            log.warning('check_sports_with_events: %s -> %s %s', key, resp.status_code, resp.reason)
+            return key, 0
         except Exception:
             log.exception('check_sports_with_events failed for %s', key)
-            counts[key] = 0
+            return key, 0
+
+    # Parallel: 60+ sports one-by-one blocked the app's first render for a minute or more.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        counts = dict(pool.map(_one, sport_keys))
     return counts
 
 def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFrame:
@@ -145,7 +150,7 @@ def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFram
 
     rows = []
 
-    for sport in sports:
+    def _fetch(sport):
         params = {
         'apiKey': API_KEY,
         'regions': 'us',
@@ -155,11 +160,21 @@ def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFram
         'commenceTimeFrom': x1,
         'commenceTimeTo':   x2,}
         try:
-            resp_odds = requests.get(f'{BASE_URL}/sports/{sport}/odds', params=params)
-            resp_odds.raise_for_status()
+            resp = requests.get(f'{BASE_URL}/sports/{sport}/odds', params=params, timeout=30)
+            resp.raise_for_status()
+            return sport, resp
         except requests.exceptions.RequestException:
             # One bad/rate-limited sport shouldn't blank out every other sport's odds.
             log.exception('pinnacle_odds: fetch failed for sport %s — skipping', sport)
+            return sport, None
+
+    # All sports fetched in parallel (each call can take several seconds); parsing below stays sequential.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(12, max(1, len(sports)))) as pool:
+        fetched = list(pool.map(_fetch, sports))
+
+    for sport, resp_odds in fetched:
+        if resp_odds is None:
             continue
 
         _api_usage['used']      = int(resp_odds.headers.get('x-requests-used', 0))

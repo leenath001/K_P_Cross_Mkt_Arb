@@ -23,6 +23,8 @@ from trade.core.execution import (get_balance, cross_and_cancel_order, cancel_an
                                   get_orderbook_depth, cancel_all_resting_orders, kelly_contracts,
                                   resize_resting_order, _ev)
 from trade.core.positions import open_tickers, opposite_leg_blocked
+from trade.mm.ui import render_trade as _mm_trade, render_review as _mm_review
+from trade.clv import load_closing_lines, start_background as _start_clv_capture
 from trade.strategies.kp_arb import run_all_signals, resume_monitoring
 from dashboard          import StreamlitDashboard
 import settle
@@ -133,6 +135,19 @@ div[class*="st-key-_btnrow_"] [data-testid="stHorizontalBlock"] {
 }
 /* ✕ panel-close buttons — no button pill (transparent, borderless), a
    smaller glyph, pushed flush to the right edge of their column. */
+/* Inner tabs (Trade | Review) sit on the same row, to the right of the outer tabs (Pinnacle | Market Making) */
+[data-baseweb="tab-panel"] [data-baseweb="tab-list"] {
+    margin-top: -58px; margin-left: 200px; width: calc(100% - 200px);
+    position: relative; z-index: 2;
+}
+[data-baseweb="tab-panel"] [data-baseweb="tab-list"] [data-baseweb="tab-border"] { display: none; }
+/* No dead space above the tabs: less top padding, and the zero-height tab-memory script frame takes no room */
+[data-testid="stMainBlockContainer"] { padding-top: 3.5rem !important; }
+/* Market Making ON / Cancel all buttons: same height as the input boxes beside them */
+div[class*="st-key-_mm_onoff"] button, div[class*="st-key-_mm_cancel_all"] button { min-height: 38px; height: 38px; position: relative; top: -1px; }
+[data-testid="stElementContainer"]:has(> iframe[data-testid="stIFrame"]) {
+    position: absolute; width: 0; height: 0; margin: 0; overflow: hidden;
+}
 div[class*="st-key-_close_inspect"] button,
 div[class*="st-key-_close_calib_detail"] button,
 div[class*="st-key-_close_bar_"] button {
@@ -146,26 +161,60 @@ div[class*="st-key-_close_bar_"] button {
 </style>
 """, unsafe_allow_html=True)
 
-st.title('K/P Cross-Market Arbitrage')
+_start_clv_capture()   # closing-line capture thread (idempotent across reruns)
+
+# Remember the selected tab in every tab bar (per browser tab) and put it back if a rerun resets it to the first one.
+# Streamlit re-mounts the tab bars on some reruns (the Market Making ON/OFF click did), which snaps the page back to
+# Pinnacle → Trade. Same-origin script; no effect on anything else.
+import streamlit.components.v1 as _components
+_components.html("""<script>
+(function(){
+  const P=window.parent, D=P.document, KEY='tabmem_v1';
+  if(P.__tabmem) return; P.__tabmem=true;
+  const store=()=>{try{return JSON.parse(P.sessionStorage.getItem(KEY)||'{}')}catch(e){return {}}};
+  const put=o=>{try{P.sessionStorage.setItem(KEY,JSON.stringify(o))}catch(e){}};
+  const lists=()=>[...D.querySelectorAll('[data-baseweb="tab-list"]')];
+  const sig=l=>lists().indexOf(l)+':'+[...l.querySelectorAll('[data-baseweb="tab"]')].map(t=>t.innerText.trim()).join('|');
+  D.addEventListener('click',e=>{const t=e.target.closest('[data-baseweb="tab"]'); if(!t)return;
+    const l=t.closest('[data-baseweb="tab-list"]'); if(!l)return; const s=store(); s[sig(l)]=t.innerText.trim(); put(s)},true);
+  function restore(){
+    const s=store();
+    lists().forEach(l=>{const want=s[sig(l)]; if(!want)return;
+      const cur=l.querySelector('[data-baseweb="tab"][aria-selected="true"]'); if(cur&&cur.innerText.trim()===want)return;
+      const tgt=[...l.querySelectorAll('[data-baseweb="tab"]')].find(t=>t.innerText.trim()===want); if(tgt)tgt.click();});
+  }
+  new MutationObserver(()=>{clearTimeout(P.__tabmemT);P.__tabmemT=setTimeout(restore,150)})
+    .observe(D.body,{subtree:true,childList:true,attributes:true,attributeFilter:['aria-selected']});
+})();
+</script>""", height=0)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _cached_event_counts(keys: tuple, hrs: int):
+    """Process-wide, so opening/reloading the page doesn't re-spend a credit per sport (or wait on them)."""
+    return check_sports_with_events(list(keys), hrs)
 
 # ── Startup: check which sports have real Pinnacle events in the window ───────
-if 'active_sports' not in st.session_state:
+def _load_active_sports():
     with st.spinner(f'Checking OddsAPI for upcoming events across {len(config.SPORTS_CONFIG)} sports...'):
         try:
             used, remaining = fetch_usage()
             st.session_state['api_used']       = used
             st.session_state['api_remaining']  = remaining
-            _event_counts = check_sports_with_events(
-                list(config.SPORTS_CONFIG.keys()), config.LOOKAHEAD_HRS)
+            _event_counts = _cached_event_counts(tuple(config.SPORTS_CONFIG.keys()), config.LOOKAHEAD_HRS)
             # True = at least 1 event in the look-ahead window
             st.session_state['active_sports']     = {k: v > 0 for k, v in _event_counts.items()}
             st.session_state['active_sports_at']  = datetime.utcnow().strftime('%H:%M UTC')
             st.session_state['active_sports_ok']  = True
         except Exception:
-            log.exception('Startup active-sports check failed')
+            log.exception('Active-sports check failed')
             st.session_state['active_sports']     = {}
             st.session_state['active_sports_at']  = '—'
             st.session_state['active_sports_ok']  = False
+
+
+if 'active_sports' not in st.session_state:
+    _load_active_sports()
 
 # ── Startup: pull the Kalshi balance once so trading never blocks on a manual
 #    "Refresh balance" click first — same pattern as the active-sports check above.
@@ -178,65 +227,77 @@ if 'balance' not in st.session_state:
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 
+# Everything in the sidebar lives in ONE fragment: clicking Refresh usage / Refresh balance or moving a slider reruns
+# only this block, not the whole page. Values other parts read (hours, threshold, live) are keyed session_state entries.
 with st.sidebar:
-    st.header('API Usage')
-    if st.button('Refresh usage'):
-        with st.spinner('Fetching...'):
-            try:
-                used, remaining = fetch_usage()
-                st.session_state['api_used']      = used
-                st.session_state['api_remaining'] = remaining
-            except Exception as e:
-                log.exception('Refresh usage failed')
-                st.error(f'Failed: {e}')
+    @st.fragment
+    def _sidebar_panel():
+        st.header('API Usage')
+        if st.button('Refresh usage'):
+            with st.spinner('Fetching...'):
+                try:
+                    used, remaining = fetch_usage()
+                    st.session_state['api_used']      = used
+                    st.session_state['api_remaining'] = remaining
+                except Exception as e:
+                    log.exception('Refresh usage failed')
+                    st.error(f'Failed: {e}')
 
-    used      = st.session_state.get('api_used',      0)
-    remaining = st.session_state.get('api_remaining', 500)
-    limit     = used + remaining
-    pct       = min(max(used / max(limit, 1), 0.0), 1.0)
-    st.progress(pct, text=f'{used} / {limit} requests used  ({remaining} remaining)')
-    if pct >= 0.9:
-        st.error('API quota nearly exhausted')
-    elif pct >= 0.7:
-        st.warning('API quota above 70%')
+        used      = st.session_state.get('api_used',      0)
+        remaining = st.session_state.get('api_remaining', 500)
+        limit     = used + remaining
+        pct       = min(max(used / max(limit, 1), 0.0), 1.0)
+        st.progress(pct, text=f'{used} / {limit} requests used  ({remaining} remaining)')
+        if pct >= 0.9:
+            st.error('API quota nearly exhausted')
+        elif pct >= 0.7:
+            st.warning('API quota above 70%')
 
-    st.divider()
+        st.divider()
 
-    st.header('Kalshi Balance')
-    if st.button('Refresh balance'):
-        with st.spinner('Fetching...'):
-            try:
-                st.session_state['balance'] = get_balance()
-            except Exception as e:
-                log.exception('Refresh balance failed')
-                st.error(f'Failed: {e}')
-    balance = st.session_state.get('balance', None)
-    if balance is not None:
-        st.metric('Balance', f'${balance:.2f}')
-    else:
-        st.caption('Click refresh to load')
+        st.header('Kalshi Balance')
+        if st.button('Refresh balance'):
+            with st.spinner('Fetching...'):
+                try:
+                    st.session_state['balance'] = get_balance()
+                except Exception as e:
+                    log.exception('Refresh balance failed')
+                    st.error(f'Failed: {e}')
+        balance = st.session_state.get('balance', None)
+        if balance is not None:
+            st.metric('Balance', f'${balance:.2f}')
+        else:
+            st.caption('Click refresh to load')
 
-    st.divider()
+        st.divider()
 
-    st.header('Run Config')
-    hrs       = st.slider('Look-ahead (hours)', 1, 168, config.LOOKAHEAD_HRS)
-    threshold = st.slider('Match threshold',    0.5, 1.0, 0.85, step=0.01)
-    live      = st.toggle('Fetch live games', value=config.LIVE)
+        st.header('Run Config')
+        st.slider('Look-ahead (hours)', 1, 168, config.LOOKAHEAD_HRS, key='_hrs')
+        st.slider('Match threshold',    0.5, 1.0, 0.85, step=0.01, key='_threshold')
+        st.toggle('Fetch live games', value=config.LIVE, key='_live')
 
-    st.caption(
-        'Fees are fetched live per Kalshi series (not a fixed global rate) — verified '
-        'to genuinely vary, e.g. MLB gets a 0.5x multiplier and several soccer/boxing '
-        'series charge no maker fee at all. See the "fee %" columns in the signals table.'
-    )
-    # Fallback-only defaults if a series' live fee lookup fails — see
-    # KALSHI/k_helpers.fee_rate_for(). No longer user-adjustable: a single override
-    # can't be correct across series with genuinely different published fee rates.
-    taker_fee = TAKER_FEE_BASE
-    maker_fee = MAKER_FEE_BASE
+        st.caption(
+            'Fees are fetched live per Kalshi series (not a fixed global rate) — verified '
+            'to genuinely vary, e.g. MLB gets a 0.5x multiplier and several soccer/boxing '
+            'series charge no maker fee at all. See the "fee %" columns in the signals table.'
+        )
+
+    _sidebar_panel()
+
+# Fallback-only defaults if a series' live fee lookup fails — see
+# KALSHI/k_helpers.fee_rate_for(). No longer user-adjustable: a single override
+# can't be correct across series with genuinely different published fee rates.
+taker_fee = TAKER_FEE_BASE
+maker_fee = MAKER_FEE_BASE
+
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 
-tab_trade, tab_review = st.tabs(['Trade', 'Review'])
+tab_pin, tab_mm = st.tabs(['Pinnacle', 'Market Making'])
+with tab_pin:
+    tab_trade, tab_review = st.tabs(['Trade', 'Review'])
+with tab_mm:
+    tab_mm_trade, tab_mm_review = st.tabs(['Trade', 'Review'])
 
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 1 — TRADE
@@ -244,103 +305,119 @@ tab_trade, tab_review = st.tabs(['Trade', 'Review'])
 
 with tab_trade:
 
-    # ── Sport selection ──────────────────────────────────────────────────────
-    st.subheader('Select Sports')
+    # The sports picker is its own fragment: ticking a sport / Select All / Re-check reruns only this block.
+    @st.fragment
+    def _sports_panel():
+        # ── Sport selection ──────────────────────────────────────────────────────
+        st.subheader('Select Sports')
 
-    # Show OddsAPI active-sport check status
-    _as_ok = st.session_state.get('active_sports_ok', False)
-    _as_at = st.session_state.get('active_sports_at', '—')
-    _as    = st.session_state.get('active_sports', {})
-    _n_active_sports = sum(1 for k in config.SPORTS_CONFIG if _as.get(k, False))
-    _all_keys      = list(config.SPORTS_CONFIG.keys())
-    _paused_sports = getattr(config, 'PAUSED_SPORTS', set())
-    # A [caption, button-cluster] column split, with the cluster itself a
-    # horizontal=True container — each button sizes to its own content and
-    # Streamlit's own gap applies uniformly between them, rather than trying
-    # to guess per-button st.columns() ratios (which left uneven leftover
-    # space whenever a button didn't fill its column exactly).
-    _oa_cap, _oa_btns = st.columns([3, 2])
-    with _oa_cap:
-        if _as_ok:
-            st.caption(
-                f':green[OddsAPI event check:] **{_n_active_sports}/{len(config.SPORTS_CONFIG)} sports have upcoming events** '
-                f'in the {hrs}h window — checked {_as_at}'
-            )
-        else:
-            st.caption(':red[OddsAPI event check failed] — falling back to season-month defaults. Check your API key.')
-    with _oa_btns:
-        with st.container(key='_btnrow_oddsapi', horizontal=True,
-                          horizontal_alignment='right', gap='medium'):
-            if st.button('Re-check', key='recheck_odds_api',
-                        help=f'Re-query events for all {len(config.SPORTS_CONFIG)} sports using current {hrs}h window. Costs ~{len(config.SPORTS_CONFIG)} API credits.'):
-                for _k in ('active_sports', 'active_sports_at', 'active_sports_ok'):
-                    st.session_state.pop(_k, None)
-                st.rerun()
-            if st.button('Select All', key='_select_all_sports'):
-                for k in _all_keys:
-                    st.session_state[f'sport_{k}'] = _in_season(k) and k not in _paused_sports
-            if st.button('Deselect All', key='_deselect_all_sports'):
-                for k in _all_keys:
-                    st.session_state[f'sport_{k}'] = False
+        # Show OddsAPI active-sport check status
+        _as_ok = st.session_state.get('active_sports_ok', False)
+        _as_at = st.session_state.get('active_sports_at', '—')
+        _as    = st.session_state.get('active_sports', {})
+        _n_active_sports = sum(1 for k in config.SPORTS_CONFIG if _as.get(k, False))
+        _all_keys      = list(config.SPORTS_CONFIG.keys())
+        _paused_sports = getattr(config, 'PAUSED_SPORTS', set())
+        # A [caption, button-cluster] column split, with the cluster itself a
+        # horizontal=True container — each button sizes to its own content and
+        # Streamlit's own gap applies uniformly between them, rather than trying
+        # to guess per-button st.columns() ratios (which left uneven leftover
+        # space whenever a button didn't fill its column exactly).
+        _oa_cap, _oa_btns = st.columns([3, 2])
+        with _oa_cap:
+            if _as_ok:
+                st.caption(
+                    f':green[OddsAPI event check:] **{_n_active_sports}/{len(config.SPORTS_CONFIG)} sports have upcoming events** '
+                    f'in the {st.session_state.get("_hrs", config.LOOKAHEAD_HRS)}h window — checked {_as_at}'
+                )
+            else:
+                st.caption(':red[OddsAPI event check failed] — falling back to season-month defaults. Check your API key.')
+        with _oa_btns:
+            with st.container(key='_btnrow_oddsapi', horizontal=True,
+                              horizontal_alignment='right', gap='medium'):
+                if st.button('Re-check', key='recheck_odds_api',
+                            help=f'Re-query events for all {len(config.SPORTS_CONFIG)} sports. Costs ~{len(config.SPORTS_CONFIG)} API credits.'):
+                    _cached_event_counts.clear()
+                    _load_active_sports()
+                    _fragment_rerun()
+                if st.button('Select All', key='_select_all_sports'):
+                    for k in _all_keys:
+                        st.session_state[f'sport_{k}'] = _in_season(k) and k not in _paused_sports
+                if st.button('Deselect All', key='_deselect_all_sports'):
+                    for k in _all_keys:
+                        st.session_state[f'sport_{k}'] = False
 
-    _CATEGORY_LABELS = {
-        'americanfootball': 'American Football',
-        'aussierules':      'Aussie Rules',
-        'baseball':         'Baseball',
-        'basketball':       'Basketball',
-        'boxing':           'Boxing / MMA',
-        'mma':              'Boxing / MMA',
-        'icehockey':        'Ice Hockey',
-        'lacrosse':         'Lacrosse',
-        'rugbyleague':      'Rugby',
-        'soccer':           'Soccer',
-    }
+        _CATEGORY_LABELS = {
+            'americanfootball': 'American Football',
+            'aussierules':      'Aussie Rules',
+            'baseball':         'Baseball',
+            'basketball':       'Basketball',
+            'boxing':           'Boxing / MMA',
+            'mma':              'Boxing / MMA',
+            'icehockey':        'Ice Hockey',
+            'lacrosse':         'Lacrosse',
+            'rugbyleague':      'Rugby',
+            'soccer':           'Soccer',
+        }
 
-    def _category(key):
-        return _CATEGORY_LABELS.get(key.split('_')[0], key.split('_')[0].title())
+        def _category(key):
+            return _CATEGORY_LABELS.get(key.split('_')[0], key.split('_')[0].title())
 
-    grouped = {}
-    for key, cfg in config.SPORTS_CONFIG.items():
-        grouped.setdefault(_category(key), []).append((key, cfg['label']))
+        grouped = {}
+        for key, cfg in config.SPORTS_CONFIG.items():
+            grouped.setdefault(_category(key), []).append((key, cfg['label']))
 
-    cat_order = sorted([c for c in grouped if c != 'Soccer']) + (['Soccer'] if 'Soccer' in grouped else [])
+        cat_order = sorted([c for c in grouped if c != 'Soccer']) + (['Soccer'] if 'Soccer' in grouped else [])
 
-    selected_sports = []
+        selected_sports = []          # (kept for the count caption below; the fetch panel derives its own from session_state)
 
-    non_soccer = [c for c in cat_order if c != 'Soccer']
-    cols = st.columns(min(len(non_soccer), 3))
-    for i, cat in enumerate(non_soccer):
-        with cols[i % 3]:
-            st.markdown(f'**{cat}**')
-            for key, label in grouped[cat]:
-                if key in _paused_sports:
-                    st.checkbox(f':gray[{label} (paused — see notebooks/win_loss_analysis.ipynb)]',
-                               value=False, key=f'sport_{key}', disabled=True)
-                    continue
-                active = _in_season(key)
-                _color = 'green' if active else 'red'
-                if st.checkbox(f':{_color}[{label}]', value=active, key=f'sport_{key}'):
-                    selected_sports.append(key)
+        non_soccer = [c for c in cat_order if c != 'Soccer']
+        cols = st.columns(min(len(non_soccer), 3))
+        for i, cat in enumerate(non_soccer):
+            with cols[i % 3]:
+                st.markdown(f'**{cat}**')
+                for key, label in grouped[cat]:
+                    if key in _paused_sports:
+                        st.checkbox(f':gray[{label} (paused — see notebooks/win_loss_analysis.ipynb)]',
+                                   value=False, key=f'sport_{key}', disabled=True)
+                        continue
+                    active = _in_season(key)
+                    _color = 'green' if active else 'red'
+                    if st.checkbox(f':{_color}[{label}]', value=active, key=f'sport_{key}'):
+                        selected_sports.append(key)
 
-    if 'Soccer' in grouped:
-        st.markdown('**Soccer**')
-        soccer_cols = st.columns(4)
-        for i, (key, label) in enumerate(grouped['Soccer']):
-            with soccer_cols[i % 4]:
-                if key in _paused_sports:
-                    st.checkbox(f':gray[{label} (paused)]', value=False, key=f'sport_{key}', disabled=True)
-                    continue
-                active = _in_season(key)
-                _color = 'green' if active else 'red'
-                if st.checkbox(f':{_color}[{label}]', value=active, key=f'sport_{key}'):
-                    selected_sports.append(key)
+        if 'Soccer' in grouped:
+            st.markdown('**Soccer**')
+            soccer_cols = st.columns(4)
+            for i, (key, label) in enumerate(grouped['Soccer']):
+                with soccer_cols[i % 4]:
+                    if key in _paused_sports:
+                        st.checkbox(f':gray[{label} (paused)]', value=False, key=f'sport_{key}', disabled=True)
+                        continue
+                    active = _in_season(key)
+                    _color = 'green' if active else 'red'
+                    if st.checkbox(f':{_color}[{label}]', value=active, key=f'sport_{key}'):
+                        selected_sports.append(key)
 
-    st.caption(f'{len(selected_sports)} sport(s) selected')
-    st.divider()
+        st.caption(f'{len(selected_sports)} sport(s) selected')
+        st.divider()
+
+
+    _sports_panel()
 
     # ── Fetch signals ────────────────────────────────────────────────────────
     @st.fragment
     def _fetch_and_trade_panel():
+        # Read the sidebar / sports-picker values fresh on every run of THIS fragment — a closure over the module-level
+        # names would be frozen at the last full-page run, and those widgets no longer trigger one.
+        hrs       = st.session_state.get('_hrs', config.LOOKAHEAD_HRS)
+        threshold = st.session_state.get('_threshold', 0.85)
+        live      = st.session_state.get('_live', config.LIVE)
+        balance   = st.session_state.get('balance', None)
+        used      = st.session_state.get('api_used', 0)
+        remaining = st.session_state.get('api_remaining', 500)
+        selected_sports = [k for k in config.SPORTS_CONFIG
+                           if k not in getattr(config, 'PAUSED_SPORTS', set()) and st.session_state.get(f'sport_{k}', False)]
         if st.button('Fetch Signals', type='primary', disabled=len(selected_sports) == 0):
             with st.status('Running pipeline...', expanded=True) as status:
                 try:
@@ -1480,7 +1557,7 @@ with tab_review:
                         b4.metric('Total wagered', f'${_wag:.2f}')
                         st.markdown('**Trade history**')
                         _cols = [c for c in ['logged_at', 'k_ticker', 'outcome', 'side', 'entry_price',
-                                             'fair_prob', 'edge', 'contracts', 'order_type', 'result',
+                                             'fair_prob', 'close_fair', 'clv', 'edge', 'contracts', 'order_type', 'result',
                                              'actual_pnl'] if c in sub.columns]
                         st.dataframe(sub[_cols].sort_values('logged_at', ascending=False),
                                      width='stretch', hide_index=True)
@@ -1625,33 +1702,40 @@ with tab_review:
 
                     _c3, _c4 = st.columns(2)
 
-                    # 3. Win rate by order type
+                    # 3. Closing line value by order type — did we get a better price than
+                    # Pinnacle's final (closing) fair probability? CLV = close_fair − entry
+                    # price for OUR side, captured by trade/clv.py in the minutes before the
+                    # start. Much lower-noise than win rate; available as soon as the event
+                    # starts, before it settles. Only trades placed since capture began have it.
+                    clv_src = pd.DataFrame()
                     with _c3:
                         fig3 = go.Figure()
-                        if not settled.empty and 'order_type' in settled.columns:
+                        _cl = load_closing_lines()
+                        if not _cl.empty and 'order_id' in filled.columns:
+                            clv_src = filled.merge(_cl[['order_id', 'close_fair']], on='order_id', how='inner')
+                            clv_src['close_fair'] = pd.to_numeric(clv_src['close_fair'], errors='coerce')
+                            clv_src['entry_price'] = pd.to_numeric(clv_src['entry_price'], errors='coerce')
+                            clv_src['clv'] = clv_src['close_fair'] - clv_src['entry_price']
+                            clv_src = clv_src.dropna(subset=['clv'])
+                        if not clv_src.empty:
                             _LABEL_MAP = {'no_rest': 'rest', 'no_cross': 'cross'}
-                            settled = settled.copy()
-                            settled['order_type'] = settled['order_type'].map(
-                                lambda v: _LABEL_MAP.get(v, v))
-                            _types = sorted(settled['order_type'].unique())
-                            _wr, _txt, _bcolors = [], [], []
-                            for t in _types:
-                                sub = settled[settled['order_type'] == t]
-                                wr  = sub['is_win'].mean()
-                                w   = int(sub['is_win'].sum())
-                                l   = int((1 - sub['is_win']).sum())
-                                pnl = pd.to_numeric(sub['actual_pnl'], errors='coerce').sum()
-                                _wr.append(wr)
-                                _bcolors.append('#2ecc71' if wr >= 0.5 else '#e74c3c')
-                                _txt.append(f'{wr:.0%}<br>{w}W/{l}L  ${pnl:+.2f}')
-                            fig3.add_trace(go.Bar(x=_types, y=_wr, marker_color=_bcolors,
+                            clv_src['order_type'] = clv_src['order_type'].map(lambda v: _LABEL_MAP.get(v, v))
+                            _groups = [('all', clv_src)] + [(t, g) for t, g in clv_src.groupby('order_type')]
+                            _names = [n for n, _ in _groups]
+                            _means = [g['clv'].mean() * 100 for _, g in _groups]
+                            _txt = [f"{m:+.3f}¢<br>{(g['clv'] > 0).mean():.0%} beat close · n={len(g)}"
+                                    for m, (_, g) in zip(_means, _groups)]
+                            fig3.add_trace(go.Bar(x=_names, y=_means,
+                                                  marker_color=['#2ecc71' if m > 0 else '#e74c3c' for m in _means],
                                                   text=_txt, textposition='outside',
                                                   hoverinfo='text', hovertext=_txt))
-                            fig3.add_hline(y=0.5, line_dash='dash', line_color='#888')
-                            fig3.update_layout(yaxis_tickformat='.0%', yaxis_range=[0, 1.25])
+                            fig3.add_hline(y=0, line_color='#888', line_width=1)
+                            _pad = max(abs(m) for m in _means) * 0.6 + 0.3
+                            fig3.update_layout(yaxis_range=[min(min(_means), 0) - _pad, max(max(_means), 0) + _pad])
                         else:
-                            fig3.add_annotation(text='No settled trades yet', **_NO_DATA)
-                        fig3.update_layout(title='Win Rate by Order Type', yaxis_title='Win rate',
+                            fig3.add_annotation(text='No closing lines captured yet — collected for trades<br>'
+                                                     'starting in the next ~12 min, from now on', **_NO_DATA)
+                        fig3.update_layout(title='Closing Line Value by Order Type', yaxis_title='avg CLV (¢)',
                                           showlegend=False, **_CHART_LAYOUT)
                         _ev3 = st.plotly_chart(fig3, width='stretch', theme='streamlit',
                                                on_select='rerun', selection_mode=['points'],
@@ -1768,10 +1852,10 @@ with tab_review:
                             st.session_state['_calib_selected_sport'] = None
 
                     _sel = st.session_state.get('_bar_sel_ordertype')
-                    if _sel and not settled.empty and 'order_type' in settled.columns:
-                        _sub = settled[settled['order_type'] == _sel]
+                    if _sel and not clv_src.empty:
+                        _sub = clv_src if _sel == 'all' else clv_src[clv_src['order_type'] == _sel]
                         if not _sub.empty:
-                            _detail_panel('ordertype', f'Order type: {_sel}', _sub)
+                            _detail_panel('ordertype', f'CLV — {_sel}', _sub)
 
                     _c5, _c6 = st.columns(2)
 
@@ -1852,3 +1936,8 @@ with tab_review:
 
 
     _review_panel()
+
+with tab_mm_trade:
+    _mm_trade()
+with tab_mm_review:
+    _mm_review()

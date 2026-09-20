@@ -160,7 +160,9 @@ def fetch_realized_pnl_from_fills(ticker: str, side: str) -> Optional[dict]:
         return None
 
     fills = resp.json().get('fills', [])
-    fills = [f for f in fills if f.get('ticker') == ticker
+    from trade.mm.ledger import mm_order_ids           # market-making fills belong to the MM ledger, not this trade
+    _mm = mm_order_ids()
+    fills = [f for f in fills if f.get('ticker') == ticker and str(f.get('order_id')) not in _mm
              and f.get('outcome_side', f.get('side')) == side]
     if not fills:
         return None
