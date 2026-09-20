@@ -13,6 +13,7 @@ from typing import Optional
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from applog import get_logger
+from trade.core.pricing import rest_price_cents, parse_ranges
 
 log = get_logger(__name__)
 
@@ -200,6 +201,7 @@ def load_all_mkts(SERIES_TICKER: str):
             'no_ask':        float(m['no_ask_dollars'])  if m.get('no_ask_dollars')  else None,
             'volume':        m.get('volume_fp'),
             'open_int':      m.get('open_interest_fp'),
+            'price_ranges':  m.get('price_ranges'),
         } for m in markets])
     
     return z   
@@ -328,13 +330,16 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
             yes_bid  = k_row['yes_bid']
             no_bid   = k_row['no_bid']
 
-            # Spread-aware rest price: 2¢ wide → bid+1 (midpoint); 1¢ wide → bid; else ask-1
+            # Rest at the top of the book without taking: one tick below the ask, on THIS
+            # market's own price grid (1¢ for most, ½¢ for e.g. Brasileirão). 49/50 -> 49.
+            # See trade/core/pricing.py.
+            _ranges = parse_ranges(k_row.get('price_ranges'))
+
             def _rp(bid, ask):
-                if bid is not None and ask is not None:
-                    s = round((ask - bid) * 100)
-                    if s == 2: return round(ask - 0.01, 2)
-                    if s == 1: return round(bid, 2)
-                return round(ask - 0.01, 2) if ask is not None else None
+                if ask is None:
+                    return None
+                return round(rest_price_cents(None if bid is None else bid * 100, ask * 100,
+                                              _ranges) / 100, 4)
 
             rest_price_yes = _rp(yes_bid, yes_ask)
             rest_price_no  = _rp(no_bid,  no_ask)
@@ -408,6 +413,8 @@ def kalshi_odds(df: pd.DataFrame, threshold: float = 0.6,
                 'yes_ask':        yes_ask,
                 'no_bid':         k_row['no_bid'],
                 'no_ask':         no_ask,
+                'rest_price_yes': rest_price_yes,
+                'rest_price_no':  rest_price_no,
                 'volume':         k_row['volume'],
                 'OI':             k_row['open_int'],
                 'match_score':    round(score, 3),

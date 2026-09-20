@@ -81,14 +81,18 @@ _Q_LABELS = ['Q1', 'Q2', 'Q3', 'Q4']
 
 def _entry_price_series(df, side, force_cross, limit_only_mode):
     """Price the bot will actually fill/post at, per signal row (shared by the table and the quartile filter)."""
+    # Rest rows use the price kalshi_odds() computed (one tick below the ask on the market's own
+    # price grid); falls back to ask − 1¢ for a matched_df fetched before that column existed.
+    def _rest(col, ask_col):
+        return df[col] if col in df.columns else (df[ask_col] - 0.01).round(2)
     if side == 'no':
-        return df['no_ask'] if force_cross else (df['no_ask'] - 0.01).round(2)
+        return df['no_ask'] if force_cross else _rest('rest_price_no', 'no_ask')
     if force_cross:
         return df['yes_ask']
     if limit_only_mode:
-        return (df['yes_ask'] - 0.01).round(2)
-    return df.apply(lambda r: r['yes_ask'] if r.get('signal', False)
-                    else round(r.get('yes_ask', 0) - 0.01, 2), axis=1)
+        return _rest('rest_price_yes', 'yes_ask')
+    rp = _rest('rest_price_yes', 'yes_ask')
+    return df['yes_ask'].where(df.get('signal', pd.Series(False, index=df.index)).astype(bool), rp)
 
 def _eop_quartile_cutoffs():
     """Q1/Q2/Q3 edge÷price cutoffs from settled history — same definition as the Review quartile chart."""
@@ -434,7 +438,8 @@ with tab_trade:
                 st.caption('Edge÷Price quartile',
                            help='Only trade signals whose edge÷price falls in the checked '
                                 'quartile(s). Cutoffs come from your settled trade history '
-                                '(same buckets as the Review chart). Counts are signals in each.')
+                                '(same buckets as the Review chart). Counts are signals in each. '
+                                'Q4 (largest) is always excluded.')
                 _eop_cuts = _eop_quartile_cutoffs()
                 if _eop_cuts is None:
                     st.caption('Needs 8+ settled trades to define quartiles.')
@@ -445,10 +450,16 @@ with tab_trade:
                     _s_q     = pd.cut(_s_eop, [-float('inf')] + _eop_cuts + [float('inf')],
                                       labels=_Q_LABELS)
                     _q_counts = _s_q.value_counts()
+                    # Q4 (largest edge÷price) is never offered — in settled history those
+                    # trades realized far below the model's promise (overpaying for "edge"),
+                    # so they're always excluded, not just unchecked.
                     with st.container(horizontal=True, gap='medium', vertical_alignment='bottom'):
-                        _q_chosen = [q for q in _Q_LABELS
+                        _q_chosen = [q for q in _Q_LABELS[:3]
                                      if st.checkbox(f'{q} ({int(_q_counts.get(q, 0))})',
                                                     value=True, key=f'_q_filter_{q}')]
+                    if int(_q_counts.get('Q4', 0)):
+                        st.caption(f"Q4 excluded: {int(_q_counts.get('Q4', 0))} signal(s) "
+                                   f"with edge÷price above {_eop_cuts[2]:.3f}")
                     signals = signals[_s_q.isin(_q_chosen).values]
 
             if not any(c in matched_df.columns for c in ('signal', 'signal_yes_rest', 'signal_no', 'signal_no_cross')):

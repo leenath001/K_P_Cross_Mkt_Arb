@@ -16,10 +16,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from KALSHI.k_helpers import kalshi_odds, fee_rate_for
 from trade.core.execution import (
     place_order, get_order_status, _final_order_status, filled_count, get_market_price,
-    get_market_prices, _rest_price_cents, cross_and_cancel_order, _monitor,
+    get_market_prices, rest_price_dollars, signal_rest_price, cross_and_cancel_order, _monitor,
     resolve_contracts, _ev, _exact_ev_ok, force_cancel_all,
     TAKER_FEE, MAKER_FEE, MIN_CROSS_EV, MAX_DURATION, PRE_EVENT_BUFFER,
 )
+from trade.core.pricing import to_cents
 from trade.core.positions import (open_tickers, opposite_leg_blocked,
                                   drop_same_event_duplicates)
 from trade.core.logging_io import write_row, log_unfilled_attempt, is_filled
@@ -228,9 +229,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             return {'status': 'skipped', 'reason': 'no_ask_unavailable',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
         fair_prob_no  = 1 - fair_prob
-        no_bid_c      = round(no_bid * 100) if no_bid is not None else None
-        no_ask_c      = round(no_ask * 100)
-        rest_price_no = _rest_price_cents(no_bid_c, no_ask_c) / 100
+        rest_price_no = signal_rest_price(signal_row, 'no')
         taker_ev_no   = _ev(fair_prob_no, no_ask,      taker_fee)
         maker_ev_no   = _ev(fair_prob_no, rest_price_no, maker_fee)
         if force_cross:
@@ -261,14 +260,14 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         if live_na is not None:
             if order_type == 'no_rest':
                 live_nb   = live_prices.get('no_bid')
-                live_rest = _rest_price_cents(live_nb, live_na) / 100
+                live_rest = rest_price_dollars(live_prices, 'no')
                 live_ev   = _ev(fair_prob_no, live_rest, fee_rate)
                 if live_ev <= 0:
                     return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
                             'ticker': ticker, 'order_id': None, 'contracts': 0}
                 order_price = live_rest
             else:  # no_cross
-                live_cross = round(live_na / 100, 2)
+                live_cross = live_na / 100
                 live_ev    = _ev(fair_prob_no, live_cross, fee_rate)
                 if live_ev <= 0:
                     return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
@@ -276,7 +275,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
                 order_price = live_cross
 
         ev          = _ev(fair_prob_no, order_price, fee_rate)
-        price_cents = round(order_price * 100)
+        price_cents = to_cents(order_price)
         contracts   = resolve_contracts(signal_row, fair_prob_no, order_price, bankroll,
                                         fee_rate, size_mult)
         if contracts is None:
@@ -349,9 +348,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         }
 
     # ── YES side: same AUTO/CROSS/REST logic as NO, using yes_ask ───────────
-    yes_bid_c      = round(yes_bid * 100) if yes_bid is not None else None
-    yes_ask_c      = round(yes_ask * 100)
-    rest_price_yes = _rest_price_cents(yes_bid_c, yes_ask_c) / 100
+    rest_price_yes = signal_rest_price(signal_row, 'yes')
     taker_ev_yes   = _ev(fair_prob, yes_ask,       taker_fee)
     maker_ev_yes   = _ev(fair_prob, rest_price_yes, maker_fee)
     if force_cross:
@@ -384,7 +381,7 @@ def run_trade(signal_row: pd.Series, bankroll: float,
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
 
     ev            = _ev(fair_prob, order_price, fee_rate)
-    price_cents   = round(order_price * 100)
+    price_cents   = to_cents(order_price)
     contracts     = resolve_contracts(signal_row, fair_prob, order_price, bankroll,
                                       fee_rate, size_mult)
     if contracts is None:
@@ -417,12 +414,12 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             order_price = live_ya / 100
         else:  # rest: spread-aware — 2¢ wide → bid+1, 1¢ wide → bid
             live_yb     = live_prices.get('yes_bid')
-            order_price = _rest_price_cents(live_yb, live_ya) / 100
+            order_price = rest_price_dollars(live_prices, 'yes')
         ev = _ev(fair_prob, order_price, fee_rate)
         if ev <= 0:
             return {'status': 'skipped', 'reason': 'signal_gone_at_execution',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
-        price_cents = round(order_price * 100)
+        price_cents = to_cents(order_price)
         contracts   = resolve_contracts(signal_row, fair_prob, order_price, bankroll,
                                         fee_rate, size_mult)
 

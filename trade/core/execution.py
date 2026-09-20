@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from KALSHI.k_helpers import kalshi_headers, fee_rate_for, kalshi_fee_dollars
 from theODDS.p_helpers import pinnacle_odds, get_api_usage
 from applog import get_logger
+from trade.core.pricing import rest_price_cents, to_cents, parse_ranges
 
 log = get_logger(__name__)
 
@@ -140,7 +141,15 @@ def resolve_contracts(signal_row, fair_prob: float, price: float, bankroll: floa
 # Order Placement, Cancellation, Status
 # ---------------------------------------------------------------------------
 
-def place_order(ticker: str, price_cents: int, count: int,
+def _price_str(cents: float) -> str:
+    """Dollar price string: 2 decimals for whole cents (unchanged), more only when the market's grid needs it (0.445)."""
+    s = f'{cents / 100:.4f}'
+    while s.endswith('0') and len(s.split('.')[1]) > 2:
+        s = s[:-1]
+    return s
+
+
+def place_order(ticker: str, price_cents: float, count: int,
                 side: str = 'yes',
                 expiration_ts: Optional[int] = None,
                 post_only: bool = False) -> dict:
@@ -156,13 +165,13 @@ def place_order(ticker: str, price_cents: int, count: int,
     path = '/trade-api/v2/portfolio/events/orders'
     # Kalshi V2 always quotes from the YES side.
     # For NO orders the yes-equivalent price is the complement: 100 - no_price_cents.
-    yes_price_cents = (100 - price_cents) if side == 'no' else price_cents
+    yes_price_cents = round(100 - price_cents, 3) if side == 'no' else price_cents
     body: dict = {
         'ticker':                     ticker,
         'client_order_id':            str(uuid.uuid4()),
         'side':                       'ask' if side == 'no' else 'bid',
         'count':                      f'{count:.2f}',
-        'price':                      f'{yes_price_cents / 100:.2f}',
+        'price':                      _price_str(yes_price_cents),
         'time_in_force':              'good_till_canceled',
         'self_trade_prevention_type': 'taker_at_cross',
     }
@@ -356,7 +365,8 @@ def get_market_prices(ticker: str) -> dict:
         ]:
             v = m.get(field)
             if v:
-                result[key] = round(float(v) * 100)
+                result[key] = to_cents(v)
+        result['ranges'] = parse_ranges(m.get('price_ranges'))
         return result
     log.warning('get_market_prices failed for %s: %s %s', ticker, resp.status_code, resp.reason)
     return {}
@@ -433,21 +443,21 @@ def get_orderbook_depth(ticker: str, levels: int = 2) -> dict:
     return result
 
 
-def _rest_price_cents(bid_cents: Optional[int], ask_cents: int) -> int:
-    """
-    Spread-aware rest price (in cents).
-      2¢ spread: bid+1 (= ask-1) — tightens spread to 1¢
-      1¢ spread: bid   (= ask-1) — join the best bid
-      >2¢ spread: ask-1          — stay near top of book
-    Always returns a price that will not cross the book.
-    """
-    if bid_cents is not None:
-        spread = ask_cents - bid_cents
-        if spread == 2:
-            return ask_cents - 1   # = bid + 1
-        if spread == 1:
-            return bid_cents       # = ask - 1, join bid
-    return ask_cents - 1           # fallback: top of book
+def rest_price_dollars(prices: dict, side: str) -> Optional[float]:
+    """Top-of-book resting price (dollars) from get_market_prices() output: one tick below the ask on the market's own grid."""
+    bid, ask = prices.get(f'{side}_bid'), prices.get(f'{side}_ask')
+    if ask is None:
+        return None
+    return rest_price_cents(bid, ask, prices.get('ranges')) / 100
+
+
+def signal_rest_price(signal_row, side: str) -> float:
+    """Resting price (dollars) for a signal row — the value kalshi_odds() precomputed, else derived from its bid/ask."""
+    v = signal_row.get(f'rest_price_{side}')
+    if v is not None and not pd.isna(v):
+        return float(v)
+    bid, ask = signal_row.get(f'{side}_bid'), signal_row.get(f'{side}_ask')
+    return rest_price_cents(None if bid is None or pd.isna(bid) else bid * 100, ask * 100) / 100
 
 
 def cross_and_cancel_order(ticker: str, order_id: str, contracts: int,

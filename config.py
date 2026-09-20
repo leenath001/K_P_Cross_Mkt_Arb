@@ -23,7 +23,6 @@ SPORTS = [
 SEASON_MONTHS = {
     "americanfootball_ncaaf":               [8, 9, 10, 11, 12, 1],
     "americanfootball_nfl":                 [9, 10, 11, 12, 1],
-    "aussierules_afl":                      [3, 4, 5, 6, 7, 8, 9],
     "baseball_mlb":                         [3, 4, 5, 6, 7, 8, 9, 10],
     "basketball_euroleague":                [10, 11, 12, 1, 2, 3, 4, 5],
     "basketball_nba":                       [10, 11, 12, 1, 2, 3, 4, 5, 6],
@@ -63,6 +62,27 @@ SEASON_MONTHS = {
     "soccer_uefa_champs_league":            [9, 10, 11, 12, 1, 2, 3, 4, 5],
     "soccer_uefa_europa_conference_league": [9, 10, 11, 12, 1, 2, 3, 4, 5],
     "soccer_uefa_europa_league":            [9, 10, 11, 12, 1, 2, 3, 4, 5],
+    # ── Added from the OddsAPI ↔ Kalshi cross-check (see SPORTS_CONFIG notes) ──
+    "basketball_wnba":                      [5, 6, 7, 8, 9, 10],
+    "basketball_nbl":                       [9, 10, 11, 12, 1, 2, 3],
+    "baseball_kbo":                         [3, 4, 5, 6, 7, 8, 9, 10],
+    "baseball_npb":                         [3, 4, 5, 6, 7, 8, 9, 10],
+    "icehockey_liiga":                      [9, 10, 11, 12, 1, 2, 3, 4],
+    "icehockey_sweden_hockey_league":       [9, 10, 11, 12, 1, 2, 3, 4],
+    "lacrosse_pll":                         [6, 7, 8, 9],
+    "soccer_brazil_serie_b":                [4, 5, 6, 7, 8, 9, 10, 11],
+    "soccer_conmebol_copa_sudamericana":    [3, 4, 5, 6, 7, 8, 9, 10, 11],
+    "soccer_denmark_superliga":             [7, 8, 9, 10, 11, 3, 4, 5],
+    "soccer_england_efl_cup":               [8, 9, 10, 11, 12, 1, 2, 3],
+    "soccer_england_league1":               [8, 9, 10, 11, 12, 1, 2, 3, 4, 5],
+    "soccer_germany_liga3":                 [8, 9, 10, 11, 12, 1, 2, 3, 4, 5],
+    "soccer_japan_j_league":                [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    "soccer_korea_kleague1":                [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    "soccer_norway_eliteserien":            [3, 4, 5, 6, 7, 8, 9, 10, 11],
+    "soccer_poland_ekstraklasa":            [7, 8, 9, 10, 11, 3, 4, 5, 6],
+    "soccer_sweden_allsvenskan":            [4, 5, 6, 7, 8, 9, 10, 11],
+    "soccer_switzerland_superleague":       [7, 8, 9, 10, 11, 12, 2, 3, 4, 5],
+    "soccer_uefa_nations_league":           [9, 10, 11, 3, 6],
 }
 
 # Pinnacle fetch window
@@ -70,12 +90,8 @@ LOOKAHEAD_HRS = 72    # how many hours ahead to search for upcoming events
 LIVE          = False # True = fetch currently live games, False = fetch upcoming
 
 # Sports temporarily excluded from signal generation (enforced in KALSHI.k_helpers.kalshi_odds).
-# aussierules_afl: 2/23 wins (8.7%) against 22.9% predicted in settled trade history
-# (notebooks/win_loss_analysis.ipynb) — AFL rarely has draw markets, so this isn't the
-# same de-vig bias fixed for soccer; likely a timezone/date-boundary matching bug given
-# AFL fixtures run on the furthest-from-UTC schedule of any traded league. Re-enable
-# once the KXAFLGAME <-> Pinnacle matching has been manually audited.
-PAUSED_SPORTS = {"aussierules_afl"}
+PAUSED_SPORTS = set()
+
 
 SPORTS_CONFIG = {
     # ── American Football ────────────────────────────────────────────
@@ -86,11 +102,6 @@ SPORTS_CONFIG = {
     "americanfootball_nfl": {
         "label": "NFL",
         "ticker": "KXNFLGAME"        # confirmed
-    },
-    # ── Aussie Rules ─────────────────────────────────────────────────
-    "aussierules_afl": {
-        "label": "AFL",
-        "ticker": "KXAFLGAME"        # confirmed
     },
     # ── Baseball ─────────────────────────────────────────────────────
     "baseball_mlb": {
@@ -255,4 +266,33 @@ SPORTS_CONFIG = {
         "label": "UEFA Europa League",
         "ticker": "KXUELGAME"        # confirmed
     },
+
+    # ── Added from the OddsAPI ↔ Kalshi cross-check ──────────────────────
+    # "# confirmed" = series exists with open markets AND the OddsAPI key returned
+    # events that matched Kalshi in a live run; "# unverified" = series exists but
+    # the match hasn't been observed yet (no upcoming events at check time).
+    "basketball_wnba":     {"label": "WNBA",                  "ticker": "KXWNBAGAME"},          # confirmed (live match 2026-09-19)
+    "basketball_nbl":      {"label": "Australia NBL",         "ticker": "KXNBLGAME"},           # unverified — no upcoming events to test the match
+    "baseball_kbo":        {"label": "KBO",                   "ticker": "KXKBOGAME"},           # confirmed (live match 2026-09-19)
+    "baseball_npb":        {"label": "NPB",                   "ticker": "KXNPBGAME"},           # confirmed (live match 2026-09-19)
+    "icehockey_liiga":     {"label": "Liiga",                 "ticker": "KXLIIGAGAME"},         # confirmed (live match 2026-09-19)
+    "icehockey_sweden_hockey_league": {"label": "SHL",        "ticker": "KXSHLGAME"},           # confirmed (live match 2026-09-19)
+    "lacrosse_pll":        {"label": "PLL",                   "ticker": "KXPLLGAME"},           # unverified — no upcoming events to test the match
+    "soccer_brazil_serie_b": {"label": "Brasileirão Série B", "ticker": "KXBRASILEIROBGAME"},   # confirmed (live match 2026-09-19)
+    "soccer_conmebol_copa_sudamericana": {"label": "Copa Sudamericana", "ticker": "KXCONMEBOLSUDGAME"},  # unverified — no upcoming events to test the match
+    "soccer_denmark_superliga": {"label": "Danish Superliga", "ticker": "KXDENSUPERLIGAGAME"},  # confirmed (live match 2026-09-19)
+    "soccer_england_efl_cup": {"label": "EFL Cup",           "ticker": "KXEFLCUPGAME"},        # unverified — no upcoming events to test the match
+    "soccer_england_league1": {"label": "EFL League One",    "ticker": "KXEFLL1GAME"},         # unverified — no upcoming events to test the match
+    "soccer_germany_liga3": {"label": "3. Liga",             "ticker": "KXGER3LGAME"},         # confirmed (live match 2026-09-19)
+    "soccer_japan_j_league": {"label": "J1 League",          "ticker": "KXJLEAGUEGAME"},       # confirmed (live match 2026-09-19)
+    "soccer_korea_kleague1": {"label": "K League 1",         "ticker": "KXKLEAGUEGAME"},       # confirmed (live match 2026-09-19)
+    "soccer_norway_eliteserien": {"label": "Eliteserien",    "ticker": "KXELITESERIENGAME"},   # confirmed (live match 2026-09-19)
+    "soccer_poland_ekstraklasa": {"label": "Ekstraklasa",    "ticker": "KXEKSTRAKLASAGAME"},   # confirmed (live match 2026-09-19)
+    "soccer_sweden_allsvenskan": {"label": "Allsvenskan",    "ticker": "KXALLSVENSKANGAME"},   # confirmed (live match 2026-09-19)
+    "soccer_switzerland_superleague": {"label": "Swiss Super League", "ticker": "KXSWISSLEAGUEGAME"},  # confirmed (live match 2026-09-19)
+    "soccer_uefa_nations_league": {"label": "UEFA Nations League", "ticker": "KXUEFANLGAME"},  # unverified — no upcoming events to test the match
+    # ── UNKNOWN: on OddsAPI but no Kalshi game-winner series found (not addable) ──
+    # aussierules_aflw, rugbyleague_nrlw, soccer_austria_bundesliga, soccer_england_league2,
+    # icehockey_sweden_allsvenskan, soccer_league_of_ireland, soccer_sweden_superettan,
+    # handball_germany_bundesliga, soccer_germany_bundesliga_women
 }
