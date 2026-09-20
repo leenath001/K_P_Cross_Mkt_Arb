@@ -1330,8 +1330,59 @@ with tab_review:
                 if val == 'LOSS': return 'color: red'
                 return 'color: orange'
 
-            styled = log_df2.style.map(_colour_result, subset=['result']) \
-                                  if 'result' in log_df2.columns else log_df2
+            # Filters combine (AND). Empty multiselect / "Any" / blank text = no filter on
+            # that field, so e.g. Result=WIN + Settled=Today shows today's wins.
+            def _opts(col):
+                return sorted(log_df2[col].dropna().astype(str).unique()) if col in log_df2.columns else []
+
+            _f1, _f2, _f3, _f4 = st.columns(4)
+            _f_sport  = _f1.multiselect('Sport',      _opts('sport'),      key='_tf_sport')
+            _f_result = _f2.multiselect('Result',     _opts('result'),     key='_tf_result')
+            _f_side   = _f3.multiselect('Side',       _opts('side'),       key='_tf_side')
+            _f_otype  = _f4.multiselect('Order type', _opts('order_type'), key='_tf_otype')
+            _g1, _g2, _g3 = st.columns([1, 1.4, 1.6])
+            _f_when = _g1.selectbox('Date settled',
+                                    ['Any', 'Today', 'Last 7 days', 'Last 30 days', 'Custom range'],
+                                    key='_tf_when',
+                                    help='Uses the settle time Kalshi reported; older rows without one '
+                                         'fall back to when the trade was placed.')
+            _f_range = None
+            if _f_when == 'Custom range':
+                _f_range = _g2.date_input('Settled between', value=(), key='_tf_range')
+            _f_team = _g3.text_input('Team / outcome contains', key='_tf_team',
+                                     placeholder='e.g. Flamengo')
+
+            view = log_df2.copy()
+            if _f_sport:  view = view[view['sport'].astype(str).isin(_f_sport)]
+            if _f_result: view = view[view['result'].astype(str).isin(_f_result)]
+            if _f_side:   view = view[view['side'].astype(str).isin(_f_side)]
+            if _f_otype:  view = view[view['order_type'].astype(str).isin(_f_otype)]
+            if _f_team.strip() and 'outcome' in view.columns:
+                view = view[view['outcome'].astype(str).str.contains(_f_team.strip(), case=False,
+                                                                     regex=False, na=False)]
+            if _f_when != 'Any':
+                _placed  = pd.to_datetime(view['logged_at'], errors='coerce', utc=True)
+                _settled = (pd.to_datetime(view['settled_at'], errors='coerce', utc=True)
+                            if 'settled_at' in view.columns else pd.Series(pd.NaT, index=view.index))
+                _when_dt = _settled.fillna(_placed).dt.tz_convert(None)
+                _today   = pd.Timestamp.now(tz='UTC').tz_convert(None).normalize()
+                view = view[view['result'].astype(str) != 'PENDING']  # unsettled rows have no settle date
+                _when_dt = _when_dt.loc[view.index]
+                if _f_when == 'Today':
+                    view = view[_when_dt >= _today]
+                elif _f_when == 'Last 7 days':
+                    view = view[_when_dt >= _today - pd.Timedelta(days=6)]
+                elif _f_when == 'Last 30 days':
+                    view = view[_when_dt >= _today - pd.Timedelta(days=29)]
+                elif _f_range and len(_f_range) == 2:
+                    _lo, _hi = pd.Timestamp(_f_range[0]), pd.Timestamp(_f_range[1]) + pd.Timedelta(days=1)
+                    view = view[(_when_dt >= _lo) & (_when_dt < _hi)]
+
+            _n_pnl = pd.to_numeric(view['actual_pnl'], errors='coerce').sum() if 'actual_pnl' in view.columns else 0
+            st.caption(f'{len(view)} of {len(log_df2)} trades · settled PnL in view ${_n_pnl:+.2f}')
+
+            styled = view.style.map(_colour_result, subset=['result']) \
+                               if 'result' in view.columns else view
 
             st.dataframe(styled, width="stretch", hide_index=True)
 
