@@ -6,3 +6,4 @@ python-dotenv>=1.1.0
 cryptography>=44.0.1
 streamlit>=1.35.0
 matplotlib>=3.9.0
+plotly>=5.20.0
