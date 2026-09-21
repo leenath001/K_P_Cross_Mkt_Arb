@@ -8,7 +8,7 @@
 body{margin:0;background:transparent;color:var(--fg);font:12px/1.35 "Source Sans Pro",system-ui,sans-serif}
 #board{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:stretch}
 #board.one{grid-template-columns:minmax(0,1fr)}
-#board:not(.one) .card{display:flex;flex-direction:column;min-height:318px}
+#board:not(.one) .card{display:flex;flex-direction:column;min-height:335px}
 #board:not(.one) .dyn{flex:1;min-height:0}
 #board:not(.one) .ctl{margin-top:auto}
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:0}
@@ -53,13 +53,17 @@ table.ord td,table.ord th{padding:1px 4px;text-align:left;border-bottom:1px soli
 .inv .tile{padding:2px 6px}
 .inv .tile .v{font-size:12px}
 .empty{color:var(--muted);padding:30px;text-align:center}
-.ctl{display:flex;align-items:center;gap:8px;margin-top:8px;padding-top:6px;border-top:1px solid var(--line)}
+.ctl{display:flex;flex-wrap:wrap;align-items:center;gap:6px 5px;margin-top:8px;padding-top:6px;border-top:1px solid var(--line)}
 .ctl label{color:var(--muted);font-size:11px}
-.ctl input{width:72px;background:transparent;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:3px 8px;font:inherit;text-align:center;cursor:text}
+.ctl input{width:46px;background:transparent;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:3px 8px;font:inherit;text-align:center;cursor:text}
 .ctl input:focus{outline:none;border-color:var(--gold);box-shadow:0 0 0 1px var(--gold)}
-.ctl button{padding:2px 12px}
-.ctl button.cancel{border-color:#a33;color:#ffb3b3}.ctl button.resume{border-color:#2c6b45;color:#7fd9a2}
-.ctl .sp{flex:1}
+.ctl button{padding:2px 7px;font-size:11.5px}
+.ctl button.pg{border-color:#8a6d1c;color:#f5d27a}.ctl button.pg:disabled{opacity:.4;cursor:default}
+.ctl button.cancel{border-color:#a33;color:#ffb3b3}.ctl button.on{border-color:#2c6b45;color:#7fd9a2}.ctl button.on:disabled{opacity:.4;cursor:default}
+.ctl .sp{flex:1}.ctl .br{flex-basis:100%;height:0;margin:0}
+.ctl button.sd{border-color:#2c6b45;color:#7fd9a2}.ctl button.sd.pull{border-color:#a33;color:#ffb3b3}
+.card.flash{animation:flash 1.1s ease-out}
+@keyframes flash{0%{box-shadow:0 0 0 3px #e74c3c,0 0 18px 4px rgba(231,76,60,.7);background:#4a1f22}100%{box-shadow:0 0 0 0 transparent;background:var(--card)}}
 </style>
 </head>
 <body>
@@ -86,14 +90,32 @@ function pump(){
   inflight=queue[0]; inflightAt=Date.now();
   send('streamlit:setComponentValue',{value:inflight,dataType:'json'});
 }
-function act(a){a.nonce=Date.now()+Math.random();queue.push(a);pump()}
+// Direct channel to the engine (loopback HTTP): actions and fresh snapshots without a Streamlit rerun. Falls back to
+// Streamlit's setComponentValue queue if the channel is unreachable.
+let direct=null, directFails=0;
+function directUrl(p){return `http://${location.hostname}:${direct.port}${p}`}
+async function directPost(a){
+  const r=await fetch(directUrl('/act'),{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(Object.assign({token:direct.token},a))});
+  if(!r.ok)throw new Error('http '+r.status);
+}
+function act(a){a.nonce=Date.now()+Math.random();
+  if(direct&&directFails<3){directPost(a).then(()=>{directFails=0}).catch(()=>{directFails++;queue.push(a);pump()})}
+  else{queue.push(a);pump()}}
+let lastTs=0;
+function takeState(s){if(!s||s.ts<lastTs)return; lastTs=s.ts; state=s; render(); handleEvents(state.events||[])}
+setInterval(async()=>{
+  if(!direct||directFails>=3)return;
+  try{const r=await fetch(directUrl('/snap?token='+direct.token)); if(!r.ok)throw 0; directFails=0; takeState(await r.json())}
+  catch(e){directFails++}
+},1000);
 const pending={};   // ticker|side -> {price,t}: a dragged quote is shown at its new price until the engine confirms
-const pendingSize={};
+const pendingSize={}, pendingMax={}, purgeLock={};   // purgeLock: ticker -> time of the last Purge click
 function applyPending(ms){ms.forEach(m=>{
   m.orders=m.orders.map(o=>{const k=m.ticker+'|'+o.side,pd=pending[k]; if(!pd)return o;
     if(Date.now()-pd.t>8000||Math.abs(o.price_c-pd.price)<1e-6){delete pending[k];return o}
     return Object.assign({},o,{price_c:pd.price,manual:true})});
-  const ps=pendingSize[m.ticker]; if(ps){if(Date.now()-ps.t>8000||m.size===ps.v)delete pendingSize[m.ticker];else m.size=ps.v}})}
+  const ps=pendingSize[m.ticker]; if(ps){if(Date.now()-ps.t>8000||m.size===ps.v)delete pendingSize[m.ticker];else m.size=ps.v}
+  const pm=pendingMax[m.ticker]; if(pm){if(Date.now()-pm.t>8000||m.max_inv===pm.v)delete pendingMax[m.ticker];else m.max_inv=pm.v}})}
 
 // ---- pieces
 function ladder(m,n,compact){
@@ -117,7 +139,7 @@ function ladder(m,n,compact){
     const mine=o?`<span class="you">◀ YOU ${o.size}${o.manual?' · pinned':''}</span>`+(o.manual?`<span class="xbtn" data-action="clear" data-side="${o.side}" title="back to auto">↺</span>`:''):'';
     out+=`<div class="row ${side}${o?' our':''}" data-p="${k}" ${o?`data-side="${o.side}"`:''}><span class="bar" style="width:${Math.min(100,sz/maxSz*100)}%"></span><span class="sz">${sz?fmt(sz,0):'·'}</span><span class="px">${fmt(p,1)}${mine}</span></div>`;
   });
-  return `<div class="ladder" data-bb="${bb}" data-ba="${ba}" data-tick="${tick}">${out}<div class="spread">spread ${fmt(m.stats.spread_c,1)}¢${m.last_c!=null?' · last '+fmt(m.last_c,1)+'¢':''}</div></div>`;
+  return `<div class="ladder" data-bb="${bb}" data-ba="${ba}" data-tick="${tick}">${out}<div class="spread">spread ${fmt(m.stats.spread_c,1)}¢${m.last_c!=null?' · last '+fmt(m.last_c,1)+'¢':''}${m.fair_c!=null?' · theo '+fmt(m.fair_c,1)+'¢':''}</div></div>`;
 }
 function depth(m,w,h){
   const bids=m.bids, asks=m.asks;
@@ -164,18 +186,21 @@ function orders(m){
   return `<table class="ord"><tr><th>side</th><th>price</th><th>size</th><th>filled</th></tr>`+
     m.orders.map(o=>`<tr><td>${o.side==='bid'?'BUY YES':'SELL YES (buy NO @ '+fmt(100-o.price_c,1)+')'}${o.manual?' · pinned':''}</td><td>${fmt(o.price_c,1)}¢</td><td>${o.size}</td><td>${fmt(o.filled,2)}</td></tr>`).join('')+`</table>`;
 }
+function cdText(iso){const s=Math.floor((new Date(iso)-Date.now())/1000); if(!(s>0))return 'started';
+  const h=Math.floor(s/3600),mi=Math.floor(s%3600/60),se=s%60; return 'starts in '+(h?h+'h ':'')+mi+'m '+String(se).padStart(2,'0')+'s'}
+function tickCd(){document.querySelectorAll('.cd').forEach(e=>{const t=cdText(e.dataset.s); if(e.textContent!==t)e.textContent=t})}
+setInterval(tickCd,1000);
 function headHTML(m,wide){
-  const mins=m.mins_to_start, st=mins>=60?(mins/60).toFixed(1)+'h':Math.round(mins)+'m';
   const b={quoting:['q','QUOTING'],paused:['pause','PAUSED'],waiting:['','WAITING'],off:['','OFF']}[m.status]||['',''];
   return `<span class="grip" title="drag to move">⠿</span><div class="main"><div class="ttl" title="${esc(m.title)}">${esc(m.title)}</div><div class="sub">${esc(m.outcome)} · ${esc(m.ticker)}</div>`+
-    `<div class="badges"><span class="badge zero">0% fee</span><span class="badge ${b[0]}">${b[1]}</span><span class="badge">starts in ${st}</span>${m.note?`<span class="badge warn" title="${esc(m.note)}">${esc(m.note)}</span>`:''}</div></div>`+
+    `<div class="badges"><span class="badge zero">0% fee</span><span class="badge ${b[0]}">${b[1]}</span><span class="badge cd" data-s="${esc(m.start_iso)}"></span>${m.note?`<span class="badge warn" title="${esc(m.note)}">${esc(m.note)}</span>`:''}</div></div>`+
     `<button class="xp" title="${wide?'back to grid':'expand'}">${wide?'⤡':'⤢'}</button>`;
 }
 function invStrip(m){
   const s=m.stats, net=s.inventory||0, usd=v=>(v<0?'-':'')+'$'+Math.abs(v).toFixed(3);
   const T=(k,v,sub,c,tip)=>`<div class="tile" title="${tip}"><div class="k">${k}</div><div class="v ${c||''}">${v}</div>${sub?`<div class="sub">${sub}</div>`:''}</div>`;
   return `<div class="inv">`+
-    T('Inventory',(net>0?'+':'')+net,net>0?'long YES':(net<0?'long NO':'flat'),net?'neg':'','Net contracts held from market making: bought YES − sold YES. Carried across sessions.')+
+    T('Inventory',(net>0?'+':'')+net+' <span class="sub">/ '+m.max_inv+' max</span>',net>0?'long YES':(net<0?'long NO':'flat'),net?'neg':'','Net contracts held from market making: bought YES − sold YES. Carried across sessions.')+
     T('Avg buy',s.avg_bid_fill_c==null?'—':fmt(s.avg_bid_fill_c,1)+'¢',s.bid_qty?'×'+s.bid_qty+' filled':'','','Average price of your bid (buy YES) fills')+
     T('Avg sell',s.avg_ask_fill_c==null?'—':fmt(s.avg_ask_fill_c,1)+'¢',s.ask_qty?'×'+s.ask_qty+' filled':'','','Average price of your ask (sell YES / buy NO) fills')+
   `</div>`;
@@ -189,7 +214,7 @@ function dynHTML(m,wide){
 // ---- cards
 function makeCard(t){
   const el=document.createElement('div'); el.className='card'; el.dataset.t=t;
-  el.innerHTML='<div class="hd"></div><div class="dyn"></div><div class="ctl"><label>Contracts / side</label><input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off" spellcheck="false"><span class="sp"></span><button class="cancel">Cancel</button></div>';
+  el.innerHTML='<div class="hd"></div><div class="dyn"></div><div class="ctl"><label>Size</label><input class="sz" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off" spellcheck="false" title="Contracts offered on each side"><label>Max inv</label><input class="mx" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" autocomplete="off" spellcheck="false" title="Most net contracts held either way; at the cap that side stops quoting"><span class="br"></span><button class="sd" data-side="bid">Add B</button><button class="sd" data-side="ask">Add A</button><span class="sp"></span><button class="pg" disabled>Purge</button><span class="sp"></span><button class="on">ON</button><button class="cancel">Cancel</button></div>';
   board.appendChild(el);
   el.addEventListener('dragover',e=>{if(!dragging||dragging===el||expanded)return;e.preventDefault();el.classList.add('over');
     const r=el.getBoundingClientRect(),after=(e.clientX-r.left)>r.width/2;board.insertBefore(dragging,after?el.nextSibling:el)});
@@ -199,15 +224,19 @@ function makeCard(t){
   el.addEventListener('dragend',()=>{el.classList.remove('dragging');el.draggable=false;dragging=null;
     layout.order=[...board.children].map(c=>c.dataset.t).filter(Boolean);save();render()});
   el.addEventListener('mousedown',e=>{el.draggable=!!e.target.closest('.grip')&&!expanded});
-  const inp=el.querySelector('input');
-  const commit=()=>{const cur=state&&state.markets.find(x=>x.ticker===t); let v=Math.max(1,Math.min(25,parseInt(inp.value,10)||(cur?cur.size:1)));
-    inp.value=v; if(cur&&cur.size===v)return; pendingSize[t]={v,t:Date.now()}; act({action:'set_size',ticker:t,size:v})};
-  inp.addEventListener('mousedown',e=>e.stopPropagation());
-  inp.addEventListener('pointerdown',e=>e.stopPropagation());
-  inp.addEventListener('focus',()=>inp.select());
-  inp.addEventListener('input',()=>{inp.value=inp.value.replace(/[^0-9]/g,'')});
-  inp.addEventListener('keydown',e=>{if(e.key==='Enter'){inp.blur()}else if(e.key==='Escape'){const cur=state&&state.markets.find(x=>x.ticker===t);inp.value=cur?cur.size:1;inp.blur()}});
-  inp.addEventListener('blur',commit);
+  const wire=(inp,key,lo,hi,pend,field)=>{
+    const cur=()=>state&&state.markets.find(x=>x.ticker===t);
+    const commit=()=>{const c=cur(); let v=Math.max(lo,Math.min(hi,parseInt(inp.value,10)||(c?c[key]:lo)));
+      inp.value=v; if(c&&c[key]===v)return; pend[t]={v,t:Date.now()}; act({action:field,ticker:t,[key==='size'?'size':'max_inv']:v})};
+    inp.addEventListener('mousedown',e=>e.stopPropagation());
+    inp.addEventListener('pointerdown',e=>e.stopPropagation());
+    inp.addEventListener('focus',()=>inp.select());
+    inp.addEventListener('input',()=>{inp.value=inp.value.replace(/[^0-9]/g,'')});
+    inp.addEventListener('keydown',e=>{if(e.key==='Enter'){inp.blur()}else if(e.key==='Escape'){const c=cur();inp.value=c?c[key]:lo;inp.blur()}});
+    inp.addEventListener('blur',commit);
+  };
+  wire(el.querySelector('input.sz'),'size',1,25,pendingSize,'set_size');
+  wire(el.querySelector('input.mx'),'max_inv',1,500,pendingMax,'set_max_inv');
   return el;
 }
 function render(){
@@ -227,13 +256,24 @@ function render(){
     const hh=headHTML(m,wide), dd=dynHTML(m,wide);
     if(el._hh!==hh){el.querySelector('.hd').innerHTML=hh;el._hh=hh}
     if(el._dd!==dd){el.querySelector('.dyn').innerHTML=dd;el._dd=dd}
-    const inp=el.querySelector('input'); if(document.activeElement!==inp)inp.value=m.size;
-    const cb=el.querySelector('.ctl button'), paused=m.status==='paused';
-    cb.textContent=paused?'Resume':'Cancel'; cb.className=paused?'resume':'cancel';
+    const si=el.querySelector('input.sz'), mi=el.querySelector('input.mx');
+    if(document.activeElement!==si)si.value=m.size; if(document.activeElement!==mi)mi.value=m.max_inv;
+    el.querySelectorAll('.ctl button.sd').forEach(b=>{const on=m.sides&&m.sides[b.dataset.side], L=b.dataset.side==='bid'?'B':'A';
+      b.textContent=(on?'Pull ':'Add ')+L; b.classList.toggle('pull',!!on);
+      b.title=on?'cancel this side\'s quote and keep it off':'quote just this side of this market'});
+    const pb=el.querySelector('.ctl button.pg'), pu=m.purge;
+    const locked=purgeLock[m.ticker]&&Date.now()-purgeLock[m.ticker]<25000; if(!pu)delete purgeLock[m.ticker];
+    pb.disabled=!pu||locked; pb.textContent=locked?'Purging…':pu?('Purge ('+(pu.pnl_usd==null?'?':(pu.pnl_usd<0?'-':'+')+'$'+Math.abs(pu.pnl_usd).toFixed(2))+')'):'Purge';
+    pb.title=pu?`Sell/buy back all ${pu.qty} contracts now to get flat, profit or not: stops quoting this market, pulls its orders and hits the book (taker fee applies). The figure is the all-in result versus average entry.${pu.short?' The visible book is too thin for '+pu.short+' of them.':''}`:'no inventory to purge';
+    const ob=el.querySelector('.ctl button.on'); ob.disabled=!!m.active; ob.title=m.active?'quoting this market':'start market making on this market only';
   });
   [...board.children].forEach(c=>{if(c.dataset&&c.dataset.t&&!by[c.dataset.t])c.remove()});
-  layout.order.forEach(t=>{const el=board.querySelector(`[data-t="${CSS.escape(t)}"]`);if(el)board.appendChild(el)});
+  // Re-order only when the order actually changed: re-appending a card every second detaches it, which drops focus from
+  // an input being typed in (the size / max-inventory boxes).
+  const want=layout.order.filter(t=>board.querySelector(`[data-t="${CSS.escape(t)}"]`)), have=[...board.children].map(c=>c.dataset&&c.dataset.t).filter(Boolean);
+  if(want.join('|')!==have.join('|'))want.forEach(t=>board.appendChild(board.querySelector(`[data-t="${CSS.escape(t)}"]`)));
   paintDrag();
+  tickCd();
   setHeight();
 }
 
@@ -241,8 +281,12 @@ function render(){
 board.addEventListener('pointerdown',e=>{
   const card=e.target.closest('.card');
   if(card&&e.target.closest('button.xp')){const t=card.dataset.t;expanded=expanded===t?null:t;act({action:'focus',ticker:expanded});render();e.preventDefault();return}
-  if(card&&e.target.closest('.ctl button')){const t=card.dataset.t,m=state&&state.markets.find(x=>x.ticker===t);
-    act({action:(m&&m.status==='paused')?'resume_market':'cancel_market',ticker:t});e.preventDefault();return}
+  const cbn=card&&e.target.closest('.ctl button');
+  if(cbn){const t=card.dataset.t; if(cbn.disabled)return;
+    if(cbn.classList.contains('pg')){if(cbn.disabled)return; purgeLock[t]=Date.now(); act({action:'purge',ticker:t});e.preventDefault();return}
+    if(cbn.classList.contains('sd')){const m=state&&state.markets.find(x=>x.ticker===t), s=cbn.dataset.side;
+      act({action:(m&&m.sides&&m.sides[s])?'pull_side':'add_side',ticker:t,side:s});e.preventDefault();return}
+    act({action:cbn.classList.contains('on')?'resume_market':'cancel_market',ticker:t});e.preventDefault();return}
   const x=e.target.closest('.xbtn'); if(x){const t=x.closest('.card').dataset.t;delete pending[t+'|'+x.dataset.side];act({action:'clear_quote',ticker:t,side:x.dataset.side});e.preventDefault();return}
   const r=e.target.closest('.row.our'); if(!r)return;
   // The drag is tracked by ticker/side/price, not by DOM node, so the book keeps ticking (rows are rebuilt on every
@@ -280,10 +324,38 @@ window.addEventListener('message',e=>{
   const th=e.data.theme; if(th){const r=document.documentElement.style;
     if(th.secondaryBackgroundColor)r.setProperty('--card',th.secondaryBackgroundColor); if(th.textColor)r.setProperty('--fg',th.textColor);
     if(th.base==='light'){r.setProperty('--line','#d5d9e0');r.setProperty('--muted','#5b6472')}}
-  state=e.data.args.state;
-  if(inflight&&state.ack===inflight.nonce){queue.shift();inflight=null}
-  pump(); render();
+  const s=e.data.args.state; if(s&&s.act&&s.act.port)direct=s.act;
+  if(inflight&&s.ack===inflight.nonce){queue.shift();inflight=null}
+  pump(); takeState(s);
 });
+// ---- fill announcements: the card flashes red and a toast appears top-right of the page for 5s
+let evSeen=null;
+function toastHost(){
+  let doc=document; try{doc=window.parent.document; void doc.body}catch(e){doc=document}
+  let h=doc.getElementById('mm-toasts');
+  if(!h){h=doc.createElement('div'); h.id='mm-toasts'; h.style.cssText='position:fixed;top:56px;right:16px;z-index:2147483000;pointer-events:none';
+    doc.body.appendChild(h)}
+  return h;
+}
+function showToast(ev){
+  const h=toastHost(), d=h.ownerDocument.createElement('div');
+  d.style.cssText='background:#1f2430;border:1px solid #e74c3c;border-left:5px solid #e74c3c;color:#e6e6e6;border-radius:6px;padding:8px 12px;margin-bottom:8px;font:13px/1.35 system-ui,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.5);width:340px;transition:opacity .4s;pointer-events:auto';
+  const act=ev.liq==='offload'?(ev.side==='ask'?'OFFLOADED (sold YES)':'OFFLOADED (bought YES back)'):(ev.side==='bid'?'BID HIT (we bought YES)':'ASK LIFTED (we sold YES)');
+  const net=ev.inv, inv=(net>0?'long YES ':(net<0?'long NO ':'flat '))+(net?Math.abs(net):'');
+  d.innerHTML=`<b style="color:#fff">${act}</b> ${fmt(ev.qty,0)} @ ${fmt(ev.price_c,1)}¢${ev.fee_usd?` <span style="color:#9aa3b2;font-size:12px">(fee $${ev.fee_usd.toFixed(2)})</span>`:''}<br>${esc(ev.title)} · ${esc(ev.outcome)}<br>`+
+    `<span style="color:#9aa3b2;font-size:12px">market ${fmt(ev.bid,1)} / ${fmt(ev.ask,1)} · bought ${fmt(ev.bought,0)} · sold ${fmt(ev.sold,0)} · net ${inv}</span>`;
+  h.appendChild(d);
+  setTimeout(()=>{d.style.opacity='0'; setTimeout(()=>d.remove(),450)},5000);
+}
+function handleEvents(evs){
+  if(evSeen===null){evSeen=evs.length?Math.max(...evs.map(e=>e.id)):0;return}      // history from before this page load: no announcements
+  evs.filter(e=>e.id>evSeen).forEach(ev=>{
+    evSeen=Math.max(evSeen,ev.id);
+    const c=board.querySelector(`[data-t="${CSS.escape(ev.ticker)}"]`);
+    if(c){c.classList.remove('flash'); void c.offsetWidth; c.classList.add('flash'); setTimeout(()=>c.classList.remove('flash'),1200)}
+    showToast(ev);
+  });
+}
 window.addEventListener('resize',setHeight);
 send('streamlit:componentReady',{apiVersion:1});
 </script>

@@ -153,9 +153,11 @@ def place_order(ticker: str, price_cents: float, count: int,
                 side: str = 'yes',
                 expiration_ts: Optional[int] = None,
                 post_only: bool = False,
-                client_order_id: Optional[str] = None) -> dict:
+                client_order_id: Optional[str] = None,
+                time_in_force: str = 'good_till_canceled') -> dict:
     """
     Place a limit buy order on Kalshi for YES or NO contracts.
+    time_in_force='immediate_or_cancel' takes what is available at the price and cancels the rest.
     post_only=True guarantees the order rests (maker fee) — rejected if it would cross.
     `price_cents` is interpreted as yes_price for side='yes', no_price for side='no'.
 
@@ -173,7 +175,7 @@ def place_order(ticker: str, price_cents: float, count: int,
         'side':                       'ask' if side == 'no' else 'bid',
         'count':                      f'{count:.2f}',
         'price':                      _price_str(yes_price_cents),
-        'time_in_force':              'good_till_canceled',
+        'time_in_force':              time_in_force,
         'self_trade_prevention_type': 'taker_at_cross',
     }
     if expiration_ts:

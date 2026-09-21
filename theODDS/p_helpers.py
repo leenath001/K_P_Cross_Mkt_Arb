@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import requests
 import numpy as np
 import pandas as pd
@@ -95,6 +96,26 @@ def fetch_usage() -> tuple:
     return used, remaining
 
 
+_last_failed: list = []          # sports the most recent pinnacle_odds() could not load even after retries
+ODDS_WORKERS = 5                # OddsAPI rate-limits bursts (429): more parallel calls than this got sports silently dropped
+
+
+def _get_retry(url, params, timeout, tries=5):
+    """GET with backoff on rate limiting / transient gateway errors, so a burst never silently drops a sport."""
+    import random
+    resp = None
+    for attempt in range(tries):
+        resp = requests.get(url, params=params, timeout=timeout)
+        if resp.status_code not in (429, 502, 503, 504):
+            return resp
+        try:
+            wait = float(resp.headers.get('Retry-After', 0))
+        except ValueError:
+            wait = 0.0
+        time.sleep(max(wait, 1.0 * (attempt + 1)) + random.random() * 0.5)
+    return resp
+
+
 def check_sports_with_events(sport_keys: list, hrs: int) -> dict:
     """
     For each sport key, query the /v4/sports/{sport}/events endpoint to check
@@ -111,14 +132,10 @@ def check_sports_with_events(sport_keys: list, hrs: int) -> dict:
 
     def _one(key):
         try:
-            resp = requests.get(
+            resp = _get_retry(
                 f'{BASE_URL}/sports/{key}/events',
-                params={
-                    'apiKey':            API_KEY,
-                    'commenceTimeFrom':  t_from,
-                    'commenceTimeTo':    t_to,
-                },
-                timeout=10,
+                {'apiKey': API_KEY, 'commenceTimeFrom': t_from, 'commenceTimeTo': t_to},
+                timeout=15,
             )
             if resp.ok:
                 _api_usage['used']      = int(resp.headers.get('x-requests-used',      _api_usage['used']))
@@ -132,7 +149,7 @@ def check_sports_with_events(sport_keys: list, hrs: int) -> dict:
 
     # Parallel: 60+ sports one-by-one blocked the app's first render for a minute or more.
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with ThreadPoolExecutor(max_workers=ODDS_WORKERS) as pool:
         counts = dict(pool.map(_one, sport_keys))
     return counts
 
@@ -160,7 +177,7 @@ def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFram
         'commenceTimeFrom': x1,
         'commenceTimeTo':   x2,}
         try:
-            resp = requests.get(f'{BASE_URL}/sports/{sport}/odds', params=params, timeout=30)
+            resp = _get_retry(f'{BASE_URL}/sports/{sport}/odds', params, timeout=30)
             resp.raise_for_status()
             return sport, resp
         except requests.exceptions.RequestException:
@@ -170,9 +187,12 @@ def pinnacle_odds(sports: list[str], hrs:int, live: bool = False) -> pd.DataFram
 
     # All sports fetched in parallel (each call can take several seconds); parsing below stays sequential.
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=min(12, max(1, len(sports)))) as pool:
+    with ThreadPoolExecutor(max_workers=min(ODDS_WORKERS, max(1, len(sports)))) as pool:
         fetched = list(pool.map(_fetch, sports))
 
+    _last_failed[:] = [sp for sp, r in fetched if r is None]
+    if _last_failed:
+        log.warning('pinnacle_odds: %d sport(s) failed after retries: %s', len(_last_failed), _last_failed)
     for sport, resp_odds in fetched:
         if resp_odds is None:
             continue

@@ -842,6 +842,7 @@ with tab_trade:
                             with st.container(key='_btnrow_dashboard', horizontal=True,
                                               horizontal_alignment='right', gap='medium'):
                                 if st.button('Cancel all', key='_cancel_all_btn'):
+                                    st.session_state['_fast_positions_until'] = time.time() + 45   # watch rows clear as each order cancels
                                     if stop_event:
                                         stop_event.set()
                                     st.session_state['_dash_last_action'] = {
@@ -851,6 +852,7 @@ with tab_trade:
                                 if st.button('↑ Cross & Cancel', key='_cross_cancel_btn',
                                               help='Re-check each resting order against Pinnacle fair value. '
                                                    'Crosses if EV still positive at current ask, cancels if not.'):
+                                    st.session_state['_fast_positions_until'] = time.time() + 45
                                     _snap2    = dash.snapshot()
                                     _pos_now  = _snap2['positions']
                                     _RESTING  = {'resting', 'open', 'pending', 'unknown'}
@@ -999,7 +1001,7 @@ with tab_trade:
                 # countdown timer above stays on the outer 1s cadence since a plain
                 # st.progress isn't a widget with state to preserve — it updates via
                 # normal prop diffing, no remount risk, so it can afford to be smooth.
-                @st.fragment(run_every='10s' if is_alive else None)
+                @st.fragment(run_every=('2s' if time.time() < st.session_state.get('_fast_positions_until', 0) else '10s') if is_alive else None)
                 def _positions_panel():
                     if dash is None:
                         return
@@ -1048,9 +1050,12 @@ with tab_trade:
                                 })
                             n = len(rows)
 
-                            # Red = unfilled, yellow = partial, green = fully filled.
+                            # Red = unfilled and still resting, yellow = partial, green = fully filled;
+                            # an order that has been cancelled / expired loses its highlight.
                             def _fill_color(row):
                                 cts_, filled_ = row['Contracts'], row['Filled']
+                                if row['Status'] in ('canceled', 'expired') and filled_ <= 0:
+                                    return [''] * len(row)
                                 if cts_ > 0 and filled_ >= cts_:
                                     bg = 'rgba(46, 204, 113, 0.25)'    # green
                                 elif filled_ > 0:

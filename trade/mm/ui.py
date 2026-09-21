@@ -5,8 +5,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import threading
-from trade.mm.engine import (MMEngine, ENGINE_VERSION, MAX_SIZE, DEFAULT_SIZE, zero_fee_sports, screen_candidates, spec_from_row)
-from trade.mm.ledger import pnl_table, load_fills
+from trade.mm.engine import (MMEngine, ENGINE_VERSION, MAX_SIZE, DEFAULT_SIZE, MAX_INV_LIMIT, DEFAULT_MAX_INV, zero_fee_sports, screen_candidates, spec_from_row)
+from trade.mm.ledger import pnl_table, load_fills, load_markouts, mm_summary
 from trade.settle import fetch_market_result
 
 _board = components.declare_component(
@@ -32,16 +32,23 @@ def _stop_stale_engines():
                     pass
 
 
+def _engine_module():
+    """The CURRENT trade.mm.engine module. Streamlit re-imports an edited module, but this file (unedited) keeps the names it
+    imported at the top, i.e. the OLD class and version: an engine fix then never took effect until this file was touched."""
+    import importlib
+    return importlib.import_module('trade.mm.engine')
+
+
 @st.cache_resource
-def _make_engine(version: int) -> MMEngine:
+def _make_engine(version: int):
     _stop_stale_engines()          # Streamlit hot-reloads changed modules but keeps cached objects built from the old class
-    e = MMEngine()
+    e = _engine_module().MMEngine()
     e.start()
     return e
 
 
-def get_engine() -> MMEngine:
-    return _make_engine(ENGINE_VERSION)
+def get_engine():
+    return _make_engine(_engine_module().ENGINE_VERSION)
 
 
 def _toggle_quoting(eng):
@@ -54,6 +61,12 @@ def _toggle_quoting(eng):
 
 def _cancel_all(eng):
     eng.kill()
+
+
+def _refresh_markets(eng):
+    """Force a market re-screen now (the next controls refresh, ≤2s, starts it in the background)."""
+    if eng.screen_state != 'loading':
+        eng.screen_key = None
 
 
 def _screen_if_needed(eng, hrs: int):
@@ -76,16 +89,20 @@ def render_trade():
     def _controls():
         # ── controls, one row: window · ON/OFF · cancel all ────────────────────
         # Equal-width cells, bottom-aligned so the buttons sit on the same line as the input boxes.
-        c1, c1b, c1c, c2, c3, _spare = st.columns([1, 1, 1, 1, 1, 1.4], vertical_alignment='bottom')
-        hrs = c1.number_input('Games starting within (h)', 2, 48, 18, key='_mm_hrs')
+        c1, c1b, c1m, c1c, c2, c2b, c3, c4 = st.columns([1.15, 1, 1, 1, 0.75, 1.1, 0.9, 1.3], vertical_alignment='bottom')
+        hrs = c1.number_input('Games starting within', 2, 48, 18, key='_mm_hrs')
         c1b.number_input('Size, all markets', 1, MAX_SIZE, DEFAULT_SIZE, key='_mm_size_all',
                          on_change=lambda: (eng.set_all_sizes(st.session_state['_mm_size_all']), st.session_state.setdefault('_mm_size_seen', set()).update(eng.snapshot_tickers())),
                          help='Contracts offered on each side of every market. Each card\'s own box can still be edited after.')
-        c1c.number_input('Pinnacle refresh (s)', 10, 300, 30, step=5, key='_mm_fair_sec',
+        c1m.number_input('Max inventory, all', 1, MAX_INV_LIMIT, DEFAULT_MAX_INV, key='_mm_maxinv_all',
+                         on_change=lambda: (eng.set_all_max_inv(st.session_state['_mm_maxinv_all']), st.session_state.setdefault('_mm_size_seen', set()).update(eng.snapshot_tickers())),
+                         help='Most net contracts held per market, either direction. At the cap that side stops quoting until we can reduce; '
+                              'the other side stays up. Each card\'s own box can still be edited after.')
+        c1c.number_input('Pinnacle refresh', 10, 300, 30, step=5, key='_mm_fair_sec',
                          on_change=lambda: eng.set_params(fair_refresh_sec=st.session_state['_mm_fair_sec']),
                          help='How often Pinnacle fair values are re-fetched for sports with live quotes. Each refresh costs OddsAPI credits.')
         seen = st.session_state.setdefault('_mm_size_seen', set())
-        eng.apply_size_to_new(st.session_state['_mm_size_all'], seen)
+        eng.apply_size_to_new(st.session_state['_mm_size_all'], seen, st.session_state['_mm_maxinv_all'])
         if eng.params['fair_refresh_sec'] != st.session_state['_mm_fair_sec']:
             eng.set_params(fair_refresh_sec=st.session_state['_mm_fair_sec'])
         quoting = eng.params['live']
@@ -93,6 +110,13 @@ def render_trade():
         c2.button('OFF' if quoting else 'ON', key='_mm_onoff', type='primary' if quoting else 'secondary',
                   on_click=_toggle_quoting, args=(eng,), width='stretch',
                   help='ON → fire quotes on every funded market. While quoting this button reads OFF: click it to cancel them all.')
+        c2b.button('Refresh', key='_mm_refresh', on_click=_refresh_markets, args=(eng,), width='stretch',
+                   help='Re-screen now for new zero-fee games instead of waiting for the 45-minute refresh (about 1 OddsAPI credit per zero-fee sport).')
+        offload = c4.toggle('Auto-offload', value=True, key='_mm_offload',
+                            help='While a market is quoting, sell (or buy back) held inventory at the touch whenever it '
+                                 'nets a profit after the taker fee.')
+        if eng.params['auto_offload'] != offload:
+            eng.set_params(auto_offload=offload)
         c3.button('Cancel all', key='_mm_cancel_all', on_click=_cancel_all, args=(eng,), width='stretch',
                   help='Stops quoting and cancels every market-making order (including strays from an earlier run).')
         _screen_if_needed(eng, int(hrs))
@@ -107,7 +131,8 @@ def render_trade():
         else:
             st.caption(f"{len(snap['markets'])} markets loaded · {n_q} quoting" +
                        (f" · ${cash:,.2f} available" if cash is not None else '') +
-                       ' · markets are funded in ranking order until cash runs out')
+                       ' · markets are funded in ranking order until cash runs out' +
+                       (f" · {len(eng.screen_failed)} sport(s) failed to load (OddsAPI busy) — press Refresh markets" if getattr(eng, 'screen_failed', []) else ''))
 
     _controls()
 
@@ -117,19 +142,7 @@ def render_trade():
         act = _board(state=eng.snapshot(), key='mm_board', default=None)
         # Actions from the board (queued client-side); the nonce de-dupes re-delivery, `ack` releases the queue.
         if act and act.get('nonce') != eng.ack:
-            a, t = act.get('action'), act.get('ticker')
-            if a == 'set_quote':
-                eng.set_manual_quote(t, act['side'], float(act['price_c']))
-            elif a == 'clear_quote':
-                eng.clear_manual_quote(t, act['side'])
-            elif a == 'set_size':
-                eng.set_market_size(t, int(act['size']))
-            elif a == 'cancel_market':
-                eng.pause_market(t)
-            elif a == 'resume_market':
-                eng.resume_market(t)
-            elif a == 'focus':
-                eng.set_focus(t)
+            eng.handle_action(act)
             eng.ack = act.get('nonce')
 
     _live_board()
@@ -154,6 +167,43 @@ def render_review():
         c3.metric('Total MM PnL', f"${tbl['total_$'].sum():+.3f}")
         c4.metric('Fills logged', len(fills))
         st.dataframe(tbl, hide_index=True, width='stretch')
+
+        # ── market-maker metrics ──────────────────────────────────────────
+        st.markdown('#### Market-maker metrics')
+        summ = mm_summary(fills, load_markouts(), results)
+        for row in (summ['kpi'][:6], summ['kpi'][6:]):
+            cols = st.columns(len(row))
+            for col, (label, val, hint) in zip(cols, row):
+                col.metric(label, val, help=hint)
+        w = summ['walk']
+        import plotly.graph_objects as go
+        g1, g2 = st.columns(2)
+        fig = go.Figure(go.Scatter(x=pd.to_datetime(w['ts']), y=w['cum_realized'], mode='lines+markers', line_shape='hv',
+                                   line=dict(color='#2ecc71'), hovertemplate='%{x}<br>cumulative realized $%{y:.3f}<extra></extra>'))
+        fig.update_layout(title='Cumulative realized PnL (net of fees)', height=280, margin=dict(l=10, r=10, t=40, b=10), yaxis_title='$')
+        g1.plotly_chart(fig, width='stretch')
+        fig = go.Figure(go.Scatter(x=pd.to_datetime(w['ts']), y=w['net_pos_all'], mode='lines', line_shape='hv',
+                                   line=dict(color='#4c9be8'), hovertemplate='%{x}<br>net contracts %{y:.0f}<extra></extra>'))
+        fig.update_layout(title='Net inventory over time (all markets)', height=280, margin=dict(l=10, r=10, t=40, b=10), yaxis_title='contracts')
+        g2.plotly_chart(fig, width='stretch')
+        e = w.dropna(subset=['edge_c'])
+        if len(e):
+            g3, g4 = st.columns(2)
+            fig = go.Figure(go.Histogram(x=e['edge_c'], nbinsx=25, marker_color='#f5b301'))
+            fig.update_layout(title='Edge at fill vs Pinnacle fair (¢) — right of 0 = we got the better side', height=260,
+                              margin=dict(l=10, r=10, t=40, b=10), bargap=0.05)
+            g3.plotly_chart(fig, width='stretch')
+            snap_m = pd.DataFrame(eng.snapshot()['markets'])
+            if len(snap_m):
+                q = pd.DataFrame({'market': snap_m['ticker'].str[-24:],
+                                  'two-sided %': [m['stats']['two_sided_pct'] for m in eng.snapshot()['markets']],
+                                  'requotes': [m['stats']['requotes'] for m in eng.snapshot()['markets']],
+                                  'API errors': [m['stats']['api_err'] for m in eng.snapshot()['markets']]})
+                g4.markdown('**Quoting quality (this session)**')
+                g4.caption('two-sided % = share of cycles both a bid and an ask were up; high re-quotes with few fills means paying API churn for nothing.')
+                g4.dataframe(q[q['requotes'] > 0].sort_values('requotes', ascending=False), hide_index=True, width='stretch', height=210)
+        st.markdown('**By market**')
+        st.dataframe(summ['by_market'], hide_index=True, width='stretch')
         with st.expander('Fill log'):
             st.dataframe(fills.sort_values('ts', ascending=False), hide_index=True, width='stretch')
 
