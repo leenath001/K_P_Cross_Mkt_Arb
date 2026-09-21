@@ -8,7 +8,7 @@
 body{margin:0;background:transparent;color:var(--fg);font:12px/1.35 "Source Sans Pro",system-ui,sans-serif}
 #board{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:stretch}
 #board.one{grid-template-columns:minmax(0,1fr)}
-#board:not(.one) .card{display:flex;flex-direction:column;min-height:335px}
+#board:not(.one) .card{display:flex;flex-direction:column;min-height:372px}
 #board:not(.one) .dyn{flex:1;min-height:0}
 #board:not(.one) .ctl{margin-top:auto}
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:0}
@@ -21,7 +21,7 @@ body{margin:0;background:transparent;color:var(--fg);font:12px/1.35 "Source Sans
 .badges{display:flex;flex-wrap:nowrap;gap:4px;margin-top:3px;overflow:hidden}
 .badge{border:1px solid var(--line);border-radius:10px;padding:0 7px;font-size:10px;color:var(--muted);white-space:nowrap}
 .badge.q{background:#5a1f1f;border-color:#a33;color:#ffb3b3}
-.badge.zero{border-color:#2c6b45;color:#7fd9a2}
+.badge.zero{border-color:#2c6b45;color:#7fd9a2}.badge.side{color:var(--fg)}
 .badge.warn{color:#f5b301;border-color:#8a6d10;min-width:0;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto}
 .badge.pause{background:#4a3a12;border-color:#a8801a;color:#ffd97a}
 button{background:transparent;border:1px solid var(--line);color:var(--fg);border-radius:4px;cursor:pointer;font:inherit}
@@ -53,6 +53,9 @@ table.ord td,table.ord th{padding:1px 4px;text-align:left;border-bottom:1px soli
 .note{color:var(--gold);margin-top:4px;font-size:11px}
 .inv{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;margin-top:4px}
 .inv .tile{padding:2px 6px}
+.tile.okfill{background:rgba(46,204,113,.18);border-color:#2c6b45}
+.n0{color:var(--red)}.np{color:var(--gold)}.nf{color:var(--green)}
+.meta{margin-top:4px;color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta b{color:var(--fg);font-weight:600}
 .inv .tile .v{font-size:12px}
 .empty{color:var(--muted);padding:30px;text-align:center}
 .ctl{display:flex;flex-wrap:wrap;align-items:center;gap:6px 5px;margin-top:8px;padding-top:6px;border-top:1px solid var(--line)}
@@ -71,7 +74,7 @@ table.ord td,table.ord th{padding:1px 4px;text-align:left;border-bottom:1px soli
 <body>
 <div id="board"></div>
 <script>
-const KEY='mm_layout_v2';
+const KEY='pin_layout_v1';
 let layout={order:[]}, state=null, dragging=null, qdrag=null, expanded=null;
 try{layout=Object.assign(layout,JSON.parse(localStorage.getItem(KEY)||'{}'))}catch(e){}
 const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(layout))}catch(e){}};
@@ -111,13 +114,12 @@ setInterval(async()=>{
   catch(e){directFails++}
 },1000);
 const pending={};   // ticker|side -> {price,t}: a dragged quote is shown at its new price until the engine confirms
-const pendingSize={}, pendingMax={}, purgeLock={};   // purgeLock: ticker -> time of the last Purge click
+const pendingSize={};
 function applyPending(ms){ms.forEach(m=>{
   m.orders=m.orders.map(o=>{const k=m.ticker+'|'+o.side,pd=pending[k]; if(!pd)return o;
     if(Date.now()-pd.t>8000||Math.abs(o.price_c-pd.price)<1e-6){delete pending[k];return o}
     return Object.assign({},o,{price_c:pd.price,manual:true})});
-  const ps=pendingSize[m.ticker]; if(ps){if(Date.now()-ps.t>8000||m.size===ps.v)delete pendingSize[m.ticker];else m.size=ps.v}
-  const pm=pendingMax[m.ticker]; if(pm){if(Date.now()-pm.t>8000||m.max_inv===pm.v)delete pendingMax[m.ticker];else m.max_inv=pm.v}})}
+  const ps=pendingSize[m.ticker]; if(ps){if(Date.now()-ps.t>8000||m.contracts===ps.v)delete pendingSize[m.ticker];else m.contracts=ps.v}})}
 
 // ---- pieces
 function ladder(m,n,compact){
@@ -221,62 +223,66 @@ function depth(m,w,h){
   return `<svg viewBox="0 0 ${w} ${h}"><path d="${path(bv,bc,-1)}" fill="rgba(46,204,113,.25)" stroke="#2ecc71" stroke-width="1.5"/><path d="${path(av,ac,1)}" fill="rgba(231,76,76,.25)" stroke="#e74c3c" stroke-width="1.5"/>${lines}${ticks}</svg>`;
 }
 function stats(m){
-  const s=m.stats, T=(k,v,c)=>`<div class="tile"><div class="k">${k}</div><div class="v ${c||''}">${v}</div></div>`;
-  const usd=v=>(v<0?'-':'')+'$'+Math.abs(v).toFixed(3);
+  const T=(k,v,c)=>`<div class="tile"><div class="k">${k}</div><div class="v ${c||''}">${v}</div></div>`;
+  const usd=v=>v==null?'—':(v<0?'-':'')+'$'+Math.abs(v).toFixed(2), s=m.stats;
   return `<div class="stats">`+
-   T('fair (Pinnacle)',fmt(m.fair_c,1)+'¢ <span class="sub">'+m.fair_age_s+'s ago</span>')+
-   T('mid − fair',s.mid_minus_fair_c==null?'—':fmt(s.mid_minus_fair_c,2)+'¢')+
+   T('side',m.side==='yes'?'BUY YES':'BUY NO')+
+   T('status',esc(m.status_label))+
+   T('filled / contracts',fmt(m.filled,0)+' / '+m.contracts)+
+   T('order price',fmt(m.entry_c,1)+'¢')+
+   T('avg fill',m.avg_c==null?'—':fmt(m.avg_c,2)+'¢')+
+   T('market ask (ours)',m.mkt_ask_c==null?'—':fmt(m.mkt_ask_c,1)+'¢')+
+   T('exit bid (ours)',m.exit_c==null?'—':fmt(m.exit_c,1)+'¢')+
+   T('unrealized',usd(m.unreal_usd),cls(m.unreal_usd))+
+   T('cost',usd(m.cost_usd))+
+   T('to win (before fees)',usd(m.to_win_usd),'pos')+
+   T('fair entry',m.fair_entry==null?'—':fmt(m.fair_entry,3))+
+   T('fair last',m.fair_last==null?'—':fmt(m.fair_last,3))+
+   T('edge',m.edge==null?'—':(m.edge>0?'+':'')+fmt(m.edge,3),cls(m.edge))+
+   T('fee rate',m.fee_rate==null?'—':fmt(m.fee_rate,4))+
    T('book spread',fmt(s.spread_c,1)+'¢')+
-   T('our spread',s.quote_spread_c==null?'—':fmt(s.quote_spread_c,1)+'¢','pos')+
-   T('bid off top',s.bid_off_top_ticks==null?'—':s.bid_off_top_ticks+' ticks')+
-   T('ask off top',s.ask_off_top_ticks==null?'—':s.ask_off_top_ticks+' ticks')+
    T('depth ±5¢ (b/a)',fmt(s.depth_bid_5c,0)+' / '+fmt(s.depth_ask_5c,0))+
-   T('two-sided',s.two_sided_pct+'%')+
-   T('size / side',m.size+' contracts')+
-   T('avg bid fill',s.avg_bid_fill_c==null?'—':fmt(s.avg_bid_fill_c,2)+'¢ <span class="sub">×'+s.bid_qty+'</span>')+
-   T('avg ask fill',s.avg_ask_fill_c==null?'—':fmt(s.avg_ask_fill_c,2)+'¢ <span class="sub">×'+s.ask_qty+'</span>')+
-   T('fills b / a',s.fills_bid+' / '+s.fills_ask)+
-   T('matched pairs',s.matched)+
-   T('locked spread',usd(s.capture_usd),cls(s.capture_usd))+
-   T('inventory',s.inventory,s.inventory?'neg':'')+
-   T('inv mark vs fair',usd(s.mtm_usd),cls(s.mtm_usd))+
-   T('avg edge @ fill',s.avg_edge_at_fill_c==null?'—':fmt(s.avg_edge_at_fill_c,2)+'¢',cls(s.avg_edge_at_fill_c))+
-   T('re-quotes / errors',s.requotes+' / '+s.api_err)+`</div>`;
+   T('sport',esc(m.sport))+
+   T('last Pinnacle ping',esc(m.last_ping||'—'))+`</div>`;
 }
 function orders(m){
-  if(!m.orders.length)return '<div class="sub" style="margin-top:4px">no quotes resting</div>';
-  return `<table class="ord"><tr><th>side</th><th>price</th><th>size</th><th>filled</th></tr>`+
-    m.orders.map(o=>`<tr><td>${o.side==='bid'?'BUY YES':'SELL YES (buy NO @ '+fmt(100-o.price_c,1)+')'}${o.manual?' · pinned':''}</td><td>${fmt(o.price_c,1)}¢</td><td>${o.size}</td><td>${fmt(o.filled,2)}</td></tr>`).join('')+`</table>`;
+  if(!m.orders.length)return '<div class="sub" style="margin-top:4px">no order resting</div>';
+  return `<table class="ord"><tr><th>order</th><th>price</th><th>left</th><th>filled</th></tr>`+
+    m.orders.map(o=>`<tr><td>${m.side==='yes'?'BUY YES':'BUY NO @ '+fmt(100-o.price_c,1)+'¢'}</td><td>${fmt(o.price_c,1)}¢ (YES)</td><td>${o.size}</td><td>${fmt(o.filled,0)}</td></tr>`).join('')+`</table>`;
 }
 function cdText(iso){const s=Math.floor((new Date(iso)-Date.now())/1000); if(!(s>0))return 'started';
   const h=Math.floor(s/3600),mi=Math.floor(s%3600/60),se=s%60; return 'starts in '+(h?h+'h ':'')+mi+'m '+String(se).padStart(2,'0')+'s'}
 function tickCd(){document.querySelectorAll('.cd').forEach(e=>{const t=cdText(e.dataset.s); if(e.textContent!==t)e.textContent=t})}
 setInterval(tickCd,1000);
 function headHTML(m,wide){
-  const b={quoting:['q','QUOTING'],paused:['pause','PAUSED'],waiting:['','WAITING'],off:['','OFF']}[m.status]||['',''];
+  const b={resting:'q',partial:'pause',filled:'zero',closed:''}[m.status]||'';
   return `<span class="grip" title="drag to move">⠿</span><div class="main"><div class="ttl" title="${esc(m.title)}">${esc(m.title)}</div><div class="sub">${esc(m.outcome)} · ${esc(m.ticker)}</div>`+
-    `<div class="badges"><span class="badge zero">0% fee</span><span class="badge ${b[0]}">${b[1]}</span><span class="badge cd" data-s="${esc(m.start_iso)}"></span>${m.note?`<span class="badge warn" title="${esc(m.note)}">${esc(m.note)}</span>`:''}</div></div>`+
+    `<div class="badges"><span class="badge side">${m.side==='yes'?'BUY YES':'BUY NO'}</span><span class="badge ${b}">${esc(m.status_label)}</span><span class="badge cd" data-s="${esc(m.start_iso)}"></span>${m.note?`<span class="badge warn" title="${esc(m.note)}">${esc(m.note)}</span>`:''}</div></div>`+
     `<button class="xp" title="${wide?'back to grid':'expand'}">${wide?'⤡':'⤢'}</button>`;
 }
-function invStrip(m){
-  const s=m.stats, net=s.inventory||0, usd=v=>(v<0?'-':'')+'$'+Math.abs(v).toFixed(3);
-  const T=(k,v,sub,c,tip)=>`<div class="tile" title="${tip}"><div class="k">${k}</div><div class="v ${c||''}">${v}</div>${sub?`<div class="sub">${sub}</div>`:''}</div>`;
+function fillStrip(m){
+  const full=m.contracts>0&&m.filled>=m.contracts, nc=m.filled<=0?'n0':(full?'nf':'np'), usd=v=>(v<0?'-':'+')+'$'+Math.abs(v).toFixed(2);
+  const T=(k,v,sub,c,tip,box)=>`<div class="tile ${box||''}" title="${tip}"><div class="k">${k}</div><div class="v ${c||''}">${v}</div>${sub?`<div class="sub">${sub}</div>`:''}</div>`;
   return `<div class="inv">`+
-    T('Inventory',(net>0?'+':'')+net+' <span class="sub">/ '+m.max_inv+' max</span>',net>0?'long YES':(net<0?'long NO':'flat'),net?'neg':'','Net contracts held from market making: bought YES − sold YES. Carried across sessions.')+
-    T('Avg buy',s.avg_bid_fill_c==null?'—':fmt(s.avg_bid_fill_c,1)+'¢',s.bid_qty?'×'+s.bid_qty+' filled':'','','Average price of your bid (buy YES) fills')+
-    T('Avg sell',s.avg_ask_fill_c==null?'—':fmt(s.avg_ask_fill_c,1)+'¢',s.ask_qty?'×'+s.ask_qty+' filled':'','','Average price of your ask (sell YES / buy NO) fills')+
+    T('Filled',`${fmt(m.filled,0)} <span class="sub">/ ${m.contracts}</span>`,full?'fully filled':(m.filled>0?'partial':'none yet'),nc,'Contracts filled of the order. Green box = fully filled; number red at 0, yellow while partial.',full?'okfill':'')+
+    T('Avg buy',m.avg_c==null?'—':fmt(m.avg_c,1)+'¢',m.avg_c==null?'':'cost $'+fmt(m.cost_usd,2),'','Average price of the fills so far (your side)')+
+    T('Exit bid',m.exit_c==null?'—':fmt(m.exit_c,1)+'¢',m.unreal_usd==null?'':'unreal. '+usd(m.unreal_usd),cls(m.unreal_usd),'What the position could be sold for right now (best bid on your side), and the unrealized result at that price before fees.')+
   `</div>`;
+}
+function metaLine(m){
+  const e=m.edge;
+  return `<div class="meta" title="Pinnacle fair probability at entry → now, edge, and the ask on your side">fair <b>${m.fair_entry==null?'—':fmt(m.fair_entry,3)}</b> → <b>${m.fair_last==null?'—':fmt(m.fair_last,3)}</b> · edge <b class="${cls(e)}">${e==null?'—':(e>0?'+':'')+fmt(e,3)}</b> · order <b>${fmt(m.entry_c,1)}¢</b> · ask <b>${m.mkt_ask_c==null?'—':fmt(m.mkt_ask_c,1)+'¢'}</b></div>`;
 }
 function dynHTML(m,wide){
   const note=m.note?`<div class="note">${esc(m.note)}</div>`:'';
-  if(!wide)return compactBook(m,10)+invStrip(m);   // (the status note shows as a badge in the header)
-  return `<div class="pane"><h4 title="Every price level: contracts, and the cash resting there (bids: price x size; asks: (100 - price) x size). Scroll for the whole book.">Order book · all levels · drag YOU</h4>${fullBook(m)}</div><div class="pane"><h4>Depth &amp; our quotes</h4>${depth(m,640,300)}${orders(m)}${note}</div><div class="pane"><h4>Stats</h4>${stats(m)}</div>`;
+  if(!wide)return compactBook(m,10)+fillStrip(m)+metaLine(m);   // 5 levels a side
+  return `<div class="pane"><h4 title="Every price level: contracts, and the cash resting there (bids: price x size; asks: (100 - price) x size). Scroll for the whole book.">Order book · all levels · drag YOU</h4>${fullBook(m)}</div><div class="pane"><h4>Depth &amp; our order</h4>${depth(m,640,300)}${orders(m)}${note}${fillStrip(m)}</div><div class="pane"><h4>Stats</h4>${stats(m)}</div>`;
 }
 
 // ---- cards
 function makeCard(t){
   const el=document.createElement('div'); el.className='card'; el.dataset.t=t;
-  el.innerHTML='<div class="hd"></div><div class="dyn"></div><div class="ctl"><label>Size</label><input class="sz" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off" spellcheck="false" title="Contracts offered on each side"><label>Max inv</label><input class="mx" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" autocomplete="off" spellcheck="false" title="Most net contracts held either way; at the cap that side stops quoting"><span class="br"></span><button class="sd" data-side="bid">Add B</button><button class="sd" data-side="ask">Add A</button><span class="sp"></span><button class="pg" disabled>Purge</button><span class="sp"></span><button class="on">ON</button><button class="cancel">Cancel</button></div>';
+  el.innerHTML='<div class="hd"></div><div class="dyn"></div><div class="ctl"><label>Contracts</label><input class="sz" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" autocomplete="off" spellcheck="false" title="Total contracts for this order; changing it cancels and re-rests the unfilled part"><span class="sp"></span><button class="cancel">Cancel</button></div>';
   board.appendChild(el);
   el.addEventListener('dragover',e=>{if(!dragging||dragging===el||expanded)return;e.preventDefault();el.classList.add('over');
     const r=el.getBoundingClientRect(),after=(e.clientX-r.left)>r.width/2;board.insertBefore(dragging,after?el.nextSibling:el)});
@@ -286,25 +292,21 @@ function makeCard(t){
   el.addEventListener('dragend',()=>{el.classList.remove('dragging');el.draggable=false;dragging=null;
     layout.order=[...board.children].map(c=>c.dataset.t).filter(Boolean);save();render()});
   el.addEventListener('mousedown',e=>{el.draggable=!!e.target.closest('.grip')&&!expanded});
-  const wire=(inp,key,lo,hi,pend,field)=>{
-    const cur=()=>state&&state.markets.find(x=>x.ticker===t);
-    const commit=()=>{const c=cur(); let v=Math.max(lo,Math.min(hi,parseInt(inp.value,10)||(c?c[key]:lo)));
-      inp.value=v; if(c&&c[key]===v)return; pend[t]={v,t:Date.now()}; act({action:field,ticker:t,[key==='size'?'size':'max_inv']:v})};
-    inp.addEventListener('mousedown',e=>e.stopPropagation());
-    inp.addEventListener('pointerdown',e=>e.stopPropagation());
-    inp.addEventListener('focus',()=>inp.select());
-    inp.addEventListener('input',()=>{inp.value=inp.value.replace(/[^0-9]/g,'')});
-    inp.addEventListener('keydown',e=>{if(e.key==='Enter'){inp.blur()}else if(e.key==='Escape'){const c=cur();inp.value=c?c[key]:lo;inp.blur()}});
-    inp.addEventListener('blur',commit);
-  };
-  wire(el.querySelector('input.sz'),'size',1,25,pendingSize,'set_size');
-  wire(el.querySelector('input.mx'),'max_inv',1,500,pendingMax,'set_max_inv');
+  const inp=el.querySelector('input.sz'), cur=()=>state&&state.markets.find(x=>x.ticker===t);
+  const commit=()=>{const c=cur(); let v=Math.max(1,Math.min(999,parseInt(inp.value,10)||(c?c.contracts:1)));
+    inp.value=v; if(!c||c.contracts===v||inp.disabled)return; pendingSize[t]={v,t:Date.now()}; act({action:'set_size',ticker:t,size:v})};
+  inp.addEventListener('mousedown',e=>e.stopPropagation());
+  inp.addEventListener('pointerdown',e=>e.stopPropagation());
+  inp.addEventListener('focus',()=>inp.select());
+  inp.addEventListener('input',()=>{inp.value=inp.value.replace(/[^0-9]/g,'')});
+  inp.addEventListener('keydown',e=>{if(e.key==='Enter'){inp.blur()}else if(e.key==='Escape'){const c=cur();inp.value=c?c.contracts:1;inp.blur()}});
+  inp.addEventListener('blur',commit);
   return el;
 }
 function render(){
   if(!state||dragging)return;      // (a quote drag no longer pauses updates; only reordering cards does)
   const ms=JSON.parse(JSON.stringify(state.markets)); applyPending(ms);
-  if(!ms.length){board.innerHTML='<div class="empty" style="grid-column:1/-1">No zero-fee markets with a Pinnacle line in this window.</div>';setHeight();return}
+  if(!ms.length){board.innerHTML='<div class="empty" style="grid-column:1/-1">No orders yet in this session.</div>';setHeight();return}
   if(board.querySelector('.empty'))board.innerHTML='';
   const tk=ms.map(m=>m.ticker);
   layout.order=layout.order.filter(t=>tk.includes(t)); tk.forEach(t=>{if(!layout.order.includes(t))layout.order.push(t)});
@@ -320,16 +322,8 @@ function render(){
     if(el._dd!==dd){const oldSc=el.querySelector('.scroller'), keep=oldSc?oldSc.scrollTop:null;
       el.querySelector('.dyn').innerHTML=dd; el._dd=dd;
       const sc=el.querySelector('.scroller'); if(sc){if(keep!=null)sc.scrollTop=keep; else centerScroll(sc)}}
-    const si=el.querySelector('input.sz'), mi=el.querySelector('input.mx');
-    if(document.activeElement!==si)si.value=m.size; if(document.activeElement!==mi)mi.value=m.max_inv;
-    el.querySelectorAll('.ctl button.sd').forEach(b=>{const on=m.sides&&m.sides[b.dataset.side], L=b.dataset.side==='bid'?'B':'A';
-      b.textContent=(on?'Pull ':'Add ')+L; b.classList.toggle('pull',!!on);
-      b.title=on?'cancel this side\'s quote and keep it off':'quote just this side of this market'});
-    const pb=el.querySelector('.ctl button.pg'), pu=m.purge;
-    const locked=purgeLock[m.ticker]&&Date.now()-purgeLock[m.ticker]<25000; if(!pu)delete purgeLock[m.ticker];
-    pb.disabled=!pu||locked; pb.textContent=locked?'Purging…':pu?('Purge ('+(pu.pnl_usd==null?'?':(pu.pnl_usd<0?'-':'+')+'$'+Math.abs(pu.pnl_usd).toFixed(2))+')'):'Purge';
-    pb.title=pu?`Sell/buy back all ${pu.qty} contracts now to get flat, profit or not: stops quoting this market, pulls its orders and hits the book (taker fee applies). The figure is the all-in result versus average entry.${pu.short?' The visible book is too thin for '+pu.short+' of them.':''}`:'no inventory to purge';
-    const ob=el.querySelector('.ctl button.on'); ob.disabled=!!m.active; ob.title=m.active?'quoting this market':'start market making on this market only';
+    const si=el.querySelector('input.sz'); if(document.activeElement!==si)si.value=m.contracts; si.disabled=!m.can_cancel;
+    const cb=el.querySelector('.ctl button.cancel'); cb.disabled=!m.can_cancel; cb.style.opacity=m.can_cancel?1:.4;
   });
   [...board.children].forEach(c=>{if(c.dataset&&c.dataset.t&&!by[c.dataset.t])c.remove()});
   // Re-order only when the order actually changed: re-appending a card every second detaches it, which drops focus from
@@ -346,11 +340,7 @@ board.addEventListener('pointerdown',e=>{
   const card=e.target.closest('.card');
   if(card&&e.target.closest('button.xp')){const t=card.dataset.t;expanded=expanded===t?null:t;act({action:'focus',ticker:expanded});render();e.preventDefault();return}
   const cbn=card&&e.target.closest('.ctl button');
-  if(cbn){const t=card.dataset.t; if(cbn.disabled)return;
-    if(cbn.classList.contains('pg')){if(cbn.disabled)return; purgeLock[t]=Date.now(); act({action:'purge',ticker:t});e.preventDefault();return}
-    if(cbn.classList.contains('sd')){const m=state&&state.markets.find(x=>x.ticker===t), s=cbn.dataset.side;
-      act({action:(m&&m.sides&&m.sides[s])?'pull_side':'add_side',ticker:t,side:s});e.preventDefault();return}
-    act({action:cbn.classList.contains('on')?'resume_market':'cancel_market',ticker:t});e.preventDefault();return}
+  if(cbn){const t=card.dataset.t; if(!cbn.disabled)act({action:'cancel_market',ticker:t}); e.preventDefault();return}
   const x=e.target.closest('.xbtn'); if(x){const t=x.closest('.card').dataset.t;delete pending[t+'|'+x.dataset.side];act({action:'clear_quote',ticker:t,side:x.dataset.side});e.preventDefault();return}
   const r=e.target.closest('.row.our'); if(!r)return;
   // The drag is tracked by ticker/side/price, not by DOM node, so the book keeps ticking (rows are rebuilt on every
@@ -402,12 +392,11 @@ function toastHost(){
   return h;
 }
 function showToast(ev){
-  const h=toastHost(), d=h.ownerDocument.createElement('div');
-  d.style.cssText='background:#1f2430;border:1px solid #e74c3c;border-left:5px solid #e74c3c;color:#e6e6e6;border-radius:6px;padding:8px 12px;margin-bottom:8px;font:13px/1.35 system-ui,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.5);width:340px;transition:opacity .4s;pointer-events:auto';
-  const act=ev.liq==='offload'?(ev.side==='ask'?'OFFLOADED (sold YES)':'OFFLOADED (bought YES back)'):(ev.side==='bid'?'BID HIT (we bought YES)':'ASK LIFTED (we sold YES)');
-  const net=ev.inv, inv=(net>0?'long YES ':(net<0?'long NO ':'flat '))+(net?Math.abs(net):'');
-  d.innerHTML=`<b style="color:#fff">${act}</b> ${fmt(ev.qty,0)} @ ${fmt(ev.price_c,1)}¢${ev.fee_usd?` <span style="color:#9aa3b2;font-size:12px">(fee $${ev.fee_usd.toFixed(2)})</span>`:''}<br>${esc(ev.title)} · ${esc(ev.outcome)}<br>`+
-    `<span style="color:#9aa3b2;font-size:12px">market ${fmt(ev.bid,1)} / ${fmt(ev.ask,1)} · bought ${fmt(ev.bought,0)} · sold ${fmt(ev.sold,0)} · net ${inv}</span>`;
+  const h=toastHost(), d=h.ownerDocument.createElement('div'), fill=ev.kind==='fill', col=fill?'#2ecc71':'#8b93a1';
+  d.style.cssText=`background:#1f2430;border:1px solid ${col};border-left:5px solid ${col};color:#e6e6e6;border-radius:6px;padding:8px 12px;margin-bottom:8px;font:13px/1.35 system-ui,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.5);width:340px;transition:opacity .4s;pointer-events:auto`;
+  const side=ev.side==='yes'?'YES':'NO', grey='<span style="color:#9aa3b2;font-size:12px">';
+  const head=fill?`<b style="color:#fff">ORDER FILLED</b> ${fmt(ev.qty,0)} ${side} @ ${fmt(ev.price_c,1)}¢`:`<b style="color:#fff">ORDER ${esc(ev.label)}</b> ${side} @ ${fmt(ev.price_c,1)}¢`;
+  d.innerHTML=`${head}<br>${esc(ev.title)} · ${esc(ev.outcome)}<br>${grey}market ${fmt(ev.bid,1)} / ${fmt(ev.ask,1)} (YES) · filled ${fmt(ev.filled,0)} of ${ev.contracts}</span>`;
   h.appendChild(d);
   setTimeout(()=>{d.style.opacity='0'; setTimeout(()=>d.remove(),450)},5000);
 }
@@ -416,7 +405,7 @@ function handleEvents(evs){
   evs.filter(e=>e.id>evSeen).forEach(ev=>{
     evSeen=Math.max(evSeen,ev.id);
     const c=board.querySelector(`[data-t="${CSS.escape(ev.ticker)}"]`);
-    if(c){c.classList.remove('flash'); void c.offsetWidth; c.classList.add('flash'); setTimeout(()=>c.classList.remove('flash'),1200)}
+    if(c&&ev.kind==='fill'){c.classList.remove('flash'); void c.offsetWidth; c.classList.add('flash'); setTimeout(()=>c.classList.remove('flash'),1200)}
     showToast(ev);
   });
 }

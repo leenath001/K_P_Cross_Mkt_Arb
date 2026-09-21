@@ -26,6 +26,8 @@ from trade.core.positions import open_tickers, opposite_leg_blocked
 from trade.mm.ui import render_trade as _mm_trade, render_review as _mm_review
 from trade.clv import load_closing_lines, start_background as _start_clv_capture
 from trade.strategies.kp_arb import run_all_signals, resume_monitoring
+from trade.pinboard.board import PinBoard
+from trade.pinboard.ui import render_board as _render_pin_board
 from dashboard          import StreamlitDashboard
 import settle
 from applog             import get_logger
@@ -759,6 +761,10 @@ with tab_trade:
                             results_holder: list = []
                             stop_event     = threading.Event()
                             limit_only     = limit_only_mode
+                            _old_board = st.session_state.pop('_trade_board', None)
+                            if _old_board is not None:
+                                _old_board.stop()
+                            st.session_state['_trade_board'] = PinBoard(dash, stop_event)
 
                             def _worker(approved=approved_signals.copy(),
                                         bk=balance, tf=taker_fee, mf=maker_fee,
@@ -803,6 +809,7 @@ with tab_trade:
                 dash          = st.session_state.get('_trade_dash')
                 results_h     = st.session_state.get('_trade_results_h', [])
                 stop_event    = st.session_state.get('_trade_stop')
+                pin_board     = st.session_state.get('_trade_board')
                 last_side     = st.session_state.get('_trade_side', 'yes')
                 last_mode     = st.session_state.get('_trade_mode', 'REST')
 
@@ -1001,7 +1008,7 @@ with tab_trade:
                 # countdown timer above stays on the outer 1s cadence since a plain
                 # st.progress isn't a widget with state to preserve — it updates via
                 # normal prop diffing, no remount risk, so it can afford to be smooth.
-                @st.fragment(run_every=('2s' if time.time() < st.session_state.get('_fast_positions_until', 0) else '10s') if is_alive else None)
+                @st.fragment(run_every='5s' if is_alive else None)
                 def _positions_panel():
                     if dash is None:
                         return
@@ -1012,6 +1019,10 @@ with tab_trade:
                     try:
                         positions = snap['positions']
                         if positions:
+                            # The live board: one card per market (5-level book, drag to re-price, filled / avg boxes,
+                            # Cancel, fill notifications). It updates itself over its own channel between reruns.
+                            if pin_board is not None:
+                                _render_pin_board(pin_board)
                             # Sorted by ticker — a stable order independent of dict
                             # insertion history, so row index N reliably maps to the
                             # same ticker across the reruns this whole panel does
@@ -1064,228 +1075,11 @@ with tab_trade:
                                     bg = 'rgba(231, 76, 60, 0.25)'     # red
                                 return [f'background-color: {bg}'] * len(row)
 
-                            positions_df = pd.DataFrame(rows)
-                            styled = positions_df.style.apply(_fill_color, axis=1)
-                            st.dataframe(styled, width="stretch", hide_index=True,
-                                        height=min(35 * n + 38, 600))
-
-                            # ── Click-to-inspect ─────────────────────────────────────────────
-                            # A row click on the st.dataframe above (on_select='rerun') was
-                            # tried here first, but it's unreliable inside a fragment that
-                            # auto-refreshes every 10s: st.dataframe's widget identity is a hash
-                            # that includes the data bytes themselves (see
-                            # compute_and_register_element_id(..., data=proto.data, ...) in
-                            # streamlit/elements/arrow.py), and live price ticks (Mkt Ask ¢,
-                            # Fair last) change that identity on nearly every render — the same
-                            # kalshi_poll cadence (10s) that drives this fragment's own timer.
-                            # A click can race the fragment's own next scheduled auto-tick: the
-                            # server can already be pushing a fresh, unselected widget instance
-                            # right as the click's selection event arrives, so the detail panel
-                            # flashes or never appears — confirmed in production logs as the
-                            # cause of "select a row, no detail shows" reports. A plain
-                            # st.selectbox doesn't have this problem: its identity is its `key`
-                            # alone, not a hash of its options, so it survives every remount of
-                            # the table above it.
-                            if st.session_state.pop('_inspect_reset', False):
-                                st.session_state['_inspect_select'] = None
-
-                            _tkr_options = [p['ticker'] for p in ordered]
-                            _tkr_labels  = {p['ticker']: f"{p['ticker']} — {p['outcome']}"
-                                           for p in ordered}
-                            _prior_tkr    = st.session_state.get('_inspect_ticker')
-                            _default_idx  = (_tkr_options.index(_prior_tkr) + 1
-                                            if _prior_tkr in _tkr_options else 0)
-                            _tkr = st.selectbox(
-                                'Inspect a position', options=[None] + _tkr_options,
-                                format_func=lambda t: '— select a position —' if t is None
-                                                      else _tkr_labels[t],
-                                index=_default_idx, key='_inspect_select',
-                            )
-                            st.session_state['_inspect_ticker'] = _tkr
-
-                            if _tkr and _tkr in {p['ticker'] for p in ordered}:
-                                _pos = next(p for p in ordered if p['ticker'] == _tkr)
-
-                                # Depth is a fresh live API call — throttled to once per 3s
-                                # per selected ticker regardless of what triggered this
-                                # redraw (the panel's own 10s cadence, or an out-of-cycle
-                                # rerun from clicking ✕/Resize), so a burst of interactions
-                                # can't spam the endpoint.
-                                _depth_key = f'_orderbook_depth_{_tkr}'
-                                _cached    = st.session_state.get(_depth_key)
-                                _stale     = (_cached is None or
-                                             time.time() - _cached.get('_fetched_at', 0) > 3)
-                                if _stale:
-                                    _depth = get_orderbook_depth(_tkr, levels=2)
-                                    _depth['_fetched_at'] = time.time()
-                                    st.session_state[_depth_key] = _depth
-                                else:
-                                    _depth = _cached
-
-                                with st.container(border=True):
-                                    _hdr_col, _x_col = st.columns([10, 1])
-                                    _hdr_col.markdown(f'#### {_tkr} — {_pos["outcome"]}')
-                                    if _x_col.button('✕', key='_close_inspect', help='Close'):
-                                        st.session_state['_inspect_ticker'] = None
-                                        # Can't overwrite '_inspect_select' here directly — it
-                                        # was already instantiated earlier in this same run.
-                                        # Flag it and clear on the next run's first line instead.
-                                        st.session_state['_inspect_reset'] = True
-                                        # Header above was already drawn this pass with the old
-                                        # ticker — force a fresh run now instead of letting it
-                                        # linger until this fragment's next 10s tick (same fix
-                                        # as the calibration-chart detail panel's close button).
-                                        _fragment_rerun()
-
-                                if _tkr:
-                                    with st.container(border=True):
-                                        _sum_col, _book_col = st.columns([1, 1])
-
-                                        with _sum_col:
-                                            st.markdown('**Order summary**')
-                                            _avg = _pos.get('avg_fill_price')
-                                            st.markdown(
-                                                f"- Side: **{_pos['side'].upper()}**\n"
-                                                f"- Contracts: **{_pos['contracts']}**  "
-                                                f"(filled **{_pos.get('filled', 0)}**)\n"
-                                                f"- Entry: **{_pos['entry_price']}¢**\n"
-                                                f"- Avg fill: **{f'{_avg*100:.1f}¢' if _avg is not None else '—'}**\n"
-                                                f"- Fair (entry → last): **{_pos['fair_entry']:.3f} → "
-                                                f"{_pos['fair_last']:.3f}**\n"
-                                                f"- Edge: **{_pos['edge_last']:+.3f}**\n"
-                                                f"- Status: **{_pos['status']}**\n"
-                                                f"- Sport: {_pos.get('sport', '—')}\n"
-                                                f"- Last ping: {_pos['last_ping']}"
-                                            )
-
-                                            # Live resize — only while there's still an
-                                            # unfilled remainder resting on Kalshi. Cancels
-                                            # the current resting order and re-places for
-                                            # the new total (new_total - already_filled) at
-                                            # the same price; see resize_resting_order().
-                                            _filled_now    = _pos.get('filled', 0)
-                                            _still_resting = _pos['status'] not in (
-                                                'executed', 'filled', 'canceled', 'expired')
-                                            if _still_resting and _pos.get('order_id'):
-                                                st.markdown('**Resize this order**')
-                                                _rz_c1, _rz_c2 = st.columns([2, 1])
-                                                _new_size = _rz_c1.number_input(
-                                                    'New total contracts',
-                                                    min_value=_filled_now + 1,
-                                                    value=max(_pos['contracts'], _filled_now + 1),
-                                                    step=1, key=f'_resize_input_{_tkr}',
-                                                    help=f'{_filled_now} already filled — resize '
-                                                         'applies to the remaining unfilled portion.',
-                                                )
-                                                if _rz_c2.button('Resize', key=f'_resize_btn_{_tkr}'):
-                                                    with st.spinner('Resizing...'):
-                                                        _rz = resize_resting_order(
-                                                            _tkr, _pos['order_id'], _pos['side'],
-                                                            int(_new_size), _pos['entry_price'],
-                                                        )
-                                                    if _rz['action'] == 'resized':
-                                                        # resize_resting_order() only cancels +
-                                                        # re-places — it returns immediately and
-                                                        # doesn't know about the dashboard or
-                                                        # monitoring. Without picking that back up
-                                                        # here, the table would never reflect the
-                                                        # new order (still shows the just-canceled
-                                                        # old one until its own monitor thread
-                                                        # notices and exits), it'd get no
-                                                        # auto-cancel-before-event protection, and
-                                                        # it would never get logged when it
-                                                        # eventually resolves. Runs in its own
-                                                        # thread since _monitor() blocks until the
-                                                        # order closes — can't do that on the UI
-                                                        # thread.
-                                                        _rz_price     = _pos['entry_price'] / 100
-                                                        _rz_fee_rate  = _pos.get('fee_rate', MAKER_FEE_BASE)
-                                                        _rz_fair      = _pos.get(
-                                                            'fair_last', _pos.get('fair_entry', 0.5))
-                                                        # Fee-adjusted EV (same formula ev_total in the
-                                                        # logs is built from), not edge_last — edge is
-                                                        # the raw pre-fee mispricing and would overstate
-                                                        # this trade's Projected EV in the Review chart.
-                                                        _rz_ev = _ev(_rz_fair, _rz_price, _rz_fee_rate)
-                                                        threading.Thread(
-                                                            target=resume_monitoring,
-                                                            kwargs=dict(
-                                                                order_id=_rz['new_order_id'],
-                                                                ticker=_tkr,
-                                                                event_id=_pos.get('event_id', ''),
-                                                                sport=_pos.get('sport', ''),
-                                                                outcome=_pos.get('raw_outcome',
-                                                                                 _pos['outcome']),
-                                                                order_price=_rz_price,
-                                                                fee_rate=_rz_fee_rate,
-                                                                commence=_pos.get('commence', ''),
-                                                                side=_pos['side'],
-                                                                contracts=_rz['new_remaining'],
-                                                                fair_prob=_rz_fair,
-                                                                ev_per_contract=_rz_ev,
-                                                                dashboard=dash,
-                                                                stop_event=stop_event,
-                                                            ),
-                                                            daemon=True,
-                                                        ).start()
-                                                        st.success(
-                                                            f"Resized to {_rz['new_total']} total "
-                                                            f"({_rz['already_filled']} filled + "
-                                                            f"{_rz['new_remaining']} now resting) — "
-                                                            "monitoring resumed under the new order.")
-                                                    else:
-                                                        st.error(f"Resize failed: "
-                                                                f"{_rz.get('reason', 'unknown error')}")
-                                            elif _pos.get('order_id') is None:
-                                                st.caption('No order_id on this position — placed '
-                                                          'before this feature existed; can\'t resize.')
-                                            else:
-                                                st.caption('Order is no longer resting — nothing to resize.')
-
-                                        with _book_col:
-                                            st.markdown('**Market depth** (YES side, top 2 levels)')
-                                            if not _depth or (not _depth.get('bids') and not _depth.get('asks')):
-                                                st.caption('Depth unavailable right now.')
-                                            else:
-                                                _lp = _depth.get('last_price_cents')
-                                                if _lp is not None:
-                                                    st.markdown(f"<div style='text-align:right'>Last: "
-                                                               f"<b>{_lp}¢</b></div>", unsafe_allow_html=True)
-                                                _book_rows = []
-                                                for lv in reversed(_depth.get('asks', [])):
-                                                    _book_rows.append({'Side': 'Ask', 'Price ¢': lv['price_cents'],
-                                                                       'Qty': lv['qty'], '$ Notional': lv['dollars']})
-                                                for lv in _depth.get('bids', []):
-                                                    _book_rows.append({'Side': 'Bid', 'Price ¢': lv['price_cents'],
-                                                                       'Qty': lv['qty'], '$ Notional': lv['dollars']})
-                                                if _book_rows:
-                                                    _book_df  = pd.DataFrame(_book_rows)
-                                                    _ask_mask = _book_df['Side'] == 'Ask'
-                                                    _bid_mask = ~_ask_mask
-                                                    _vmax     = _book_df['$ Notional'].max()
-
-                                                    def _side_text_color(row):
-                                                        c = '#e74c3c' if row['Side'] == 'Ask' else '#2ecc71'
-                                                        return [f'color: {c}; font-weight: 600'] * len(row)
-
-                                                    # .bar() draws the depth-size bar as a background
-                                                    # gradient behind the $ value, red for asks / green
-                                                    # for bids, scaled to the deepest level shown — the
-                                                    # same visual language as Kalshi's own book.
-                                                    _book_styled = (
-                                                        _book_df.style
-                                                        .apply(_side_text_color, axis=1)
-                                                        .bar(subset=pd.IndexSlice[_book_df.index[_ask_mask], ['$ Notional']],
-                                                            color='rgba(231, 76, 60, 0.35)', vmin=0, vmax=_vmax, align='left')
-                                                        .bar(subset=pd.IndexSlice[_book_df.index[_bid_mask], ['$ Notional']],
-                                                            color='rgba(46, 204, 113, 0.35)', vmin=0, vmax=_vmax, align='left')
-                                                        .format({'Price ¢': '{:.0f}¢', 'Qty': '{:,.0f}',
-                                                                '$ Notional': '${:,.2f}'})
-                                                    )
-                                                    st.dataframe(_book_styled, width="stretch", hide_index=True,
-                                                                height=35 * len(_book_rows) + 38)
-                                                else:
-                                                    st.caption('No resting depth on either side.')
+                            with st.expander('Table view', expanded=False):
+                                positions_df = pd.DataFrame(rows)
+                                styled = positions_df.style.apply(_fill_color, axis=1)
+                                st.dataframe(styled, width="stretch", hide_index=True,
+                                            height=min(35 * n + 38, 600))
                         else:
                             st.caption('Waiting for orders to be placed...')
                     except Exception:
@@ -1304,6 +1098,9 @@ with tab_trade:
                     for k in (thread_key, '_trade_dash', '_trade_results_h',
                               '_trade_stop', '_trade_side', '_trade_mode'):
                         st.session_state.pop(k, None)
+                    _done_board = st.session_state.pop('_trade_board', None)
+                    if _done_board is not None:
+                        _done_board.stop()
                     _fragment_rerun()
 
             # ── Final results (persist after dashboard clears) ──────────────────

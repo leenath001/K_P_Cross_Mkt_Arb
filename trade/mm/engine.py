@@ -25,7 +25,7 @@ import config
 from KALSHI.k_helpers import kalshi_headers, fee_rate_for, kalshi_fee_dollars, kalshi_odds, BASE_URL
 import theODDS.p_helpers as _pin
 from theODDS.p_helpers import pinnacle_odds
-from trade.core.execution import (place_order, ensure_canceled, get_order_status,
+from trade.core.execution import (place_order, cancel_order, ensure_canceled, get_order_status,
                                   list_resting_orders, get_balance, PRE_EVENT_BUFFER)
 from trade.core.pricing import parse_ranges, step_at, snap_down
 from trade.mm.ledger import log_fill, log_markout, fills_for_ticker, per_order_totals
@@ -35,7 +35,7 @@ log = get_logger(__name__)
 
 SELECTION_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                               'logs', 'mm_selection.json')
-ENGINE_VERSION = 16    # bump when MMEngine's state/attributes change: the UI then swaps out a stale cached engine
+ENGINE_VERSION = 18    # bump when MMEngine's state/attributes change: the UI then swaps out a stale cached engine
 MAX_SIZE, DEFAULT_SIZE, BOOK_DEPTH, UI_DEADMAN_SEC, MM_PREFIX = 25, 5, 15, 90, 'mm-'
 MAX_INV_LIMIT, DEFAULT_MAX_INV = 500, 20      # per-market cap on net contracts held (either direction)
 OFFLOAD_MIN_NET_C = 0.5                        # only take profit when it nets at least this per contract AFTER the taker fee
@@ -76,9 +76,10 @@ def _get(path, params=None):
                         params=params, timeout=8)
 
 
-def fetch_book(ticker: str) -> dict:
-    """Full ladder in cents: bids desc, asks asc (YES asks derived from NO bids)."""
-    r = _get(f'/markets/{ticker}/orderbook', {'depth': BOOK_DEPTH})
+def fetch_book(ticker: str, full: bool = False) -> dict:
+    """Ladder in cents: bids desc, asks asc (YES asks derived from NO bids). `full` reads every level (depth 0) — the
+    expanded card shows the whole 1-99c book; everything else needs only the top BOOK_DEPTH."""
+    r = _get(f'/markets/{ticker}/orderbook', {'depth': 0 if full else BOOK_DEPTH})
     r.raise_for_status()
     ob = r.json().get('orderbook_fp') or {}
     yes = [(round(float(p) * 100, 3), float(q)) for p, q in (ob.get('yes_dollars') or [])]
@@ -556,26 +557,87 @@ class MMEngine:
         self._cancel_bg(orphans=True)
 
     def _cancel_bg(self, tickers=None, orphans=False, sides=('bid', 'ask')):
-        """Cancel quotes in the background, in parallel, without holding the lock across the network: the UI keeps
-        ticking and each market's YOU row disappears the moment Kalshi confirms that order is closed."""
+        """Cancel quotes in the background, without holding the lock across the network: the UI keeps ticking and each
+        market's YOU row disappears the moment Kalshi confirms that order is closed."""
         with self.lock:
-            jobs = [(t, s) for t, m in self.mkts.items() if tickers is None or t in tickers
+            jobs = [(t, s, m['orders'][s]) for t, m in self.mkts.items() if tickers is None or t in tickers
                     for s in sides if m['orders'][s]]
             self._cancel_busy += 1
 
         def _run():
             try:
-                if jobs:
-                    with ThreadPoolExecutor(max_workers=8) as ex:
-                        list(ex.map(lambda j: self._cancel_one(*j), jobs))
-                if orphans:
-                    self.cancel_orphans()
+                self._fast_cancel(jobs, orphans)
             except Exception:
                 log.exception('mm: background cancel failed')
             finally:
                 with self.lock:
                     self._cancel_busy -= 1
         threading.Thread(target=_run, name='mm-cancel', daemon=True).start()
+
+    def _fast_cancel(self, jobs, orphans):
+        """Cancel many orders quickly: fire every DELETE at once (12 in parallel), confirm ALL of them with a single
+        list-resting-orders call instead of polling each order, retry only the stragglers, and settle fill accounting
+        afterwards so the board clears first. (The per-order path costs a status GET, a DELETE, a 0.5 s sleep and another
+        GET for every order, plus a second, sequential pass for stray orders.)"""
+        tracked = {q['order_id']: (t, side, q) for t, side, q in jobs}
+        ticker_of = {oid: t for oid, (t, _, _) in tracked.items()}
+        if orphans:                                       # strays from an earlier run, cancelled in the same burst
+            try:
+                for o in list_resting_orders():
+                    if str(o.get('client_order_id', '')).startswith(MM_PREFIX) and o['order_id'] not in ticker_of:
+                        ticker_of[o['order_id']] = o.get('ticker')
+            except Exception:
+                log.exception('mm: could not list stray orders')
+        if not ticker_of:
+            return
+
+        def _burst(ids):
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                list(ex.map(lambda i: cancel_order(ticker_of[i], i), ids))
+
+        done_acc, pending = [], list(ticker_of)
+        for attempt in range(4):
+            _burst(pending)
+            try:
+                resting = {o['order_id'] for o in list_resting_orders()}
+            except Exception:
+                resting = None                            # can't verify in bulk: fall back to per-order checks below
+            if resting is None:
+                break
+            gone = [i for i in ticker_of if i not in resting and i in pending]
+            with self.lock:
+                for oid in gone:
+                    if oid in tracked:
+                        t, side, q = tracked[oid]
+                        m = self.mkts.get(t)
+                        if m and m['orders'][side] and m['orders'][side]['order_id'] == oid:
+                            if self._cash is not None:
+                                rem = max(0.0, q['size'] - q['filled'])
+                                self._cash += (q['price_c'] if side == 'bid' else 100 - q['price_c']) / 100 * rem
+                            m['orders'][side] = None
+                            done_acc.append((t, side, q))
+            pending = [i for i in pending if i in resting]
+            if not pending:
+                break
+            time.sleep(0.3 * (attempt + 1))
+        for oid in pending:                               # stubborn or unverifiable: the careful per-order path
+            if oid in tracked:
+                self._cancel_one(tracked[oid][0], tracked[oid][1])
+            else:
+                ensure_canceled(ticker_of[oid], oid)
+
+        def _account(x):                                   # partial fills that landed before the cancel
+            t, side, q = x
+            try:
+                fp = get_order_status(q['order_id']).get('fill_count_fp')
+            except Exception:
+                return
+            with self.lock:
+                m = self.mkts.get(t)
+                if m and fp is not None:
+                    self._account_fills(m, side, q, float(fp))
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            list(ex.map(_account, done_acc))
 
     def _sweep_orphans(self, resting):
         """Safety net: any of OUR (mm-tagged) resting orders that no market is tracking gets cancelled. Catches an order
@@ -1128,7 +1190,7 @@ class MMEngine:
                     try:
                         if time.time() - m['meta_at'] > 15 or m['ranges'] is None:
                             self._refresh_meta(m)
-                        return t, fetch_book(t), None
+                        return t, (fetch_book(t, True) if t == self.focus else fetch_book(t)), None
                     except Exception as exc:
                         return t, None, exc
 

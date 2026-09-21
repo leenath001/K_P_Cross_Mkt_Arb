@@ -119,7 +119,7 @@ A live-ticking board of market cards. The board talks to the engine over a loopb
 | **Purge (±$x)** | Flatten this market now, profit or not; the label shows the all-in result if you purged right now |
 | **ON** | Quote this market only, even if the top ON is off |
 | **Cancel** | Pull this market's quotes and keep it off |
-| ⤢ | Expand: depth chart, stats, orders table |
+| ⤢ | Expand: the whole 1–99¢ book (scrollable; contracts and the cash resting at each level), depth chart, stats, orders table |
 
 Global **OFF / Cancel all** cancel every order **in parallel in the background** (the board keeps ticking and each YOU row disappears as Kalshi confirms), plus any stray `mm-` orders from an earlier run.
 
@@ -156,6 +156,23 @@ Separate from the arbitrage PnL. Headline metrics (hover for definitions): fills
 
 ---
 
+## Pinnacle live board
+
+While a trading session runs, each market with an order gets a card in the same style as the market-making board:
+
+- **5-level order book** on the YES price axis with your resting order as a draggable **YOU** row. Drag it to another price to re-price: the order is cancelled and re-rested (post-only) at the new price, refusing any price that would cross the book, and monitoring resumes on the new order. A NO order is shown as its YES-equivalent ask.
+- **Filled** box — turns green only when fully filled; the number is red at 0 and yellow while partial. **Avg buy** (average fill price and cost) and **Exit bid** (what the position would sell for now on your side, with the unrealized result before fees).
+- A stats line on every card: Pinnacle fair at entry → now, edge, order price and the ask on your side. The spread line shows the current **theo** (Pinnacle fair).
+- **Contracts** box changes the order's total size (cancel and re-rest of the unfilled part); **Cancel** cancels just that market's order. A card that is fully filled or closed disables both.
+- **Expand** (⤢) shows the whole 1–99¢ order book (scrollable, with contracts and the cash resting at every level), depth chart, order table and every stat that the old table had (fees, cost, to-win, spread, depth, last Pinnacle ping...).
+- **Notifications:** a fill flashes the card and shows a toast for 5 seconds (what filled, the market's bid/ask, filled of total); orders that close unfilled (cancelled, expired, edge gone) get a toast too.
+
+Fills are read straight from Kalshi every 2.5 s (one call lists all resting orders), books every 2 s (up to 10 per cycle), so the board is ahead of the monitor threads' 10 s cadence. Like the market-making board, it talks to Python over a loopback-only, token-gated HTTP channel, so editing a card never reruns the page.
+
+Code: `trade/pinboard/board.py` (`PinBoard`), `trade/pinboard/ui.py`, `trade/pinboard/frontend/index.html`, and the shared `trade/core/actionserver.py`.
+
+---
+
 ## Repository structure
 
 ```
@@ -177,6 +194,7 @@ K_P_Cross_Mkt_Arb/
     │   ├── execution.py         # place/cancel/status, Kelly sizing, monitor loop, fees
     │   ├── positions.py         # live open-position dedup, opposite-leg blocking
     │   ├── pricing.py           # Kalshi price grid: rest price, tick math
+    │   ├── actionserver.py      # loopback HTTP channel for the live boards
     │   └── logging_io.py        # trade / unfilled-attempt logging
     ├── strategies/
     │   ├── base.py              # the strategy contract (documented duck typing)
@@ -184,6 +202,7 @@ K_P_Cross_Mkt_Arb/
     │   ├── prospect.py          # prospect-theory strategy
     │   └── nothing.py           # non-sports markets bot
     ├── mm/                      # market making (engine, ui, ledger, frontend)
+    ├── pinboard/                # live board for the Pinnacle strategy (controller, ui, frontend)
     ├── clv.py                   # closing-line-value capture (background thread)
     ├── settle.py                # WIN/LOSS/VOID + PnL for settled trades
     ├── review.py                # terminal review + charts
@@ -207,7 +226,7 @@ streamlit run trade/web_app.py
 
 Two top-level tabs, each with **Trade** and **Review**:
 
-- **Pinnacle → Trade** — fetch signals, choose YES/NO and order mode (rest / cross / auto), filter by edge÷price quartile, edit contracts per row, execute; live dashboard with per-order Cancel all / Cross & Cancel / Keep Rest / +15 min. Cancelled orders lose their red highlight as they cancel.
+- **Pinnacle → Trade** — fetch signals, choose YES/NO and order mode (rest / cross / auto), filter by edge÷price quartile, edit contracts per row, execute. Once trading, a **live board** shows one card per market (see [Pinnacle live board](#pinnacle-live-board)) under the session controls (Cancel all / Cross & Cancel / Keep Rest / +15 min); the old table is kept under *Table view*.
 - **Pinnacle → Review** — auto-settles pending trades on load, then: projected vs realized PnL with a ±2σ luck band, outcome-distribution chart (Monte Carlo of settled trades with EV tooltip), CLV chart, calibration, win rate by sport and by edge÷price quartile, click-a-bar detail panels, and an All Trades table with filters.
 - **Market Making → Trade / Review** — see [Market making](#market-making).
 
