@@ -105,11 +105,43 @@ function act(a){a.nonce=Date.now()+Math.random();
   else{queue.push(a);pump()}}
 let lastTs=0;
 function takeState(s){if(!s||s.ts<lastTs)return; lastTs=s.ts; state=s; render(); handleEvents(state.events||[])}
-setInterval(async()=>{
-  if(!direct||directFails>=3)return;
-  try{const r=await fetch(directUrl('/snap?token='+direct.token)); if(!r.ok)throw 0; directFails=0; takeState(await r.json())}
-  catch(e){directFails++}
-},1000);
+
+// The 1s poll for a fresh snapshot runs in a Web Worker, not on this (main/document) thread: browsers throttle a
+// document's own timers once its tab loses focus or is hidden (and after ~5 min hidden, Chrome drops them to about
+// once a minute) — that starved the engine's heartbeat and tripped its 90s dead-man switch, cancelling every quote,
+// just from switching tabs. A dedicated Worker has its own timer scheduling and keeps firing at the normal rate
+// regardless of page visibility, so the heartbeat (and the board's data) stays live while this tab is in the
+// background. Falls back to a plain setInterval on this thread if Workers aren't available in this context.
+let poller=null;
+function startWorkerPoll(){
+  const src = `
+    let cfg=null;
+    onmessage=(e)=>{ if(e.data.type==='cfg'){cfg=e.data.cfg; if(!self._t)self._t=setInterval(tick,1000)} };
+    async function tick(){
+      if(!cfg)return;
+      try{
+        const r=await fetch('http://'+cfg.host+':'+cfg.port+'/snap?token='+cfg.token);
+        if(!r.ok)throw 0;
+        postMessage({type:'snap',data:await r.json()});
+      }catch(e){postMessage({type:'err'})}
+    }`;
+  const w=new Worker(URL.createObjectURL(new Blob([src],{type:'application/javascript'})));
+  w.onmessage=(e)=>{
+    if(e.data.type==='snap'){directFails=0;takeState(e.data.data)}
+    else{directFails++}
+  };
+  w.onerror=()=>{poller=null;startMainThreadPoll()};   // Worker blocked (e.g. sandboxed embed) — fall back
+  return w;
+}
+function startMainThreadPoll(){
+  setInterval(async()=>{
+    if(!direct||directFails>=3)return;
+    try{const r=await fetch(directUrl('/snap?token='+direct.token)); if(!r.ok)throw 0; directFails=0; takeState(await r.json())}
+    catch(e){directFails++}
+  },1000);
+}
+try{poller=startWorkerPoll()}catch(e){startMainThreadPoll()}
+function pollerCfg(){if(poller&&direct)poller.postMessage({type:'cfg',cfg:{host:location.hostname,port:direct.port,token:direct.token}})}
 const pending={};   // ticker|side -> {price,t}: a dragged quote is shown at its new price until the engine confirms
 const pendingSize={}, pendingMax={}, purgeLock={};   // purgeLock: ticker -> time of the last Purge click
 function applyPending(ms){ms.forEach(m=>{
@@ -388,7 +420,7 @@ window.addEventListener('message',e=>{
   const th=e.data.theme; if(th){const r=document.documentElement.style;
     if(th.secondaryBackgroundColor)r.setProperty('--card',th.secondaryBackgroundColor); if(th.textColor)r.setProperty('--fg',th.textColor);
     if(th.base==='light'){r.setProperty('--line','#d5d9e0');r.setProperty('--muted','#5b6472')}}
-  const s=e.data.args.state; if(s&&s.act&&s.act.port)direct=s.act;
+  const s=e.data.args.state; if(s&&s.act&&s.act.port){const changed=!direct||direct.port!==s.act.port||direct.token!==s.act.token; direct=s.act; if(changed)pollerCfg()}
   if(inflight&&s.ack===inflight.nonce){queue.shift();inflight=null}
   pump(); takeState(s);
 });
