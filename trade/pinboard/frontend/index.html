@@ -195,7 +195,7 @@ function fullBook(m){
   const prices=new Set(); for(let i=1;i*tick<=99+1e-9;i++)prices.add(K(Math.round(i*tick*1000)/1000));
   sizes.forEach((_,k)=>prices.add(k)); Object.keys(our).forEach(k=>prices.add(k));
   const list=[...prices].map(Number).sort((a,b)=>b-a);
-  const usd=(p,sz)=>sz*(p>=ba-1e-9?(100-p):p)/100, maxUsd=Math.max(1,...list.map(p=>usd(p,sizes.get(K(p))||0)));
+  const usd=(p,sz)=>sz*p/100, maxUsd=Math.max(1,...list.map(p=>usd(p,sizes.get(K(p))||0)));   // Kalshi's own book always prices a level at ITS listed price (ask rows included), not the NO-side complement
   let out='';
   list.forEach(p=>{
     const k=K(p), sz=sizes.get(k)||0, o=our[k], side=p>=ba-1e-9?'ask':(p<=bb+1e-9?'bid':'mid'), u=usd(p,sz);
@@ -398,6 +398,7 @@ function showToast(ev){
   const head=fill?`<b style="color:#fff">ORDER FILLED</b> ${fmt(ev.qty,0)} ${side} @ ${fmt(ev.price_c,1)}¢`:`<b style="color:#fff">ORDER ${esc(ev.label)}</b> ${side} @ ${fmt(ev.price_c,1)}¢`;
   d.innerHTML=`${head}<br>${esc(ev.title)} · ${esc(ev.outcome)}<br>${grey}market ${fmt(ev.bid,1)} / ${fmt(ev.ask,1)} (YES) · filled ${fmt(ev.filled,0)} of ${ev.contracts}</span>`;
   h.appendChild(d);
+  try{window.parent.__notifCenter && window.parent.__notifCenter.push(d.innerHTML)}catch(e){}
   setTimeout(()=>{d.style.opacity='0'; setTimeout(()=>d.remove(),450)},5000);
 }
 function handleEvents(evs){

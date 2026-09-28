@@ -466,7 +466,11 @@ def run(args):
 
     # Drop tickers we already have open positions on — live Kalshi state, not CSV
     existing = open_tickers()
-    if existing:
+    if existing is None:
+        # Couldn't verify current exposure (Kalshi/network issue) — fail CLOSED rather than trade blind.
+        print(f'  Could not verify current Kalshi exposure — skipping this run rather than trading blind ({len(kept)} candidate(s) dropped)')
+        kept = []
+    elif existing:
         before = len(kept)
         kept = [m for m in kept if m['ticker'] not in existing]
         print(f'  Skipped {before - len(kept)} ticker(s) with existing open/pending positions')

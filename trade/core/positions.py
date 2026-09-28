@@ -28,8 +28,17 @@ log = get_logger(__name__)
 BASE_URL = 'https://api.elections.kalshi.com/trade-api/v2'
 
 
-def _open_position_tickers() -> set:
-    """Tickers with a non-zero live position (GET /portfolio/positions), paginated."""
+def _open_position_tickers():
+    """
+    Tickers with a non-zero live position (GET /portfolio/positions), paginated.
+
+    Returns None (not an empty set) if any page could not be read — a network failure or bad response here used to
+    return whatever partial tickers had already been collected (or an empty set on the very first page), which
+    open_tickers() callers then treated identically to "confirmed, nothing is open": every batch-execute path skips
+    its whole dedup filter on a falsy/empty result (`if _open: ...`), so a Kalshi outage didn't just fail to check
+    exposure — it silently made the bot trade as if it held nothing, risking a duplicate order on a market already
+    open. None forces callers down their fail-closed path instead.
+    """
     tickers = set()
     cursor = None
     path = '/trade-api/v2/portfolio/positions'
@@ -42,10 +51,10 @@ def _open_position_tickers() -> set:
                                 headers=kalshi_headers('GET', path), params=params)
         except requests.exceptions.RequestException:
             log.exception('_open_position_tickers: network failure')
-            return tickers
+            return None
         if not resp.ok:
             log.warning('_open_position_tickers failed: %s %s', resp.status_code, resp.reason)
-            return tickers
+            return None
         data = resp.json()
         for p in data.get('market_positions', []):
             try:
@@ -59,8 +68,9 @@ def _open_position_tickers() -> set:
     return tickers
 
 
-def _resting_order_tickers() -> set:
-    """Tickers with a currently-resting order (GET /portfolio/orders?status=resting)."""
+def _resting_order_tickers():
+    """Tickers with a currently-resting order (GET /portfolio/orders?status=resting). None (not an empty set) if the
+    call failed — see _open_position_tickers' docstring for why that distinction matters here."""
     path = '/trade-api/v2/portfolio/orders'
     try:
         resp = requests.get(f'{BASE_URL}/portfolio/orders',
@@ -68,21 +78,28 @@ def _resting_order_tickers() -> set:
                             params={'status': 'resting', 'limit': 200})
     except requests.exceptions.RequestException:
         log.exception('_resting_order_tickers: network failure')
-        return set()
+        return None
     if not resp.ok:
         log.warning('_resting_order_tickers failed: %s %s', resp.status_code, resp.reason)
-        return set()
+        return None
     return {o['ticker'] for o in resp.json().get('orders', []) if o.get('ticker')}
 
 
-def open_tickers() -> set:
+def open_tickers():
     """
     Tickers to treat as "already have exposure here, don't signal again" — the
     union of current positions and current resting orders, read live from Kalshi.
     Call once per batch run (same cadence the old already_bet_tickers() used),
     not per-row — two cheap GETs regardless of how many signals are being scanned.
+
+    Returns None if either live check failed (network/API issue) — this can NOT be safely treated as "nothing is
+    open": every caller must check for None explicitly and refuse to trade (fail closed) rather than falling through
+    a truthiness check that treats None the same as a confirmed-empty set.
     """
-    return _open_position_tickers() | _resting_order_tickers()
+    pos, rest = _open_position_tickers(), _resting_order_tickers()
+    if pos is None or rest is None:
+        return None
+    return pos | rest
 
 
 def position_open(ticker: str) -> bool:

@@ -379,7 +379,11 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
     active = signals_df[signals_df['pt_signal']].drop_duplicates('k_ticker').copy()
 
     _open = open_tickers()
-    if _open:
+    if _open is None:
+        # Couldn't verify current exposure (Kalshi/network issue) — fail CLOSED rather than trade blind.
+        log.error('[dedup] Could not verify current Kalshi exposure — skipping this run rather than trading blind (%d candidate signal(s) dropped)', len(active))
+        active = active.iloc[0:0]
+    elif _open:
         before = len(active)
         active = active[~active['k_ticker'].isin(_open)].copy()
         dropped = before - len(active)

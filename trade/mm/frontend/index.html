@@ -108,10 +108,9 @@ function takeState(s){if(!s||s.ts<lastTs)return; lastTs=s.ts; state=s; render();
 
 // The 1s poll for a fresh snapshot runs in a Web Worker, not on this (main/document) thread: browsers throttle a
 // document's own timers once its tab loses focus or is hidden (and after ~5 min hidden, Chrome drops them to about
-// once a minute) — that starved the engine's heartbeat and tripped its 90s dead-man switch, cancelling every quote,
-// just from switching tabs. A dedicated Worker has its own timer scheduling and keeps firing at the normal rate
-// regardless of page visibility, so the heartbeat (and the board's data) stays live while this tab is in the
-// background. Falls back to a plain setInterval on this thread if Workers aren't available in this context.
+// once a minute), which left the board stale after switching tabs. A dedicated Worker has its own timer scheduling
+// and keeps firing at the normal rate regardless of page visibility, so the board's data stays live while this tab
+// is in the background. (The engine no longer depends on these polls — it keeps quoting with no browser at all.) Falls back to a plain setInterval on this thread if Workers aren't available in this context.
 let poller=null;
 function startWorkerPoll(){
   const src = `
@@ -225,7 +224,7 @@ function fullBook(m){
   const prices=new Set(); for(let i=1;i*tick<=99+1e-9;i++)prices.add(K(Math.round(i*tick*1000)/1000));
   sizes.forEach((_,k)=>prices.add(k)); Object.keys(our).forEach(k=>prices.add(k));
   const list=[...prices].map(Number).sort((a,b)=>b-a);
-  const usd=(p,sz)=>sz*(p>=ba-1e-9?(100-p):p)/100, maxUsd=Math.max(1,...list.map(p=>usd(p,sizes.get(K(p))||0)));
+  const usd=(p,sz)=>sz*p/100, maxUsd=Math.max(1,...list.map(p=>usd(p,sizes.get(K(p))||0)));   // Kalshi's own book always prices a level at ITS listed price (ask rows included), not the NO-side complement
   let out='';
   list.forEach(p=>{
     const k=K(p), sz=sizes.get(k)||0, o=our[k], side=p>=ba-1e-9?'ask':(p<=bb+1e-9?'bid':'mid'), u=usd(p,sz);
@@ -256,7 +255,7 @@ function stats(m){
   const s=m.stats, T=(k,v,c)=>`<div class="tile"><div class="k">${k}</div><div class="v ${c||''}">${v}</div></div>`;
   const usd=v=>(v<0?'-':'')+'$'+Math.abs(v).toFixed(3);
   return `<div class="stats">`+
-   T('fair (Pinnacle)',fmt(m.fair_c,1)+'¢ <span class="sub">'+m.fair_age_s+'s ago</span>')+
+   T('fair (Pinnacle)',fmt(m.fair_c,1)+'¢ <span class="sub">'+(m.fair_age_s==null?'not yet confirmed':m.fair_age_s+'s ago')+'</span>')+
    T('mid − fair',s.mid_minus_fair_c==null?'—':fmt(s.mid_minus_fair_c,2)+'¢')+
    T('book spread',fmt(s.spread_c,1)+'¢')+
    T('our spread',s.quote_spread_c==null?'—':fmt(s.quote_spread_c,1)+'¢','pos')+
@@ -441,6 +440,7 @@ function showToast(ev){
   d.innerHTML=`<b style="color:#fff">${act}</b> ${fmt(ev.qty,0)} @ ${fmt(ev.price_c,1)}¢${ev.fee_usd?` <span style="color:#9aa3b2;font-size:12px">(fee $${ev.fee_usd.toFixed(2)})</span>`:''}<br>${esc(ev.title)} · ${esc(ev.outcome)}<br>`+
     `<span style="color:#9aa3b2;font-size:12px">market ${fmt(ev.bid,1)} / ${fmt(ev.ask,1)} · bought ${fmt(ev.bought,0)} · sold ${fmt(ev.sold,0)} · net ${inv}</span>`;
   h.appendChild(d);
+  try{window.parent.__notifCenter && window.parent.__notifCenter.push(d.innerHTML)}catch(e){}
   setTimeout(()=>{d.style.opacity='0'; setTimeout(()=>d.remove(),450)},5000);
 }
 function handleEvents(evs){

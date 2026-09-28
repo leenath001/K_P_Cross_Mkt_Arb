@@ -35,8 +35,12 @@ log = get_logger(__name__)
 
 SELECTION_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                               'logs', 'mm_selection.json')
-ENGINE_VERSION = 18    # bump when MMEngine's state/attributes change: the UI then swaps out a stale cached engine
-MAX_SIZE, DEFAULT_SIZE, BOOK_DEPTH, UI_DEADMAN_SEC, MM_PREFIX = 25, 5, 15, 90, 'mm-'
+ENGINE_VERSION = 20    # bump when MMEngine's state/attributes change: the UI then swaps out a stale cached engine
+MAX_SIZE, DEFAULT_SIZE, BOOK_DEPTH, MM_PREFIX = 25, 5, 15, 'mm-'
+# Safety guards — the engine runs with no browser attached, so it polices its own inputs instead of a UI heartbeat:
+FAIR_STALE_SEC = 180       # a market's Pinnacle fair unconfirmed this long (or 3× the refresh setting, if longer) → its auto quotes are pulled until it refreshes
+KALSHI_DOWN_SEC = 60       # Kalshi's resting-orders read failing continuously this long → quoting off, cancel everything
+LOOP_STALL_SEC = 60        # engine loop hasn't finished a cycle this long (hung request) → watchdog cancels everything
 MAX_INV_LIMIT, DEFAULT_MAX_INV = 500, 20      # per-market cap on net contracts held (either direction)
 OFFLOAD_MIN_NET_C = 0.5                        # only take profit when it nets at least this per contract AFTER the taker fee
 OFFLOAD_MIN_USD = 0.02
@@ -103,7 +107,14 @@ def zero_fee_sports(candidates=None) -> list:
 
 def screen_candidates(sports: list, hrs: int = 18, top=None) -> pd.DataFrame:
     """Rank zero-fee, Pinnacle-matched markets for market making. One market (best open interest) per game."""
-    pin = pinnacle_odds(sports, hrs=hrs, live=False)
+    try:
+        pin = pinnacle_odds(sports, hrs=hrs, live=False)
+    except ValueError:
+        # pinnacle_odds() raises when it finds literally nothing in the window (e.g. no zero-fee sport has a game
+        # in the next `hrs` hours) — a normal, expected result here (short windows / off-hours are routine), not a
+        # real failure. Treat it the same as "matched to zero markets" instead of surfacing it as a scary
+        # screen-failed error with a traceback every single time the board happens to load when nothing's on.
+        return pd.DataFrame()
     m = kalshi_odds(pin, threshold=0.85)
     if m.empty:
         return pd.DataFrame()
@@ -128,7 +139,7 @@ def spec_from_row(r) -> dict:
     return {'ticker': r['k_ticker'], 'event_ticker': r['k_event_ticker'], 'sport': r['sport'],
             'title': f"{r['away']} @ {r['home']}", 'outcome': r['outcome'],
             'commence': pd.Timestamp(r['commence']).tz_convert('UTC').isoformat(),
-            'fair_c': round(float(r['fair_prob']) * 100, 2)}
+            'fair_c': round(float(r['fair_prob']) * 100, 2), 'fair_ts': time.time()}
 
 
 # ── Engine ───────────────────────────────────────────────────────────────────
@@ -137,7 +148,7 @@ def _new_state(spec):
     return {'max_inv': DEFAULT_MAX_INV, 'spec': spec, 'paused': False, 'on': False, 'side_add': {'bid': False, 'ask': False},
             'side_off': {'bid': False, 'ask': False}, 'size': DEFAULT_SIZE, 'manual': {'bid': None, 'ask': None},
             'force': {'bid': False, 'ask': False}, 'ranges': None, 'book': {'bids': [], 'asks': []}, 'last_c': None, 'volume': None,
-            'fair_c': spec.get('fair_c'), 'fair_at': time.time(), 'target': {}, 'orders': {'bid': None, 'ask': None},
+            'fair_c': spec.get('fair_c'), 'fair_at': time.time(), 'fair_ok_at': spec.get('fair_ts', 0), 'target': {}, 'orders': {'bid': None, 'ask': None},
             'fills': [], 'inv': 0.0, 'cycles': 0, 'cycles_two_sided': 0, 'api_err': 0, 'requotes': 0,
             'off_top': [], 'note': '', 'meta_at': 0}
 
@@ -159,7 +170,9 @@ class MMEngine:
         self._stop = threading.Event()
         self._wake = threading.Event()      # set to cut the loop's sleep short (e.g. quoting just switched ON)
         self._thread = None
-        self.last_ui = time.time()
+        self._cycle_at = time.time()          # end of the loop's last completed cycle (watchdog)
+        self._kalshi_fail_since = None        # first failure of the current run of failed resting-orders reads
+        self._stall_tripped = False
         self.focus = None            # expanded market on the board: polled every cycle, full book sent
         self.ack = None              # last board-action nonce processed (board queues actions until acked)
         self._cash, self._cash_at, self._rr = None, 0.0, 0
@@ -440,6 +453,7 @@ class MMEngine:
         threading.Thread(target=self.reconcile_from_kalshi, name='mm-reconcile', daemon=True).start()
         self._thread = threading.Thread(target=self._loop, name='mm-engine', daemon=True)
         self._thread.start()
+        threading.Thread(target=self._watchdog, name='mm-watchdog', daemon=True).start()
 
     # -- browser <-> engine side channel -------------------------------------
     def handle_action(self, act: dict):
@@ -1115,8 +1129,11 @@ class MMEngine:
 
     def _refresh_fair(self):
         by_sport = {}
+        live = self.params['live']
         for m in self.mkts.values():
-            if m['orders']['bid'] or m['orders']['ask']:       # credits only for sports we're actually quoting
+            # credits only for sports we're actually quoting — including a running market whose quotes were pulled
+            # for a stale fair (otherwise it could never refresh its way back)
+            if m['orders']['bid'] or m['orders']['ask'] or self._running(m, live):
                 by_sport.setdefault(m['spec']['sport'], []).append(m)
         for sport, ms in by_sport.items():
             if time.time() - min(x['fair_at'] for x in ms) < self.params['fair_refresh_sec']:
@@ -1135,21 +1152,57 @@ class MMEngine:
                           ((pin['start'] - pd.Timestamp(sp['commence'])).abs() < pd.Timedelta(seconds=90))]
                 if not hit.empty:
                     x['fair_c'] = round(float(hit.iloc[0]['fair_prob']) * 100, 2)
+                    x['fair_ok_at'] = time.time()
                 x['fair_at'] = time.time()
+
+    def _fair_stale(self, m) -> bool:
+        # Allow at least ~3 refresh intervals, so a slow 'Pinnacle refresh' setting (up to 300s on the board) or one
+        # missed fetch never trips it on its own.
+        limit = max(FAIR_STALE_SEC, 3 * self.params['fair_refresh_sec'])
+        return time.time() - m.get('fair_ok_at', 0) > limit
+
+    def _trip(self, reason: str):
+        """Safety stop from inside the loop (lock held; it's re-entrant): quoting off everywhere, cancel every MM quote."""
+        log.warning('mm: %s — quoting off, cancelling', reason)
+        self.params['live'] = False
+        for x in self.mkts.values():
+            self._clear_flags(x)
+        self._cancel_bg()
+
+    def _watchdog(self):
+        """
+        Separate thread: if the loop stops completing cycles (a hung Kalshi request — the loop holds self.lock across
+        order calls), switch quoting off and cancel every resting mm- order directly, without the lock, so quotes
+        can't sit unmanaged at stale prices. The loop's own off-sweep settles bookkeeping once it's unstuck.
+        """
+        while not self._stop.is_set():
+            self._stop.wait(5)
+            if time.time() - self._cycle_at <= LOOP_STALL_SEC:
+                self._stall_tripped = False
+                continue
+            if self._stall_tripped or not (self.params['live'] or any(self._running(x, False) for x in list(self.mkts.values()))):
+                continue
+            self._stall_tripped = True
+            log.warning('mm: engine loop stalled for %ss — quoting off, cancelling all mm orders', LOOP_STALL_SEC)
+            self.params['live'] = False
+            for x in list(self.mkts.values()):
+                self._clear_flags(x)
+            try:
+                for o in list_resting_orders():
+                    if str(o.get('client_order_id', '')).startswith(MM_PREFIX):
+                        ensure_canceled(o.get('ticker'), o['order_id'])
+            except Exception:
+                log.exception('mm: watchdog could not cancel resting orders')
 
     def _loop(self):
         while not self._stop.is_set():
             t0 = time.time()
             try:
                 with self.lock:
-                    if (self.params['live'] or any(self._running(x, False) for x in self.mkts.values())) \
-                            and time.time() - self.last_ui > UI_DEADMAN_SEC:
-                        # dead-man switch: nobody is watching the board (browser closed / app stalled)
-                        log.warning('mm: no UI heartbeat for %ss — quoting off, cancelling', UI_DEADMAN_SEC)
-                        self.params['live'] = False
-                        for x in self.mkts.values():
-                            self._clear_flags(x)
-                        self._cancel_bg()
+                    running = self.params['live'] or any(self._running(x, False) for x in self.mkts.values())
+                    if running and self._kalshi_fail_since and time.time() - self._kalshi_fail_since > KALSHI_DOWN_SEC:
+                        self._trip(f'Kalshi unreachable for {KALSHI_DOWN_SEC}s')
+                        self._kalshi_fail_since = None
                     live = self.params['live'] or any(self._running(x, False) for x in self.mkts.values())
                     tickers = list(self.mkts)
                 resting_ids = {}
@@ -1161,11 +1214,15 @@ class MMEngine:
                 if live:
                     try:
                         resting_ids = {o['order_id']: o for o in list_resting_orders()}
+                        self._kalshi_fail_since = None
                     except Exception:
                         log.exception('mm: resting-orders refresh failed'); resting_ids = None
+                        self._kalshi_fail_since = self._kalshi_fail_since or time.time()
                     if resting_ids:
                         self._sweep_orphans(resting_ids)
                     self._refresh_fair()      # Pinnacle credits are only spent for markets we're quoting
+                else:
+                    self._kalshi_fail_since = None
                 self._run_markouts()
                 if live and time.time() - self._reconciled_at > 90:
                     self._reconciled_at = time.time()
@@ -1209,12 +1266,19 @@ class MMEngine:
                         m['book'] = book
                         tg = compute_targets(book['bids'], book['asks'], m['fair_c'], m['ranges'])
                         self._apply_manual(m, tg)
+                        fair_stale = self._fair_stale(m)
+                        if fair_stale:                        # never auto-quote off an unconfirmed fair; dragged prices stay
+                            for s in ('bid', 'ask'):
+                                if m['manual'][s] is None:
+                                    tg[s] = None
                         m['target'] = tg
                         m['cycles'] += 1
                         if tg['bid'] is not None and tg['ask'] is not None:
                             m['cycles_two_sided'] += 1
                         mins = (pd.Timestamp(m['spec']['commence']) - pd.Timestamp.now(tz='UTC')).total_seconds() / 60
                         m['note'] = 'quoting stopped: event starting' if mins * 60 <= PRE_EVENT_BUFFER else ''
+                        if fair_stale and not m['note'] and self._running(m, self.params['live']):
+                            m['note'] = 'Pinnacle fair stale: auto quotes pulled'
                         m_active = self._running(m, self.params['live'])
                         if m_active and live and resting_ids is not None:   # re-check: may have been switched off mid-cycle
                             had = bool(m['orders']['bid'] or m['orders']['ask'])
@@ -1229,13 +1293,13 @@ class MMEngine:
                             self._cancel_all(t)                                         # sweep anything left resting while off
             except Exception:
                 log.exception('mm: loop error')
+            self._cycle_at = time.time()
             self._wake.wait(max(0.2, self.params['poll_sec'] - (time.time() - t0)))
             self._wake.clear()
 
     # -- snapshot for the UI ------------------------------------------------
     def snapshot(self) -> dict:
         now = time.time()
-        self.last_ui = now
         live_now = self.params['live']
         with self.lock:
             out = []
@@ -1274,7 +1338,7 @@ class MMEngine:
                     'ticker': t, 'title': sp['title'], 'outcome': sp['outcome'], 'sport': sp['sport'],
                     'start_iso': sp['commence'],
                     'mins_to_start': round((pd.Timestamp(sp['commence']) - pd.Timestamp.now(tz='UTC')).total_seconds() / 60, 1),
-                    'fair_c': fair, 'fair_age_s': round(now - m['fair_at']), 'size': m['size'],
+                    'fair_c': fair, 'fair_age_s': round(now - m['fair_ok_at']) if m.get('fair_ok_at') else None, 'size': m['size'],
                     'bids': bids if t == self.focus else bids[:9], 'asks': asks if t == self.focus else asks[:9], 'mid_c': mids, 'last_c': m['last_c'], 'volume': m['volume'],
                     'tick_c': tick, 'orders': orders,
                     'max_inv': m['max_inv'], 'note': m['note'], 'paused': m['paused'], 'active': (live_now and not m['paused']) or m['on'],

@@ -15,7 +15,7 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from KALSHI.k_helpers import kalshi_odds, fee_rate_for
 from trade.core.execution import (
-    place_order, get_order_status, _final_order_status, filled_count, get_market_price,
+    place_order, place_rest_with_requote, get_order_status, _final_order_status, filled_count, get_market_price,
     get_market_prices, rest_price_dollars, signal_rest_price, cross_and_cancel_order, _monitor,
     resolve_contracts, _ev, _exact_ev_ok, force_cancel_all,
     TAKER_FEE, MAKER_FEE, MIN_CROSS_EV, MAX_DURATION, PRE_EVENT_BUFFER,
@@ -299,9 +299,13 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             return {'status': 'skipped', 'reason': 'event_too_soon',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
 
-        order    = place_order(ticker, price_cents, contracts, side='no',
-                               expiration_ts=int(expiry_dt.timestamp()),
-                               post_only=not force_cross)
+        if not force_cross:
+            order, order_price, price_cents, contracts, ev = place_rest_with_requote(
+                ticker, 'no', price_cents, contracts, order_price, ev, int(expiry_dt.timestamp()),
+                fair_prob_no, fee_rate, bankroll, signal_row, size_mult)
+        else:
+            order = place_order(ticker, price_cents, contracts, side='no',
+                                expiration_ts=int(expiry_dt.timestamp()), post_only=False)
         order_id = order.get('order_id')
         if order_registry is not None and order_id:
             order_registry.append((order_id, ticker))
@@ -436,9 +440,14 @@ def run_trade(signal_row: pd.Series, bankroll: float,
         return {'status': 'skipped', 'reason': 'no_edge_after_exact_fee_rounding',
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
 
-    order    = place_order(ticker, price_cents, contracts, side='yes',
-                           expiration_ts=int(expiry_dt.timestamp()),
-                           post_only=(order_type == 'rest' or limit_only))
+    _post_only = order_type == 'rest' or limit_only
+    if _post_only:
+        order, order_price, price_cents, contracts, ev = place_rest_with_requote(
+            ticker, 'yes', price_cents, contracts, order_price, ev, int(expiry_dt.timestamp()),
+            fair_prob, fee_rate, bankroll, signal_row, size_mult)
+    else:
+        order = place_order(ticker, price_cents, contracts, side='yes',
+                            expiration_ts=int(expiry_dt.timestamp()), post_only=False)
     order_id = order.get('order_id')
     if order_registry is not None and order_id:
         order_registry.append((order_id, ticker))
@@ -548,7 +557,12 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
 
     # Drop tickers with existing open/pending positions — live Kalshi state, not CSV
     _open = open_tickers()
-    if _open:
+    if _open is None:
+        # Couldn't verify current exposure (Kalshi/network issue) — fail CLOSED: better to sit out this run than
+        # risk stacking a duplicate order on a market we already hold, which an empty dedup set would have allowed.
+        log.error('[dedup] Could not verify current Kalshi exposure — skipping this run rather than trading blind (%d candidate signal(s) dropped)', len(active))
+        active = active.iloc[0:0]
+    elif _open:
         before = len(active)
         active = active[~active['k_ticker'].isin(_open)].copy()
         dropped = before - len(active)

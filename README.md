@@ -133,7 +133,10 @@ Global **OFF / Cancel all** cancel every order **in parallel in the background**
 - **Cash cap:** quotes are only placed if cash covers them (balance refreshed every 20 s, decremented locally).
 - **Kalshi is the source of truth:** every cycle the engine compares each resting order's size and price with Kalshi's list and resyncs (and re-quotes) on a mismatch. Any `mm-` order on Kalshi that no market is tracking is cancelled (orphan sweep). A resting order missing from Kalshi's list is only forgotten once Kalshi says it is closed (the list can lag a fresh order). Every 90 s a reconcile adds any filled `mm-` orders the ledger missed (real average price and taker fee for offload/purge fills).
 - **Inventory carries across sessions:** each market's fills are replayed from the ledger on load, so inventory and average prices survive restarts.
-- **Dead-man switch:** if no browser has polled the engine for 90 s, all quotes are cancelled.
+- **Runs without a browser.** Closing the tab or letting the screen sleep does not stop quoting. The engine checks its own inputs instead:
+  - **Stale fair value:** if a market's Pinnacle fair hasn't been confirmed for 180 s, its automatic quotes are pulled until it refreshes. Prices you dragged by hand stay.
+  - **Kalshi unreachable:** if reading resting orders keeps failing for 60 s, quoting turns off and every quote is cancelled.
+  - **Engine stalled:** a watchdog thread cancels every `mm-` order if the engine loop hasn't finished a cycle in 60 s.
 
 ### Polling cadence
 
@@ -381,7 +384,7 @@ engine loop (2 s): read books → compute_targets (fair-driven, one tick wide)
     → inventory caps / side switches → cancel-confirm → place post_only GTC quotes
     → resync with Kalshi's resting orders, sweep orphans, account fills
     → auto-offload / purge (IOC) → ledger (mm_fills.csv) + markouts
-board ⇄ engine over loopback HTTP (actions, snapshots); Streamlit fragment as fallback + heartbeat
+board ⇄ engine over loopback HTTP (actions, snapshots); Streamlit fragment as fallback
 Review: mm_summary over the ledger (realized PnL, edge, markouts, inventory, per-market)
 ```
 
@@ -392,7 +395,7 @@ Review: mm_summary over the ledger (realized PnL, edge, markouts, inventory, per
 - **Real money.** The Market Making tab has no paper mode. ON, Add, Purge and auto-offload all place real orders. Auto-offload and Purge cross the book and pay the **taker fee**.
 - **Purge and other IOC orders** are sized against your real Kalshi position and their fills are read only after Kalshi reports the order closed, but a purge still trades at whatever the book pays. Do not click it repeatedly.
 - **Stale sessions.** With `runOnSave = true` (`.streamlit/config.toml`) a saved file reruns the app, and a bumped `ENGINE_VERSION` swaps the engine and cancels its quotes. Turn `runOnSave` off for uninterrupted live trading.
-- **Dead-man switch:** closing the browser cancels market-making quotes within about 90 seconds.
+- **Market making keeps running with the browser closed.** Use OFF or Cancel all to stop it. It stops on its own only for stale Pinnacle data, a Kalshi outage, or a stalled engine.
 - **API credits.** Each market screen costs about 1 OddsAPI credit per zero-fee sport, and each Pinnacle fair refresh costs credits for the sports you are quoting. Watch the usage bar in the sidebar.
 - **Separation.** Market-making fills and PnL never enter the arbitrage logs, Review or settlement.
 - **Manual closes.** If you close a market-making position by hand on Kalshi, add the order ID to `mm_ignored_orders.txt` (or ask to have it removed) so the ledger doesn't re-add it.

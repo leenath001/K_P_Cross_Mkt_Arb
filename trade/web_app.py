@@ -21,10 +21,11 @@ from theODDS.p_helpers import pinnacle_odds, fetch_usage, get_api_usage, get_act
 from KALSHI.k_helpers   import kalshi_odds, TAKER_FEE_BASE, MAKER_FEE_BASE
 from trade.core.execution import (get_balance, cross_and_cancel_order, cancel_and_rerest,
                                   get_orderbook_depth, cancel_all_resting_orders, kelly_contracts,
-                                  resize_resting_order, _ev)
+                                  resize_resting_order, extend_resting_order, _ev)
 from trade.core.positions import open_tickers, opposite_leg_blocked
 from trade.mm.ui import render_trade as _mm_trade, render_review as _mm_review
 from trade.clv import load_closing_lines, start_background as _start_clv_capture
+from trade.core.balance_feed import start as _start_balance_feed
 from trade.strategies.kp_arb import run_all_signals, resume_monitoring
 from trade.pinboard.board import PinBoard
 from trade.pinboard.ui import render_board as _render_pin_board
@@ -160,10 +161,15 @@ div[class*="st-key-_close_bar_"] button {
     font-size: 0.75rem;
     float: right;
 }
+/* Streamlit's own Deploy button and "..." menu — replaced by the notification envelope injected
+   below, in the same corner. Targeted narrowly (not the whole stToolbar) so the "expand sidebar"
+   control, which lives in that same header strip once the sidebar is collapsed, keeps working. */
+[data-testid="stAppDeployButton"], [data-testid="stMainMenu"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
 _start_clv_capture()   # closing-line capture thread (idempotent across reruns)
+_bal_feed_info = _start_balance_feed()   # Cash/Portfolio poller (idempotent across reruns) — see the top-bar widget below
 
 # Remember the selected tab in every tab bar (per browser tab) and put it back if a rerun resets it to the first one.
 # Streamlit re-mounts the tab bars on some reruns (the Market Making ON/OFF click did), which snaps the page back to
@@ -189,6 +195,185 @@ _components.html("""<script>
     .observe(D.body,{subtree:true,childList:true,attributes:true,attributeFilter:['aria-selected']});
 })();
 </script>""", height=0)
+
+# Notification center: replaces Streamlit's Deploy button / "..." menu (hidden above) with an envelope in the same
+# corner. Fill/close events from the Market Making and Pinnacle boards call window.parent.__notifCenter.push(html)
+# to pop the usual 5s toast AND log it here — the envelope keeps a scrollable history of everything that already
+# disappeared off-screen, with a red dot while there's anything you haven't opened the panel to see yet.
+_components.html("""<script>
+(function(){
+  const P=window.parent, D=P.document;
+  if(P.__notifCenter) return;   // idempotent across reruns — build the DOM once, keep it across script reruns
+  const css=D.createElement('style');
+  css.textContent=`
+    #nc-bell{position:fixed;top:8px;right:14px;z-index:999999;cursor:pointer;width:34px;height:34px;
+      display:flex;align-items:center;justify-content:center;border-radius:8px;font-size:18px;color:#c9cdd6;
+      user-select:none;background:rgba(255,255,255,.04)}
+    #nc-bell:hover{background:rgba(255,255,255,.1)}
+    #nc-dot{position:absolute;top:4px;right:4px;width:9px;height:9px;border-radius:50%;background:#e74c3c;
+      box-shadow:0 0 0 2px #0e1117;display:none}
+    #nc-panel{position:fixed;top:46px;right:14px;z-index:999999;width:360px;max-height:70vh;overflow-y:auto;
+      background:#161a23;border:1px solid #2a2f3a;border-radius:8px;box-shadow:0 12px 30px rgba(0,0,0,.55);
+      display:none;padding:4px 0}
+    #nc-panel .nc-item{padding:8px 12px;border-bottom:1px solid #2a2f3a;font:12px/1.4 system-ui,sans-serif;color:#e6e6e6}
+    #nc-panel .nc-item:last-child{border-bottom:none}
+    #nc-panel .nc-empty{padding:18px;text-align:center;color:#8b93a1;font:12px system-ui,sans-serif}
+    #nc-panel .nc-time{color:#8b93a1;font-size:10px;margin-top:3px}
+  `;
+  D.head.appendChild(css);
+
+  const bell=D.createElement('div'); bell.id='nc-bell'; bell.title='Notifications';
+  bell.innerHTML='\u2709<span id="nc-dot"></span>';
+  const panel=D.createElement('div'); panel.id='nc-panel';
+  D.body.appendChild(bell); D.body.appendChild(panel);
+
+  const dot=bell.querySelector('#nc-dot');
+  const state={items:[], unread:0};
+  function renderPanel(){
+    panel.innerHTML = state.items.length
+      ? state.items.map(it=>`<div class="nc-item">${it.html}<div class="nc-time">${new Date(it.ts).toLocaleTimeString()}</div></div>`).join('')
+      : '<div class="nc-empty">No notifications yet</div>';
+  }
+  function setUnread(n){ state.unread=n; dot.style.display = n>0 ? 'block' : 'none'; }
+
+  bell.addEventListener('click', e=>{
+    e.stopPropagation();
+    const opening = panel.style.display!=='block';
+    panel.style.display = opening ? 'block' : 'none';
+    if(opening) setUnread(0);   // seeing the list clears the marker, whether or not it's scrolled through
+  });
+  D.addEventListener('click', ()=>{panel.style.display='none'});
+  panel.addEventListener('click', e=>e.stopPropagation());
+
+  P.__notifCenter = {
+    push(html){
+      state.items.unshift({html, ts: Date.now()});
+      state.items.length = Math.min(state.items.length, 50);
+      setUnread(state.unread+1);
+      renderPanel();
+    }
+  };
+  renderPanel();
+})();
+</script>""", height=0)
+
+# Live Cash / Portfolio readout, just left of the envelope — polled from trade/core/balance_feed.py's background
+# thread over its own loopback channel (the browser has no Kalshi credentials, so it can't ask Kalshi directly).
+# Uses the same Worker-based poller as the Market Making board's snapshot poll so it keeps refreshing in a background tab.
+# Portfolio = cash + every open position marked to market (settled-but-unpaid positions at their 1/0 payout).
+# Clicking it opens the per-position breakdown (Kalshi's cost basis vs. the current mark).
+# The DOM + Worker are built once per browser page, but the feed's port/token are re-sent on EVERY rerun: restarting
+# `streamlit run` (or a runOnSave reload that restarts the feed) gives the feed a new port/token while the browser tab
+# reconnects without a page reload — without the re-send the old Worker kept polling a dead port and the numbers
+# silently froze. Values dim and the tooltip says so if the feed hasn't produced a fresh read in STALE_SEC.
+# (Port/token are spliced in with plain .replace() — not an f-string — since the JS below is full of the
+# same { } characters an f-string would need doubled everywhere.)
+_bal_js = """<script>
+(function(){
+  const P=window.parent, D=P.document;
+  const cfg={port:__PORT__, token:'__TOKEN__', host:'127.0.0.1'};   // components.html renders via a srcdoc iframe, whose location.hostname is empty
+  if(P.__balFeed && P.__balFeed.setCfg){ P.__balFeed.setCfg(cfg); return; }
+  if(P.__balFeed){   // an older build of this widget, still alive in an already-open tab — tear it down and rebuild
+    try{ P.__balFeed.terminate && P.__balFeed.terminate() }catch(e){}
+    ['bal-wrap','pos-panel'].forEach(id=>{ const el=D.getElementById(id); if(el) el.remove() });
+  }
+  const STALE_SEC=45;
+  const css=D.createElement('style');
+  css.textContent=`
+    #bal-wrap{position:fixed;top:8px;right:56px;z-index:999999;display:flex;gap:8px;height:34px}
+    .bal-box{background:rgba(255,255,255,.04);border-radius:8px;padding:0 14px;text-align:center;min-width:74px;
+      height:34px;box-sizing:border-box;display:flex;flex-direction:column;align-items:center;justify-content:center}
+    .bal-box .v{font:700 15px/1.3 system-ui,sans-serif;color:#e6e6e6}
+    .bal-box .l{font:500 10px/1.2 system-ui,sans-serif;color:#8b93a1;text-transform:uppercase;letter-spacing:.03em}
+    .bal-box.port{cursor:pointer}
+    .bal-box.port .l{color:#2ecc71}
+    #bal-wrap.stale .v{opacity:.45}
+    #bal-wrap.stale .l{color:#e67e22 !important}
+    #pos-panel{position:fixed;top:46px;right:56px;z-index:999999;width:300px;max-height:60vh;overflow-y:auto;
+      background:#161a23;border:1px solid #2a2f3a;border-radius:8px;box-shadow:0 12px 30px rgba(0,0,0,.55);
+      display:none;padding:4px 0}
+    #pos-panel .pos-sum{padding:8px 12px;border-bottom:1px solid #2a2f3a;font:11px/1.5 system-ui,sans-serif;color:#8b93a1}
+    #pos-panel .pos-sum b{color:#e6e6e6;font-weight:600}
+    #pos-panel .pos-item{padding:7px 12px;border-bottom:1px solid #2a2f3a;font:12px/1.4 system-ui,sans-serif;
+      color:#e6e6e6;display:flex;justify-content:space-between;gap:10px}
+    #pos-panel .pos-item:last-child{border-bottom:none}
+    #pos-panel .pos-tkr{color:#8b93a1;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:170px}
+    #pos-panel .pos-empty{padding:16px;text-align:center;color:#8b93a1;font:12px system-ui,sans-serif}
+    #pos-panel .pos-tag{font-size:9px;padding:1px 5px;border-radius:4px;margin-left:5px;background:#2a2f3a;color:#c9cdd6}
+    .pos-pos{color:#2ecc71}.pos-neg{color:#e74c3c}
+  `;
+  D.head.appendChild(css);
+  const wrap=D.createElement('div'); wrap.id='bal-wrap';
+  wrap.innerHTML='<div class="bal-box cash"><div class="v">__DASH__</div><div class="l">Cash</div></div>'+
+                 '<div class="bal-box port"><div class="v">__DASH__</div><div class="l">Portfolio</div></div>';
+  const panel=D.createElement('div'); panel.id='pos-panel';
+  D.body.appendChild(wrap); D.body.appendChild(panel);
+  const cashV=wrap.querySelector('.cash .v'), portV=wrap.querySelector('.port .v'), portBox=wrap.querySelector('.port');
+  const fmt=v=>v==null?'__DASH__':'$'+Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  let last=null, lastOk=0;   // last snapshot received, and when (ms) the browser last reached the feed at all
+  function renderPositions(d){
+    const list=d.positions||[];
+    const sum='<div class="pos-sum">Cash <b>'+fmt(d.cash)+'</b> + Positions <b>'+fmt(d.positions_value)+'</b> = <b>'+fmt(d.portfolio)+'</b></div>';
+    panel.innerHTML = sum + (list.length ? list.map(p=>{
+      const u=p.unrealized_dollars, cls=u>0?'pos-pos':(u<0?'pos-neg':'');
+      const tag=p.result ? '<span class="pos-tag">settled '+String(p.result).toUpperCase()+'</span>'
+                         : (p.status&&p.status!=='active' ? '<span class="pos-tag">'+p.status+'</span>' : '');
+      return '<div class="pos-item"><div><div>'+p.side+' ×'+p.qty+tag+'</div><div class="pos-tkr">'+p.ticker+'</div></div>'+
+        '<div style="text-align:right"><div>'+fmt(p.mark_dollars)+'</div><div class="'+cls+'">'+(u>=0?'+':'')+u.toFixed(2)+'</div></div></div>';
+    }).join('') : '<div class="pos-empty">No open positions</div>');
+  }
+  function refreshStale(){
+    const now=Date.now();
+    const fresh = last && last.updated_at && (now/1000 - last.updated_at) < STALE_SEC && (now - lastOk) < STALE_SEC*1000;
+    wrap.classList.toggle('stale', !fresh);
+    let tip;
+    if(!last) tip='Waiting for the first balance read…';
+    else if((now-lastOk) >= STALE_SEC*1000) tip='Can\\'t reach the balance feed — numbers may be out of date';
+    else if(!fresh) tip='Kalshi read failing'+(last.error?' ('+last.error+')':'')+' — numbers may be out of date';
+    else tip='Updated '+new Date(last.updated_at*1000).toLocaleTimeString();
+    wrap.title = tip + ' · click Portfolio for the position breakdown';
+  }
+  function apply(d){
+    if(!d)return;
+    last=d; lastOk=Date.now();
+    cashV.textContent=fmt(d.cash); portV.textContent=fmt(d.portfolio); renderPositions(d); refreshStale();
+  }
+  setInterval(refreshStale, 5000);
+  portBox.addEventListener('click', e=>{
+    e.stopPropagation();
+    panel.style.display = panel.style.display!=='block' ? 'block' : 'none';
+  });
+  D.addEventListener('click', ()=>{panel.style.display='none'});
+  panel.addEventListener('click', e=>e.stopPropagation());
+
+  const src = `
+    let cfg=null;
+    onmessage=(e)=>{ if(e.data.type==='cfg'){cfg=e.data.cfg; tick(); if(!self._t)self._t=setInterval(tick,5000)} };
+    async function tick(){
+      if(!cfg)return;
+      try{
+        const r=await fetch('http://'+cfg.host+':'+cfg.port+'/snap?token='+cfg.token, {cache:'no-store'});
+        if(!r.ok)throw 0;
+        postMessage(await r.json());
+      }catch(e){}
+    }`;
+  let mainCfg=cfg;
+  async function mainTick(){
+    try{const r=await fetch('http://'+mainCfg.host+':'+mainCfg.port+'/snap?token='+mainCfg.token, {cache:'no-store'}); if(r.ok)apply(await r.json())}catch(err){}
+  }
+  try{
+    const w=new Worker(URL.createObjectURL(new Blob([src],{type:'application/javascript'})));
+    w.onmessage=(e)=>apply(e.data);
+    w.postMessage({type:'cfg',cfg});
+    P.__balFeed={setCfg:c=>w.postMessage({type:'cfg',cfg:c})};
+  }catch(e){
+    mainTick(); setInterval(mainTick,5000);
+    P.__balFeed={setCfg:c=>{mainCfg=c; mainTick()}};
+  }
+  refreshStale();
+})();
+</script>""".replace('__PORT__', str(_bal_feed_info['port'])).replace('__TOKEN__', _bal_feed_info['token']).replace('__DASH__', '—')
+_components.html(_bal_js, height=0)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -673,6 +858,16 @@ with tab_trade:
 
                     editable = _sig[display_cols].copy().reset_index(drop=True)
                     editable = editable.rename(columns={mkt_ask_col: 'mkt_ask', 'fee_pct': 'fee %'})
+                    _exposure_unknown = _pending_tickers is None
+                    if _exposure_unknown:
+                        # Couldn't verify current Kalshi exposure (network/API issue) — fail CLOSED: block every
+                        # row from auto-execute rather than defaulting to "not pending", which would let Execute
+                        # fire on markets we might already hold. The checkbox itself still works if the user
+                        # wants to override with their own judgement.
+                        st.warning('Could not verify current Kalshi exposure (network/API issue) — nothing below '
+                                  'is pre-approved to execute until this is confirmed. Tick a row yourself only '
+                                  'if you are sure it is not already open.')
+                        _pending_tickers = set()
                     already_traded = editable['k_ticker'].isin(_pending_tickers)
                     # Opposite leg of a 2-way event we already hold (YES A ≡ NO B) — same
                     # bet on another ticker; run_all_signals() skips these too.
@@ -682,6 +877,8 @@ with tab_trade:
                     editable.insert(1, 'Status', already_traded.map({True: 'pending', False: ''})
                                     .mask(_opp_leg, 'opp. leg held'))
                     already_traded = already_traded | _opp_leg
+                    if _exposure_unknown:
+                        already_traded[:] = True
 
                     _override = st.session_state.pop(f'_signals_execute_override_{side}', None)
                     default_execute = (~already_traded) if _override is None else pd.Series(_override, index=editable.index)
@@ -927,14 +1124,53 @@ with tab_trade:
                                             'results': _kr_results,
                                         }
                                 if st.button('+15 min', key='_extend_time_btn',
-                                              help='Push back the auto-cancel deadline for every resting '
-                                                   'order in this session by 15 minutes.'):
-                                    dash.extend_time(15 * 60)
-                                    st.session_state['_dash_last_action'] = {
-                                        'type':    'extend',
-                                        'ts':      datetime.now().strftime('%H:%M:%S'),
-                                        'minutes': 15,
-                                    }
+                                              help='Push back the REAL Kalshi Good-till time on every resting '
+                                                   'order by 15 minutes (cancels and re-rests each one at its '
+                                                   'current price for whatever is still unfilled).'):
+                                    _ext_snap = dash.snapshot()
+                                    _EXT_RESTING = {'resting', 'open', 'pending', 'unknown'}
+                                    _ext_targets = [(oid, pos) for oid, pos in _ext_snap['positions'].items()
+                                                   if pos.get('status') in _EXT_RESTING
+                                                   and pos.get('contracts', 0) - pos.get('filled', 0) > 0]
+                                    if not _ext_targets:
+                                        st.session_state['_dash_last_action'] = {
+                                            'type': 'extend_empty',
+                                            'ts':   datetime.now().strftime('%H:%M:%S'),
+                                        }
+                                    else:
+                                        dash.extend_time(15 * 60)   # keep the monitor loop's own clock in sync too
+                                        _ext_results = []
+                                        for _oid, _pos in _ext_targets:
+                                            _r = extend_resting_order(_pos['ticker'], _oid, _pos.get('commence', ''))
+                                            _ext_results.append((_pos['ticker'], _r))
+                                            if _r['action'] == 'resized':
+                                                _r_price = _pos['entry_price'] / 100
+                                                _r_fee_rate = _pos.get('fee_rate', MAKER_FEE_BASE)
+                                                _r_fair = _pos.get('fair_last', _pos.get('fair_entry', 0.5))
+                                                threading.Thread(
+                                                    target=resume_monitoring,
+                                                    kwargs=dict(
+                                                        order_id=_r['new_order_id'], ticker=_pos['ticker'],
+                                                        event_id=_pos.get('event_id', ''), sport=_pos.get('sport', ''),
+                                                        outcome=_pos.get('raw_outcome', _pos['outcome']),
+                                                        order_price=_r_price, fee_rate=_r_fee_rate,
+                                                        commence=_pos.get('commence', ''), side=_pos['side'],
+                                                        contracts=_r['new_remaining'], fair_prob=_r_fair,
+                                                        ev_per_contract=_ev(_r_fair, _r_price, _r_fee_rate),
+                                                        dashboard=dash, stop_event=stop_event,
+                                                    ),
+                                                    daemon=True,
+                                                ).start()
+                                        _ext_err = sum(1 for _, r in _ext_results if r['action'] == 'error')
+                                        if _ext_err:
+                                            log.warning('+15 min: %d error(s) — %s', _ext_err,
+                                                       [r for _, r in _ext_results if r['action'] == 'error'])
+                                        st.session_state['_dash_last_action'] = {
+                                            'type':    'extend',
+                                            'ts':      datetime.now().strftime('%H:%M:%S'),
+                                            'minutes': 15,
+                                            'results': _ext_results,
+                                        }
 
                     # Render whatever the last action was — persists across the 1s
                     # auto-refresh instead of disappearing after one script run.
@@ -947,9 +1183,24 @@ with tab_trade:
                             st.info(f'[{_ats}] No resting orders to process.')
                         elif _atype == 'keep_rest_empty':
                             st.info(f'[{_ats}] No unfilled resting orders to keep.')
+                        elif _atype == 'extend_empty':
+                            st.info(f'[{_ats}] No resting orders to extend.')
                         elif _atype == 'extend':
-                            st.success(f"[{_ats}] Extended by {_last_action['minutes']}m — "
-                                       f"total extension now +{_extra_sec // 60}m")
+                            _ext_results = _last_action.get('results', [])
+                            _ext_ok = sum(1 for _, r in _ext_results if r['action'] == 'resized')
+                            _ext_err = sum(1 for _, r in _ext_results if r['action'] == 'error')
+                            with st.expander(
+                                f"[{_ats}] +{_last_action['minutes']}m — {_ext_ok} extended on Kalshi · "
+                                f"{_ext_err} errors — total extension now +{_extra_sec // 60}m",
+                                expanded=bool(_ext_err),
+                            ):
+                                for _tkr, _r in _ext_results:
+                                    if _r['action'] == 'resized':
+                                        st.success(f"{_tkr}  Good-till → {_r.get('new_expiry', '?')}")
+                                    elif _r['action'] == 'skipped':
+                                        st.caption(f"— {_tkr}  {_r.get('reason', 'skipped')}")
+                                    else:
+                                        st.error(f"{_tkr}  {_r.get('reason', 'error')}")
                         elif _atype == 'cross_cancel':
                             _xc_results = _last_action['results']
                             _n_crossed  = sum(1 for r in _xc_results if r['action'] == 'crossed')

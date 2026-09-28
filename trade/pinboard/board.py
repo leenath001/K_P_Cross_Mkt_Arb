@@ -28,7 +28,8 @@ BOOK_LEVELS = 15
 POLL_SEC = 2.0
 FILL_POLL_SEC = 2.5
 META_SEC = 30
-BOOKS_PER_CYCLE = 10          # order books read per 2 s cycle (the focused card always, the rest round-robin)
+BOOKS_PER_CYCLE = 10          # order books read per 2 s cycle, shared by recently-closed tickers only (see _loop)
+POST_CLOSE_WATCH_SEC = 15 * 60  # keep refreshing a filled/closed market's book this long after it closes ("where's it going")
 OPEN = {'resting', 'open', 'pending', 'unknown'}
 LABELS = {'resting': 'RESTING', 'executed': 'FILLED', 'filled': 'FILLED', 'canceled': 'CANCELED', 'expired': 'EXPIRED',
           'signal_flipped': 'EDGE GONE', 'max_duration_exceeded': 'TIMED OUT', 'event_imminent': 'EVENT SOON',
@@ -64,6 +65,7 @@ class PinBoard:
         self.books, self.live, self.px_override = {}, {}, {}
         self.events, self._ev_id, self._seen = [], 0, {}
         self.focus, self.ack, self._rr = None, None, 0
+        self._closed_at = {}   # ticker -> time.time() when we first saw it close, for POST_CLOSE_WATCH_SEC
         self.notes, self._busy = {}, set()
         self._act_seen, self._act_lock = [], threading.Lock()
         self._stop = threading.Event()
@@ -162,13 +164,27 @@ class PinBoard:
             t0 = time.time()
             try:
                 groups = self._groups()
-                live_t = [t for t, es in groups.items() if es[-1]['status'] in OPEN or t == self.focus]
-                if live_t:
-                    rest = [t for t in live_t if t != self.focus]
-                    start = self._rr % max(1, len(rest))
-                    room = BOOKS_PER_CYCLE - (1 if self.focus in live_t else 0)
-                    picked = ([self.focus] if self.focus in live_t else []) + (rest[start:] + rest[:start])[:room]
-                    self._rr = (start + room) % max(1, len(rest))
+                now = time.time()
+                # Always fetched, no budget cap: anything open, the expanded card, and any ticker we've never looked at
+                # yet — that last one matters because an order can fill INSTANTLY (a cross, or a rest that gets hit
+                # right away), faster than our own poll cycle; without this, that market's book (and so its fill
+                # notification) would show blank forever since it never had an "open" cycle to get fetched in.
+                always = {t for t, es in groups.items() if es[-1]['status'] in OPEN or t not in self._seen}
+                if self.focus in groups:
+                    always.add(self.focus)
+                # Recently-closed tickers keep refreshing for a while after the fill so the card can show where the
+                # market moved next — nice to have, not safety-critical, so these share a fixed round-robin budget
+                # instead of growing unbounded over a long session.
+                recent = [t for t, ts in self._closed_at.items()
+                         if t in groups and t not in always and now - ts < POST_CLOSE_WATCH_SEC]
+                picked = list(always)
+                if recent:
+                    room = max(0, BOOKS_PER_CYCLE - len(always))
+                    start = self._rr % len(recent)
+                    picked += (recent[start:] + recent[:start])[:room]
+                    self._rr = (start + room) % len(recent)
+                live_t = picked   # meta refresh below piggybacks on the same eligibility
+                if picked:
                     with ThreadPoolExecutor(max_workers=6) as pool:
                         for t, bk in pool.map(self._read_book, picked):
                             if bk:
@@ -241,6 +257,7 @@ class PinBoard:
                     self._event(card, 'fill', card['filled'] - prev['filled'])
                 if card['status'] == 'closed' and prev['status'] != 'closed':
                     self._event(card, 'closed', 0)
+                    self._closed_at[t] = time.time()
                 self._seen[t] = {'filled': card['filled'], 'status': card['status']}
 
     def _event(self, card, kind, qty):
