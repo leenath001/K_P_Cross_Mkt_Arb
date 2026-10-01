@@ -34,9 +34,13 @@ def faked(monkeypatch):
     monkeypatch.setattr(ph, 'check_sports_with_events', lambda keys, hrs: {k: 0 for k in keys})
     monkeypatch.setattr(ph, 'pinnacle_odds', lambda *a, **k: (_ for _ in ()).throw(ValueError('no events (faked)')))
     monkeypatch.setattr(kh, 'fee_rate_for', lambda series, maker=False: 0.0 if maker else 0.07)
+    import trade.core.execution.orders as ex_orders
+    import trade.core.execution.order_mgmt as ex_mgmt
     for name in ('place_order', 'cancel_order', 'ensure_canceled', 'cancel_all_resting_orders',
                  'cross_and_cancel_order', 'cancel_and_rerest', 'resize_resting_order', 'extend_resting_order'):
-        monkeypatch.setattr(ex, name, _refuse)
+        for mod in (ex, ex_orders, ex_mgmt):      # the package re-export and the submodules that call each other
+            if hasattr(mod, name):
+                monkeypatch.setattr(mod, name, _refuse)
     monkeypatch.setattr(ex, 'get_balance', lambda: 50.0)
     monkeypatch.setattr(ex, 'list_resting_orders', lambda: [])
     monkeypatch.setattr(pos, 'open_tickers', lambda: set())
