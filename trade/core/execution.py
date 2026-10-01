@@ -222,7 +222,7 @@ def get_balance() -> float:
     path = '/trade-api/v2/portfolio/balance'
     try:
         resp = requests.get(f'{BASE_URL}/portfolio/balance',
-                            headers=kalshi_headers('GET', path))
+                            headers=kalshi_headers('GET', path), timeout=15)
     except requests.exceptions.RequestException as exc:
         log.error('get_balance network failure: %s', exc)
         raise RuntimeError(f'Could not reach Kalshi to fetch balance: {exc}') from exc
@@ -390,13 +390,33 @@ def cancel_order(ticker: str, order_id: str, max_retries: int = 4) -> bool:
             # (a monitor thread + "Cancel all", or ensure_canceled's retry after a
             # first success) routinely race — the loser sees 404 even though the order
             # IS canceled. Confirm with a GET rather than reporting a false failure.
-            if get_order_status(order_id).get('status') in _CLOSED_STATUSES:
+            status = get_order_status(order_id).get('status')
+            if status in _CLOSED_STATUSES:
                 log.info('cancel_order: %s already closed (lost a cancel race) — ok', order_id)
+                return True
+            # Kalshi also drops a canceled/expired order that never filled from its lookups, so the GET above can
+            # come back 'unknown' for an order that is simply gone. What matters is whether it is still RESTING:
+            # check that market's resting orders directly before reporting a failure.
+            if status == 'unknown' and not _is_resting(ticker, order_id):
+                log.info('cancel_order: %s no longer exists on Kalshi and is not resting — ok', order_id)
                 return True
         log.warning('cancel_order failed for %s (%s): %s %s — %s',
                     order_id, ticker, resp.status_code, resp.reason, resp.text)
         return False
     return False
+
+
+def _is_resting(ticker: str, order_id: str) -> bool:
+    """True if order_id is among `ticker`'s resting orders — or if that can't be checked (fail safe: assume it is)."""
+    path = '/trade-api/v2/portfolio/orders'
+    try:
+        resp = requests.get(f'{BASE_URL}/portfolio/orders', headers=kalshi_headers('GET', path),
+                            params={'ticker': ticker, 'status': 'resting', 'limit': 200}, timeout=15)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException:
+        log.exception('_is_resting: could not list resting orders for %s', ticker)
+        return True
+    return any(o.get('order_id') == order_id for o in resp.json().get('orders', []))
 
 
 def ensure_canceled(ticker: str, order_id: str, max_attempts: int = 5,
@@ -438,7 +458,7 @@ def get_market_price(ticker: str) -> Optional[int]:
     path = f'/trade-api/v2/markets/{ticker}'
     try:
         resp = requests.get(f'{BASE_URL}/markets/{ticker}',
-                            headers=kalshi_headers('GET', path))
+                            headers=kalshi_headers('GET', path), timeout=15)
     except requests.exceptions.RequestException as exc:
         log.warning('get_market_price network failure for %s: %s', ticker, exc)
         return None
@@ -458,7 +478,7 @@ def get_market_prices(ticker: str) -> dict:
     path = f'/trade-api/v2/markets/{ticker}'
     try:
         resp = requests.get(f'{BASE_URL}/markets/{ticker}',
-                            headers=kalshi_headers('GET', path))
+                            headers=kalshi_headers('GET', path), timeout=15)
     except requests.exceptions.RequestException as exc:
         log.warning('get_market_prices network failure for %s: %s', ticker, exc)
         return {}
@@ -501,7 +521,7 @@ def get_orderbook_depth(ticker: str, levels: int = 2) -> dict:
     try:
         resp = requests.get(f'{BASE_URL}/markets/{ticker}/orderbook',
                             headers=kalshi_headers('GET', path),
-                            params={'depth': max(levels, 5)})
+                            params={'depth': max(levels, 5)}, timeout=15)
     except requests.exceptions.RequestException as exc:
         log.warning('get_orderbook_depth network failure for %s: %s', ticker, exc)
         return {}
@@ -538,7 +558,7 @@ def get_orderbook_depth(ticker: str, levels: int = 2) -> dict:
 
     m_path = f'/trade-api/v2/markets/{ticker}'
     try:
-        m_resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=kalshi_headers('GET', m_path))
+        m_resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=kalshi_headers('GET', m_path), timeout=15)
         if m_resp.ok:
             lp = m_resp.json().get('market', {}).get('last_price_dollars')
             if lp is not None:
@@ -859,7 +879,7 @@ def list_resting_orders() -> list:
     path = '/trade-api/v2/portfolio/orders'
     resp = requests.get(f'{BASE_URL}/portfolio/orders',
                         headers=kalshi_headers('GET', path),
-                        params={'status': 'resting', 'limit': 200})
+                        params={'status': 'resting', 'limit': 200}, timeout=15)
     resp.raise_for_status()
     orders = resp.json().get('orders', [])
     return [o for o in orders if o.get('status') in OPEN_ORDER_STATUSES]
@@ -897,7 +917,7 @@ def get_order_status(order_id: str) -> dict:
         # 1. Try direct lookup
         path = f'/trade-api/v2/portfolio/orders/{order_id}'
         resp = requests.get(f'{BASE_URL}/portfolio/orders/{order_id}',
-                            headers=kalshi_headers('GET', path))
+                            headers=kalshi_headers('GET', path), timeout=15)
         if resp.ok:
             return resp.json().get('order', {})
 
@@ -905,7 +925,7 @@ def get_order_status(order_id: str) -> dict:
         list_path = '/trade-api/v2/portfolio/orders'
         resp2 = requests.get(f'{BASE_URL}/portfolio/orders',
                              headers=kalshi_headers('GET', list_path),
-                             params={'limit': 100})
+                             params={'limit': 100}, timeout=15)
         if resp2.ok:
             for o in resp2.json().get('orders', []):
                 if o.get('order_id') == order_id:

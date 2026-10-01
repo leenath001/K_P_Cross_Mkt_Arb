@@ -66,15 +66,30 @@ table.ord td,table.ord th{padding:1px 4px;text-align:left;border-bottom:1px soli
 .ctl button.sd{border-color:#2c6b45;color:#7fd9a2}.ctl button.sd.pull{border-color:#a33;color:#ffb3b3}
 .card.flash{animation:flash 1.1s ease-out}
 @keyframes flash{0%{box-shadow:0 0 0 3px #e74c3c,0 0 18px 4px rgba(231,76,60,.7);background:#4a1f22}100%{box-shadow:0 0 0 0 transparent;background:var(--card)}}
+#sortbar{display:flex;align-items:center;gap:6px;margin:0 0 8px;color:var(--muted);font-size:11px}
+#sortbar button{padding:1px 9px;font-size:11px;color:var(--muted)}
+#sortbar button.sel{color:var(--fg);border-color:var(--blue);background:rgba(76,155,232,.15)}
+.badge.vol{border-color:#3c5f8a;color:#9cc7f2}
 </style>
 </head>
 <body>
+<div id="sortbar">Order:
+  <button data-s="vol" title="Most volatile first (vol score), left to right, top to bottom">Volatility</button>
+  <button data-s="manual" title="Your own drag-and-drop order">Manual</button></div>
 <div id="board"></div>
 <script>
 const KEY='mm_layout_v2';
-let layout={order:[]}, state=null, dragging=null, qdrag=null, expanded=null;
+let layout={order:[], sort:'vol'}, state=null, dragging=null, qdrag=null, expanded=null;
 try{layout=Object.assign(layout,JSON.parse(localStorage.getItem(KEY)||'{}'))}catch(e){}
 const save=()=>{try{localStorage.setItem(KEY,JSON.stringify(layout))}catch(e){}};
+// Board order only (display): the engine's market list and funding priority are untouched.
+// Vol score = realized volatility of the last hour's trades (cents); ties by trade count, then contracts traded.
+function volCmp(a,b){const x=a.activity, y=b.activity; if(!x||!y)return (!x)-(!y);
+  return (y.vol_c-x.vol_c)||(y.trades-x.trades)||(y.contracts-x.contracts)}
+function paintSortbar(){document.querySelectorAll('#sortbar button').forEach(b=>b.classList.toggle('sel',b.dataset.s===layout.sort))}
+document.getElementById('sortbar').addEventListener('click',e=>{const b=e.target.closest('button'); if(!b)return;
+  layout.sort=b.dataset.s; save(); paintSortbar(); render()});
+paintSortbar();
 const send=(type,data)=>window.parent.postMessage(Object.assign({isStreamlitMessage:true,type},data||{}),'*');
 const fmt=(v,d=3)=>v==null?'—':(+v).toFixed(d);
 const cls=v=>v==null?'':(v>0?'pos':(v<0?'neg':''));
@@ -283,10 +298,14 @@ function cdText(iso){const s=Math.floor((new Date(iso)-Date.now())/1000); if(!(s
   const h=Math.floor(s/3600),mi=Math.floor(s%3600/60),se=s%60; return 'starts in '+(h?h+'h ':'')+mi+'m '+String(se).padStart(2,'0')+'s'}
 function tickCd(){document.querySelectorAll('.cd').forEach(e=>{const t=cdText(e.dataset.s); if(e.textContent!==t)e.textContent=t})}
 setInterval(tickCd,1000);
+function volBadge(m){const a=m.activity;
+  if(!a)return '<span class="badge vol" title="vol score: reading the last hour of trades…">vol …</span>';
+  const tip=`vol score ${a.vol_c} — realized volatility of the last hour's trades (cents)\n${a.trades} trades · ${fmt(a.contracts,0)} contracts\nrange ${fmt(a.range_c,1)}¢ (high − low) · price action ${fmt(a.move_c,1)}¢ travelled`;
+  return `<span class="badge vol" title="${esc(tip)}">vol ${fmt(a.vol_c,1)} · ${a.trades}t</span>`}
 function headHTML(m,wide){
   const b={quoting:['q','QUOTING'],paused:['pause','PAUSED'],waiting:['','WAITING'],off:['','OFF']}[m.status]||['',''];
   return `<span class="grip" title="drag to move">⠿</span><div class="main"><div class="ttl" title="${esc(m.title)}">${esc(m.title)}</div><div class="sub">${esc(m.outcome)} · ${esc(m.ticker)}</div>`+
-    `<div class="badges"><span class="badge zero">0% fee</span><span class="badge ${b[0]}">${b[1]}</span><span class="badge cd" data-s="${esc(m.start_iso)}"></span>${m.note?`<span class="badge warn" title="${esc(m.note)}">${esc(m.note)}</span>`:''}</div></div>`+
+    `<div class="badges"><span class="badge zero">0% fee</span><span class="badge ${b[0]}">${b[1]}</span><span class="badge cd" data-s="${esc(m.start_iso)}"></span>${volBadge(m)}${m.note?`<span class="badge warn" title="${esc(m.note)}">${esc(m.note)}</span>`:''}</div></div>`+
     `<button class="xp" title="${wide?'back to grid':'expand'}">${wide?'⤡':'⤢'}</button>`;
 }
 function invStrip(m){
@@ -315,7 +334,7 @@ function makeCard(t){
   el.addEventListener('drop',e=>{e.preventDefault();el.classList.remove('over')});
   el.addEventListener('dragstart',e=>{dragging=el;el.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',t)});
   el.addEventListener('dragend',()=>{el.classList.remove('dragging');el.draggable=false;dragging=null;
-    layout.order=[...board.children].map(c=>c.dataset.t).filter(Boolean);save();render()});
+    layout.order=[...board.children].map(c=>c.dataset.t).filter(Boolean);layout.sort='manual';save();paintSortbar();render()});
   el.addEventListener('mousedown',e=>{el.draggable=!!e.target.closest('.grip')&&!expanded});
   const wire=(inp,key,lo,hi,pend,field)=>{
     const cur=()=>state&&state.markets.find(x=>x.ticker===t);
@@ -341,8 +360,9 @@ function render(){
   layout.order=layout.order.filter(t=>tk.includes(t)); tk.forEach(t=>{if(!layout.order.includes(t))layout.order.push(t)});
   if(expanded&&!tk.includes(expanded)){expanded=null;act({action:'focus',ticker:null})}
   const by=Object.fromEntries(ms.map(m=>[m.ticker,m]));
+  const order=layout.sort==='vol'?ms.slice().sort(volCmp).map(m=>m.ticker):layout.order;
   board.classList.toggle('one',!!expanded);
-  layout.order.forEach(t=>{
+  order.forEach(t=>{
     const el=board.querySelector(`[data-t="${CSS.escape(t)}"]`)||makeCard(t);
     const m=by[t], wide=expanded===t;
     el.classList.toggle('wide',wide); el.classList.toggle('hidden',!!expanded&&!wide);
@@ -365,7 +385,7 @@ function render(){
   [...board.children].forEach(c=>{if(c.dataset&&c.dataset.t&&!by[c.dataset.t])c.remove()});
   // Re-order only when the order actually changed: re-appending a card every second detaches it, which drops focus from
   // an input being typed in (the size / max-inventory boxes).
-  const want=layout.order.filter(t=>board.querySelector(`[data-t="${CSS.escape(t)}"]`)), have=[...board.children].map(c=>c.dataset&&c.dataset.t).filter(Boolean);
+  const want=order.filter(t=>board.querySelector(`[data-t="${CSS.escape(t)}"]`)), have=[...board.children].map(c=>c.dataset&&c.dataset.t).filter(Boolean);
   if(want.join('|')!==have.join('|'))want.forEach(t=>board.appendChild(board.querySelector(`[data-t="${CSS.escape(t)}"]`)));
   paintDrag();
   tickCd();

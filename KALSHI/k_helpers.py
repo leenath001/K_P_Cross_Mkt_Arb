@@ -1,4 +1,4 @@
-import sys, os
+import sys, os, threading, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import pandas as pd
 import config
@@ -82,7 +82,36 @@ def _best_match(query: str, candidates: pd.Series) -> tuple:
             best_score, best_idx = score, idx
     return best_idx, best_score
 
+# Process-wide pacing for Kalshi READS. The MM engine (parallel book reads every 2s, even while quoting is off), the
+# pin board, the Cash/Portfolio feed and the order monitors all share one API key, and their combined bursts tripped
+# Kalshi's per-second read limit (429 Too Many Requests on everything, balance included). Every authenticated call
+# signs through kalshi_headers() right before sending, so throttling GETs here paces all of them at once. Writes
+# (orders / cancels) are not throttled: they're latency-sensitive and cancel_order() already backs off on 429.
+KALSHI_READS_PER_SEC = 15      # Kalshi Basic tier allows 20 reads/s; headroom for clock jitter
+KALSHI_READ_BURST    = 5
+_read_lock    = threading.Lock()
+_read_tokens  = float(KALSHI_READ_BURST)
+_read_last    = time.monotonic()
+
+
+def _pace_read():
+    """Token bucket: take one read token, sleeping (outside the lock) until one is available."""
+    global _read_tokens, _read_last
+    while True:
+        with _read_lock:
+            now = time.monotonic()
+            _read_tokens = min(KALSHI_READ_BURST, _read_tokens + (now - _read_last) * KALSHI_READS_PER_SEC)
+            _read_last = now
+            if _read_tokens >= 1:
+                _read_tokens -= 1
+                return
+            wait = (1 - _read_tokens) / KALSHI_READS_PER_SEC
+        time.sleep(wait)
+
+
 def kalshi_headers(method: str, path: str) -> dict:
+    if method.upper() == 'GET':
+        _pace_read()
     ts  = str(int(datetime.now(timezone.utc).timestamp() * 1000))
     msg = (ts + method.upper() + path).encode()
     sig = _private_key.sign(
@@ -135,7 +164,7 @@ def get_series_fee_info(series_ticker: str) -> tuple:
     if series_ticker in _series_fee_cache:
         return _series_fee_cache[series_ticker]
     try:
-        resp = requests.get(f'{BASE_URL}/series/{series_ticker}')
+        resp = requests.get(f'{BASE_URL}/series/{series_ticker}', timeout=15)
         if resp.ok:
             s = resp.json().get('series', {})
             info = (s.get('fee_type') or 'quadratic_with_maker_fees',
@@ -182,7 +211,7 @@ def load_all_mkts(SERIES_TICKER: str):
         resp = requests.get(
             f'{BASE_URL}/markets',
             headers=kalshi_headers('GET', '/trade-api/v2/markets'),
-            params={'series_ticker': SERIES_TICKER, 'status': 'open', 'limit': 500})
+            params={'series_ticker': SERIES_TICKER, 'status': 'open', 'limit': 500}, timeout=15)
         resp.raise_for_status()
     except requests.exceptions.RequestException:
         log.exception('load_all_mkts failed for series %s', SERIES_TICKER)

@@ -14,6 +14,7 @@ from applog import get_logger
 log = get_logger(__name__)
 
 INTERVAL_SEC = 10
+MAX_BACKOFF_SEC = 120
 
 _lock = threading.Lock()
 _state = {'cash': None, 'portfolio': None, 'positions_value': None, 'positions': [],
@@ -60,12 +61,16 @@ def _refresh():
 
 
 def _loop():
+    fails = 0
     while True:
         try:
             _refresh()
         except Exception:
             log.exception('balance_feed: unexpected refresh error')
-        time.sleep(INTERVAL_SEC)
+        with _lock:
+            fails = fails + 1 if _state['error'] else 0
+        # back off while Kalshi is failing (e.g. 429 rate limiting) so this feed doesn't add to the problem
+        time.sleep(min(MAX_BACKOFF_SEC, INTERVAL_SEC * 2 ** fails))
 
 
 def start() -> dict:

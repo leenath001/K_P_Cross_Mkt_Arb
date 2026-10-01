@@ -35,11 +35,12 @@ log = get_logger(__name__)
 
 SELECTION_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                               'logs', 'mm_selection.json')
-ENGINE_VERSION = 20    # bump when MMEngine's state/attributes change: the UI then swaps out a stale cached engine
+ENGINE_VERSION = 22    # bump when MMEngine's state/attributes change: the UI then swaps out a stale cached engine
 MAX_SIZE, DEFAULT_SIZE, BOOK_DEPTH, MM_PREFIX = 25, 5, 15, 'mm-'
 # Safety guards — the engine runs with no browser attached, so it polices its own inputs instead of a UI heartbeat:
 FAIR_STALE_SEC = 180       # a market's Pinnacle fair unconfirmed this long (or 3× the refresh setting, if longer) → its auto quotes are pulled until it refreshes
 KALSHI_DOWN_SEC = 60       # Kalshi's resting-orders read failing continuously this long → quoting off, cancel everything
+ACTIVITY_WINDOW_SEC, ACTIVITY_REFRESH_SEC = 3600, 120   # vol score: trades over the last hour, re-read every 2 min
 LOOP_STALL_SEC = 60        # engine loop hasn't finished a cycle this long (hung request) → watchdog cancels everything
 MAX_INV_LIMIT, DEFAULT_MAX_INV = 500, 20      # per-market cap on net contracts held (either direction)
 OFFLOAD_MIN_NET_C = 0.5                        # only take profit when it nets at least this per contract AFTER the taker fee
@@ -90,6 +91,38 @@ def fetch_book(ticker: str, full: bool = False) -> dict:
     no  = [(round(float(p) * 100, 3), float(q)) for p, q in (ob.get('no_dollars') or [])]
     return {'bids': sorted(yes, key=lambda t: -t[0]),
             'asks': sorted(((round(100 - p, 3), q) for p, q in no), key=lambda t: t[0])}
+
+
+def market_activity(ticker: str, window_sec: int = ACTIVITY_WINDOW_SEC, max_pages: int = 3) -> dict:
+    """
+    Recent trading activity for one market from Kalshi's public trade tape (last `window_sec`):
+      trades / contracts — how much has traded
+      range_c            — high minus low trade price (cents)
+      move_c             — price action: total distance travelled, sum of |trade-to-trade change| (cents)
+      vol_c              — the VOL SCORE: realized volatility, sqrt(sum of squared trade-to-trade changes) (cents).
+                           Grows with both how often the price changes and how far it moves; trades at an unchanged
+                           price add nothing. (A market bouncing between bid and ask scores too — for a market maker
+                           that's two-sided flow, not just noise.)
+    """
+    trades, cursor = [], None
+    for _ in range(max_pages):
+        params = {'ticker': ticker, 'min_ts': int(time.time()) - window_sec, 'limit': 1000,
+                  **({'cursor': cursor} if cursor else {})}
+        r = _get('/markets/trades', params)
+        r.raise_for_status()
+        body = r.json()
+        trades.extend(body.get('trades', []))
+        cursor = body.get('cursor')
+        if not cursor:
+            break
+    trades.sort(key=lambda t: t.get('created_time', ''))
+    px = [round(float(t['yes_price_dollars']) * 100, 3) for t in trades if t.get('yes_price_dollars')]
+    steps = [b - a for a, b in zip(px, px[1:])]
+    return {'trades': len(trades), 'contracts': round(sum(float(t.get('count_fp') or 0) for t in trades), 2),
+            'range_c': round(max(px) - min(px), 3) if px else 0.0,
+            'move_c': round(sum(abs(d) for d in steps), 3),
+            'vol_c': round(math.sqrt(sum(d * d for d in steps)), 2),
+            'at': time.time()}
 
 
 # ── Screening ────────────────────────────────────────────────────────────────
@@ -148,9 +181,9 @@ def _new_state(spec):
     return {'max_inv': DEFAULT_MAX_INV, 'spec': spec, 'paused': False, 'on': False, 'side_add': {'bid': False, 'ask': False},
             'side_off': {'bid': False, 'ask': False}, 'size': DEFAULT_SIZE, 'manual': {'bid': None, 'ask': None},
             'force': {'bid': False, 'ask': False}, 'ranges': None, 'book': {'bids': [], 'asks': []}, 'last_c': None, 'volume': None,
-            'fair_c': spec.get('fair_c'), 'fair_at': time.time(), 'fair_ok_at': spec.get('fair_ts', 0), 'target': {}, 'orders': {'bid': None, 'ask': None},
+            'fair_c': spec.get('fair_c'), 'fair_at': 0, 'fair_ok_at': spec.get('fair_ts', 0), 'target': {}, 'orders': {'bid': None, 'ask': None},
             'fills': [], 'inv': 0.0, 'cycles': 0, 'cycles_two_sided': 0, 'api_err': 0, 'requotes': 0,
-            'off_top': [], 'note': '', 'meta_at': 0}
+            'off_top': [], 'note': '', 'meta_at': 0, 'activity': None}
 
 
 class MMEngine:
@@ -454,6 +487,7 @@ class MMEngine:
         self._thread = threading.Thread(target=self._loop, name='mm-engine', daemon=True)
         self._thread.start()
         threading.Thread(target=self._watchdog, name='mm-watchdog', daemon=True).start()
+        threading.Thread(target=self._activity_loop, name='mm-activity', daemon=True).start()
 
     # -- browser <-> engine side channel -------------------------------------
     def handle_action(self, act: dict):
@@ -1136,6 +1170,8 @@ class MMEngine:
             if m['orders']['bid'] or m['orders']['ask'] or self._running(m, live):
                 by_sport.setdefault(m['spec']['sport'], []).append(m)
         for sport, ms in by_sport.items():
+            # fair_at = last refresh ATTEMPT (0 for a market not yet refreshed in this engine, so a newly loaded or
+            # re-screened market gets its first Pinnacle check on the next cycle instead of sitting stale for a full interval)
             if time.time() - min(x['fair_at'] for x in ms) < self.params['fair_refresh_sec']:
                 continue
             try:
@@ -1168,6 +1204,26 @@ class MMEngine:
         for x in self.mkts.values():
             self._clear_flags(x)
         self._cancel_bg()
+
+    def _activity_loop(self):
+        """Background: refresh each board market's vol score (see market_activity). Display only — it never changes
+        which markets are loaded, their order, or quoting."""
+        while not self._stop.is_set():
+            with self.lock:
+                due = [t for t, m in self.mkts.items()
+                       if time.time() - (m.get('activity') or {}).get('at', 0) >= ACTIVITY_REFRESH_SEC]
+            for t in due:
+                if self._stop.is_set():
+                    return
+                try:
+                    act = market_activity(t)
+                except Exception as exc:
+                    log.info('mm: activity read failed for %s: %s', t, exc)
+                    continue
+                with self.lock:
+                    if t in self.mkts:
+                        self.mkts[t]['activity'] = act
+            self._stop.wait(10)
 
     def _watchdog(self):
         """
@@ -1210,6 +1266,7 @@ class MMEngine:
                     try:
                         self._cash, self._cash_at = float(get_balance()), time.time()
                     except Exception:
+                        self._cash_at = time.time()       # retry on the normal 20s cadence, not every 2s cycle
                         log.warning('mm: balance refresh failed')
                 if live:
                     try:
@@ -1340,6 +1397,7 @@ class MMEngine:
                     'mins_to_start': round((pd.Timestamp(sp['commence']) - pd.Timestamp.now(tz='UTC')).total_seconds() / 60, 1),
                     'fair_c': fair, 'fair_age_s': round(now - m['fair_ok_at']) if m.get('fair_ok_at') else None, 'size': m['size'],
                     'bids': bids if t == self.focus else bids[:9], 'asks': asks if t == self.focus else asks[:9], 'mid_c': mids, 'last_c': m['last_c'], 'volume': m['volume'],
+                    'activity': {k: v for k, v in m['activity'].items() if k != 'at'} if m.get('activity') else None,
                     'tick_c': tick, 'orders': orders,
                     'max_inv': m['max_inv'], 'note': m['note'], 'paused': m['paused'], 'active': (live_now and not m['paused']) or m['on'],
                     'purge': self._purge_view(m),

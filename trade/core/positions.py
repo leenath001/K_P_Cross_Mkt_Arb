@@ -48,7 +48,7 @@ def _open_position_tickers():
             params['cursor'] = cursor
         try:
             resp = requests.get(f'{BASE_URL}/portfolio/positions',
-                                headers=kalshi_headers('GET', path), params=params)
+                                headers=kalshi_headers('GET', path), params=params, timeout=15)
         except requests.exceptions.RequestException:
             log.exception('_open_position_tickers: network failure')
             return None
@@ -75,7 +75,7 @@ def _resting_order_tickers():
     try:
         resp = requests.get(f'{BASE_URL}/portfolio/orders',
                             headers=kalshi_headers('GET', path),
-                            params={'status': 'resting', 'limit': 200})
+                            params={'status': 'resting', 'limit': 200}, timeout=15)
     except requests.exceptions.RequestException:
         log.exception('_resting_order_tickers: network failure')
         return None
@@ -132,7 +132,7 @@ def is_two_way_event(event_ticker: str) -> bool:
     path = '/trade-api/v2/markets'
     try:
         resp = requests.get(f'{BASE_URL}/markets', headers=kalshi_headers('GET', path),
-                            params={'event_ticker': event_ticker, 'limit': 20})
+                            params={'event_ticker': event_ticker, 'limit': 20}, timeout=15)
         if not resp.ok:
             log.warning('is_two_way_event %s failed: %s', event_ticker, resp.status_code)
             return True

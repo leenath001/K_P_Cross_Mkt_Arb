@@ -45,7 +45,7 @@ def fetch_order_status(order_id: str) -> Optional[dict]:
     path = f'/trade-api/v2/portfolio/orders/{order_id}'
     try:
         resp = requests.get(f'{BASE_URL}/portfolio/orders/{order_id}',
-                            headers=kalshi_headers('GET', path))
+                            headers=kalshi_headers('GET', path), timeout=15)
     except requests.exceptions.RequestException:
         log.exception('fetch_order_status network failure for %s', order_id)
         return None
@@ -117,7 +117,7 @@ def fetch_market_result(ticker: str) -> dict:
     path = f'/trade-api/v2/markets/{ticker}'
     try:
         resp = requests.get(f'{BASE_URL}/markets/{ticker}',
-                            headers=kalshi_headers('GET', path))
+                            headers=kalshi_headers('GET', path), timeout=15)
     except requests.exceptions.RequestException:
         log.exception('fetch_market_result network failure for %s', ticker)
         return {'result': None, 'settled_at': None}
@@ -150,7 +150,7 @@ def fetch_realized_pnl_from_fills(ticker: str, side: str) -> Optional[dict]:
     try:
         resp = requests.get(f'{BASE_URL}/portfolio/fills',
                             headers=kalshi_headers('GET', path),
-                            params={'ticker': ticker, 'limit': 200})
+                            params={'ticker': ticker, 'limit': 200}, timeout=15)
     except requests.exceptions.RequestException:
         log.exception('fetch_realized_pnl_from_fills network failure for %s', ticker)
         return None
@@ -199,7 +199,7 @@ def fetch_scalar_settlement_value(ticker: str) -> Optional[float]:
     path = f'/trade-api/v2/markets/{ticker}'
     try:
         resp = requests.get(f'{BASE_URL}/markets/{ticker}',
-                            headers=kalshi_headers('GET', path))
+                            headers=kalshi_headers('GET', path), timeout=15)
     except requests.exceptions.RequestException:
         log.exception('fetch_scalar_settlement_value network failure for %s', ticker)
         return None
