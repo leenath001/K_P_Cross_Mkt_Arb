@@ -14,6 +14,7 @@ sys.path.insert(0, _TRADE)
 import threading
 import time
 import streamlit as st
+import numpy as np
 import pandas as pd
 from datetime import datetime
 import config
@@ -25,7 +26,7 @@ from trade.core.execution import (get_balance, cross_and_cancel_order, cancel_an
 from trade.core.positions import open_tickers, opposite_leg_blocked
 from trade.mm.ui import render_trade as _mm_trade, render_review as _mm_review
 from trade.clv import load_closing_lines, start_background as _start_clv_capture
-from trade.core.balance_feed import start as _start_balance_feed
+from trade.core.balance_feed import start as _start_balance_feed, latest as _balance_latest
 from trade.strategies.kp_arb import run_all_signals, resume_monitoring
 from trade.pinboard.board import PinBoard
 from trade.pinboard.ui import render_board as _render_pin_board
@@ -272,9 +273,11 @@ _bal_js = """<script>
 (function(){
   const P=window.parent, D=P.document;
   const cfg={port:__PORT__, token:'__TOKEN__', host:'127.0.0.1'};   // components.html renders via a srcdoc iframe, whose location.hostname is empty
-  if(P.__balFeed && P.__balFeed.setCfg){ P.__balFeed.setCfg(cfg); return; }
+  const VER=3;   // bump when this widget's DOM changes, so an already-open tab rebuilds instead of keeping the old one
+  if(P.__balFeed && P.__balFeed.ver===VER){ P.__balFeed.setCfg(cfg); return; }
   if(P.__balFeed){   // an older build of this widget, still alive in an already-open tab — tear it down and rebuild
     try{ P.__balFeed.terminate && P.__balFeed.terminate() }catch(e){}
+    try{ P.__balFeed.stop && P.__balFeed.stop() }catch(e){}
     ['bal-wrap','pos-panel'].forEach(id=>{ const el=D.getElementById(id); if(el) el.remove() });
   }
   const STALE_SEC=45;
@@ -286,6 +289,9 @@ _bal_js = """<script>
     .bal-box .v{font:700 15px/1.3 system-ui,sans-serif;color:#e6e6e6}
     .bal-box .l{font:500 10px/1.2 system-ui,sans-serif;color:#8b93a1;text-transform:uppercase;letter-spacing:.03em}
     .bal-box.port{cursor:pointer}
+    .bal-box.use{position:relative;overflow:hidden}
+    .bal-box.use .bar{position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(255,255,255,.08)}
+    .bal-box.use .bar i{display:block;height:100%;width:0;background:#e74c3c}
     .bal-box.port .l{color:#2ecc71}
     #bal-wrap.stale .v{opacity:.45}
     #bal-wrap.stale .l{color:#e67e22 !important}
@@ -304,10 +310,16 @@ _bal_js = """<script>
   `;
   D.head.appendChild(css);
   const wrap=D.createElement('div'); wrap.id='bal-wrap';
-  wrap.innerHTML='<div class="bal-box cash"><div class="v">__DASH__</div><div class="l">Cash</div></div>'+
+  wrap.innerHTML='<div class="bal-box use" title="Odds API requests left this month"><div class="v">__DASH__</div><div class="l">API left</div><div class="bar"><i></i></div></div>'+
+                 '<div class="bal-box cash"><div class="v">__DASH__</div><div class="l">Cash</div></div>'+
                  '<div class="bal-box port"><div class="v">__DASH__</div><div class="l">Portfolio</div></div>';
   const panel=D.createElement('div'); panel.id='pos-panel';
   D.body.appendChild(wrap); D.body.appendChild(panel);
+  // Let the look-ahead box (a Streamlit widget pinned into this bar by web_app.py's CSS) sit just left of these boxes.
+  const placeCfg=()=>D.documentElement.style.setProperty('--topcfg-right', (56+wrap.offsetWidth+8)+'px');
+  try{ new P.ResizeObserver(placeCfg).observe(wrap) }catch(e){}
+  placeCfg();
+  const useV=wrap.querySelector('.use .v'), useBar=wrap.querySelector('.use .bar i'), useBox=wrap.querySelector('.use');
   const cashV=wrap.querySelector('.cash .v'), portV=wrap.querySelector('.port .v'), portBox=wrap.querySelector('.port');
   const fmt=v=>v==null?'__DASH__':'$'+Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
   let last=null, lastOk=0;   // last snapshot received, and when (ms) the browser last reached the feed at all
@@ -337,6 +349,12 @@ _bal_js = """<script>
     if(!d)return;
     last=d; lastOk=Date.now();
     cashV.textContent=fmt(d.cash); portV.textContent=fmt(d.portfolio); renderPositions(d); refreshStale();
+    if(d.api_remaining!=null){
+      const used=d.api_used||0, lim=used+d.api_remaining, pct=lim?Math.min(100,100*used/lim):0;
+      useV.textContent=Number(d.api_remaining).toLocaleString();
+      useBar.style.width=pct+'%'; useBar.style.background=pct>=90?'#e74c3c':pct>=70?'#e67e22':'#2ecc71';
+      useBox.title='Odds API: '+Number(d.api_remaining).toLocaleString()+' requests left ('+used.toLocaleString()+' of '+lim.toLocaleString()+' used)';
+    }
   }
   setInterval(refreshStale, 5000);
   portBox.addEventListener('click', e=>{
@@ -365,10 +383,10 @@ _bal_js = """<script>
     const w=new Worker(URL.createObjectURL(new Blob([src],{type:'application/javascript'})));
     w.onmessage=(e)=>apply(e.data);
     w.postMessage({type:'cfg',cfg});
-    P.__balFeed={setCfg:c=>w.postMessage({type:'cfg',cfg:c})};
+    P.__balFeed={ver:VER, setCfg:c=>w.postMessage({type:'cfg',cfg:c}), terminate:()=>w.terminate()};
   }catch(e){
-    mainTick(); setInterval(mainTick,5000);
-    P.__balFeed={setCfg:c=>{mainCfg=c; mainTick()}};
+    mainTick(); const iv=setInterval(mainTick,5000);
+    P.__balFeed={ver:VER, setCfg:c=>{mainCfg=c; mainTick()}, stop:()=>clearInterval(iv)};
   }
   refreshStale();
 })();
@@ -412,64 +430,78 @@ if 'balance' not in st.session_state:
         log.exception('Startup balance fetch failed')
         st.session_state['balance'] = None
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+def _live_cash():
+    """Available Kalshi cash for sizing: the balance feed's latest read (refreshed every ~10s, same number as the
+    Cash readout), else the one-off read taken at startup."""
+    try:
+        cash = _balance_latest().get('cash')
+    except Exception:
+        cash = None
+    if cash is not None:
+        st.session_state['balance'] = cash
+    return st.session_state.get('balance')
 
-# Everything in the sidebar lives in ONE fragment: clicking Refresh usage / Refresh balance or moving a slider reruns
-# only this block, not the whole page. Values other parts read (hours, threshold, live) are keyed session_state entries.
-with st.sidebar:
-    @st.fragment
-    def _sidebar_panel():
-        st.header('API Usage')
-        if st.button('Refresh usage'):
-            with st.spinner('Fetching...'):
-                try:
-                    used, remaining = fetch_usage()
-                    st.session_state['api_used']      = used
-                    st.session_state['api_remaining'] = remaining
-                except Exception as e:
-                    log.exception('Refresh usage failed')
-                    st.error(f'Failed: {e}')
 
-        used      = st.session_state.get('api_used',      0)
-        remaining = st.session_state.get('api_remaining', 500)
-        limit     = used + remaining
-        pct       = min(max(used / max(limit, 1), 0.0), 1.0)
-        st.progress(pct, text=f'{used} / {limit} requests used  ({remaining} remaining)')
-        if pct >= 0.9:
-            st.error('API quota nearly exhausted')
-        elif pct >= 0.7:
-            st.warning('API quota above 70%')
+def _open_trade_outcomes(live: pd.DataFrame):
+    """
+    Exact distribution of the PnL still to come from unsettled trades: (outcome $ offsets, probabilities, expected $),
+    or None if there's nothing to project. Same payoff model as settle.compute_pnl (fee charged at entry, win or
+    lose): win = c·((1−e) − fee), loss = c·(−e − fee), fee = fee_rate·e·(1−e). A win pays exactly c dollars more than
+    a loss, so the total is (sum of all losses) + Σ cᵢ·Bernoulli(pᵢ) — convolved exactly on a 1-contract grid.
+    pᵢ = our side's Pinnacle fair_prob at entry (falls back to the entry price).
+    """
+    if live is None or live.empty:
+        return None
+    c = pd.to_numeric(live.get('contracts'), errors='coerce')
+    e = pd.to_numeric(live.get('entry_price'), errors='coerce')
+    fr = pd.to_numeric(live.get('fee_rate'), errors='coerce').fillna(0)
+    p = pd.to_numeric(live.get('fair_prob'), errors='coerce').fillna(e).clip(0, 1)
+    ok = c.notna() & e.notna() & (c > 0)
+    if not ok.any():
+        return None
+    c, e, fr, p = c[ok].round().astype(int), e[ok], fr[ok], p[ok]
+    base = float((c * (-e - fr * e * (1 - e))).sum())
+    dist = np.array([1.0])
+    for ci, pi in zip(c, p):
+        nxt = np.zeros(len(dist) + ci)
+        nxt[:len(dist)] += dist * (1 - pi)
+        nxt[ci:] += dist * pi
+        dist = nxt
+    vals = base + np.arange(len(dist), dtype=float)
+    return vals, dist, float((vals * dist).sum())
 
-        st.divider()
 
-        st.header('Kalshi Balance')
-        if st.button('Refresh balance'):
-            with st.spinner('Fetching...'):
-                try:
-                    st.session_state['balance'] = get_balance()
-                except Exception as e:
-                    log.exception('Refresh balance failed')
-                    st.error(f'Failed: {e}')
-        balance = st.session_state.get('balance', None)
-        if balance is not None:
-            st.metric('Balance', f'${balance:.2f}')
-        else:
-            st.caption('Click refresh to load')
+# ── Top-bar run config ───────────────────────────────────────────────────────
+# (Replaces the old sidebar.) Look-ahead is the only setting left on screen: a compact number box pinned into the top
+# bar just left of the API-usage / Cash / Portfolio readout, styled like those boxes (CSS below). Match threshold is
+# fixed at 0.85 and live games at config.LIVE — readers fall back to those via session_state.get(..., default).
+# A fragment, so editing the box reruns only itself; the trade tab reads `_hrs` fresh on each of its own runs.
+if '_hrs' not in st.session_state:
+    st.session_state['_hrs'] = config.LOOKAHEAD_HRS
 
-        st.divider()
 
-        st.header('Run Config')
-        st.slider('Look-ahead (hours)', 1, 168, config.LOOKAHEAD_HRS, key='_hrs')
-        st.slider('Match threshold',    0.5, 1.0, 0.85, step=0.01, key='_threshold')
-        st.toggle('Fetch live games', value=config.LIVE, key='_live')
+@st.fragment
+def _top_config():
+    with st.container(key='topcfg'):
+        st.number_input('Look-ahead', min_value=1, max_value=168, step=1, key='_hrs',
+                        label_visibility='collapsed', help='Look-ahead window in hours')
 
-        st.caption(
-            'Fees are fetched live per Kalshi series (not a fixed global rate) — verified '
-            'to genuinely vary, e.g. MLB gets a 0.5x multiplier and several soccer/boxing '
-            'series charge no maker fee at all. See the "fee %" columns in the signals table.'
-        )
 
-    _sidebar_panel()
+_top_config()
+st.markdown("""<style>
+/* pinned into the top bar; --topcfg-right is set by the Cash/Portfolio script to sit just left of its boxes */
+.st-key-topcfg{position:fixed !important;top:8px;right:var(--topcfg-right,330px);z-index:999999;width:auto !important;gap:0}
+.st-key-_hrs{width:84px !important;height:34px;background:rgba(255,255,255,.04);border-radius:8px;position:relative;
+  padding-top:2px;box-sizing:border-box}
+.st-key-_hrs [data-testid="stNumberInputContainer"], .st-key-_hrs [data-baseweb="input"],
+.st-key-_hrs [data-baseweb="input"] > div{background:transparent !important;border:none !important;height:19px;min-height:0 !important}
+.st-key-_hrs input{font:700 15px/1.3 system-ui,sans-serif !important;color:#e6e6e6 !important;text-align:center;
+  padding:0 !important;height:19px;min-height:0 !important}
+.st-key-_hrs [data-testid="stNumberInputStepUp"], .st-key-_hrs [data-testid="stNumberInputStepDown"],
+.st-key-_hrs [data-testid="InputInstructions"]{display:none !important}
+.st-key-_hrs::after{content:'Look-ahead';position:absolute;bottom:3px;left:0;right:0;text-align:center;pointer-events:none;
+  font:500 10px/1.2 system-ui,sans-serif;color:#8b93a1;text-transform:uppercase;letter-spacing:.03em}
+</style>""", unsafe_allow_html=True)
 
 # Fallback-only defaults if a series' live fee lookup fails — see
 # KALSHI/k_helpers.fee_rate_for(). No longer user-adjustable: a single override
@@ -595,12 +627,12 @@ with tab_trade:
     # ── Fetch signals ────────────────────────────────────────────────────────
     @st.fragment
     def _fetch_and_trade_panel():
-        # Read the sidebar / sports-picker values fresh on every run of THIS fragment — a closure over the module-level
+        # Read the top-bar / sports-picker values fresh on every run of THIS fragment — a closure over the module-level
         # names would be frozen at the last full-page run, and those widgets no longer trigger one.
         hrs       = st.session_state.get('_hrs', config.LOOKAHEAD_HRS)
         threshold = st.session_state.get('_threshold', 0.85)
         live      = st.session_state.get('_live', config.LIVE)
-        balance   = st.session_state.get('balance', None)
+        balance   = _live_cash()
         used      = st.session_state.get('api_used', 0)
         remaining = st.session_state.get('api_remaining', 500)
         selected_sports = [k for k in config.SPORTS_CONFIG
@@ -942,7 +974,7 @@ with tab_trade:
                     if st.button(btn_label, type='primary', disabled=(n_approved == 0),
                                 key=f'_execute_btn_{side}'):
                         if balance is None:
-                            st.error('Refresh your Kalshi balance in the sidebar before trading.')
+                            st.error('Kalshi balance unavailable (the Cash readout can\'t reach Kalshi) — try again shortly.')
                         else:
                             # Read fresh from session_state rather than the closure
                             # `used`/`remaining` (captured from the sidebar at the last
@@ -1743,6 +1775,31 @@ with tab_review:
                                                       name='Realized PnL',
                                                       line=dict(color='#9b59b6', width=2),
                                                       marker=dict(size=5)))
+                            # Where PnL could end once the live (unsettled) trades resolve: an exact distribution,
+                            # drawn sideways just right of the last realized point.
+                            _dist = _open_trade_outcomes(live_trades)
+                            if _dist is not None:
+                                _vals, _probs, _exp = _dist
+                                _x0, _y0 = len(_xs), float(_cum_real.iloc[-1])
+                                _w = max(4.0, 0.12 * len(_xs))           # widest bar, in trade-# units
+                                _keep = _probs >= 1e-4                   # drop vanishingly unlikely tails
+                                _v, _pr = _vals[_keep], _probs[_keep]
+                                _cdf = np.cumsum(_probs)
+                                _lo = _vals[np.searchsorted(_cdf, 0.05)]
+                                _hi = _vals[min(np.searchsorted(_cdf, 0.95), len(_vals) - 1)]
+                                _step = float(np.min(np.diff(_v))) if len(_v) > 1 else 1.0
+                                fig2.add_trace(go.Bar(
+                                    y=_y0 + _v, x=_pr / _pr.max() * _w, base=_x0, orientation='h',
+                                    width=0.8 * _step, marker_color='rgba(155,89,182,0.55)',
+                                    name=f'If the {len(live_trades)} live trades settle (90%: {_lo:+.2f} to {_hi:+.2f})',
+                                    customdata=np.stack([_pr * 100, _v], axis=1),
+                                    hovertemplate='%{customdata[0]:.1f}% chance → PnL ends at $%{y:.2f} '
+                                                  '(%{customdata[1]:+.2f})<extra></extra>'))
+                                fig2.add_trace(go.Scatter(
+                                    x=[_x0 - 1, _x0], y=[_y0, _y0 + _exp], mode='lines+markers',
+                                    line=dict(color='#9b59b6', width=1.5, dash='dot'),
+                                    marker=dict(size=[0, 9], symbol='diamond'), name='Expected after live trades',
+                                    hovertemplate='Expected: $%{y:.2f}<extra></extra>'))
                             fig2.add_hline(y=0, line_color='#888', line_width=1)
                             fig2.update_layout(legend=dict(orientation='h', yanchor='top', y=-0.22,
                                                           xanchor='center', x=0.5))

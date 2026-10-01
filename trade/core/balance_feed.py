@@ -8,6 +8,7 @@ numbers every INTERVAL_SEC and exposes them over the same loopback-only, token-g
 import threading, time
 
 from trade.core.execution import get_portfolio_snapshot, get_position_marks
+from theODDS.p_helpers import fetch_usage
 from trade.core.actionserver import ActionServer
 from applog import get_logger
 
@@ -15,10 +16,12 @@ log = get_logger(__name__)
 
 INTERVAL_SEC = 10
 MAX_BACKOFF_SEC = 120
+USAGE_EVERY_SEC = 60
+_usage_at = 0.0
 
 _lock = threading.Lock()
 _state = {'cash': None, 'portfolio': None, 'positions_value': None, 'positions': [],
-          'updated_at': 0, 'error': None}
+          'api_used': None, 'api_remaining': None, 'updated_at': 0, 'error': None}
 
 
 def _snapshot():
@@ -33,6 +36,16 @@ def _refresh():
     falls back to Kalshi's own positions value (last-trade priced) rather than going blank.
     """
     errors, update = [], {}
+    # Odds API usage, read from the API itself via /v4/sports — free (verified: it doesn't count against the quota).
+    # NOT p_helpers' in-memory counters: a Streamlit hot-reload re-imports p_helpers and resets them to a 500
+    # placeholder, which is what this box showed.
+    global _usage_at
+    if time.time() - _usage_at >= USAGE_EVERY_SEC:
+        try:
+            update['api_used'], update['api_remaining'] = fetch_usage()
+            _usage_at = time.time()
+        except Exception as exc:
+            log.info('balance_feed: Odds API usage read failed: %s', exc)
     try:
         snap = get_portfolio_snapshot()
         update['cash'] = snap['cash']
@@ -73,6 +86,15 @@ def _loop():
         time.sleep(min(MAX_BACKOFF_SEC, INTERVAL_SEC * 2 ** fails))
 
 
+def latest() -> dict:
+    """The running feed's latest snapshot. Read through the thread (see start()): after a hot-reload this module's own
+    _state is a fresh, empty copy while the original thread keeps updating the one it was started with."""
+    for t in threading.enumerate():
+        if t.name == 'balance-feed' and t.is_alive() and hasattr(t, 'snapshot'):
+            return t.snapshot()
+    return _snapshot()
+
+
 def start() -> dict:
     """
     Start the poller once per process and return {'port', 'token'} for the page's JS to reach it.
@@ -90,5 +112,6 @@ def start() -> dict:
     server = ActionServer(_snapshot, lambda act: None)   # read-only: no actions accepted
     th = threading.Thread(target=_loop, name='balance-feed', daemon=True)
     th.info = server.info()
+    th.snapshot = _snapshot
     th.start()
     return th.info
