@@ -186,15 +186,32 @@ K_P_Cross_Mkt_Arb/
 ├── applog.py                    # rotating file logger (trade/logs/app.log)
 ├── .env                         # API credentials (git-ignored)
 ├── .streamlit/config.toml       # runOnSave, minimal toolbar
-├── KALSHI/k_helpers.py          # Kalshi auth, market fetch, fees, signal computation
+├── KALSHI/
+│   ├── client.py                # THE way to call Kalshi: signing, read pacing, pooled session, timeouts
+│   └── k_helpers.py             # market fetch + fuzzy matching, fees, signal computation
 ├── theODDS/p_helpers.py         # Pinnacle odds via The Odds API (parallel, 429 retry)
 ├── POLYMARKET/                  # Polymarket helpers (experimental)
 ├── notebooks/                   # win/loss, calibration, edge÷price quartile analysis
-├── tests/                       # fill-speed test
+├── tests/                       # offline pytest suite (network blocked) + manual fill-speed script
 └── trade/
-    ├── web_app.py               # Streamlit UI: Pinnacle (Trade, Review) + Market Making (Trade, Review)
+    ├── web_app.py               # Streamlit entry point: page setup + tab wiring only
+    ├── ui/                      # dashboard, one module per area
+    │   ├── chrome.py            # page CSS, top bar (look-ahead, API left, Cash/Portfolio), notifications
+    │   ├── startup.py           # once-per-session setup, live cash for sizing
+    │   ├── trade_tab.py         # Pinnacle → Trade
+    │   ├── review_tab.py        # Pinnacle → Review
+    │   ├── analytics.py         # pure chart math (unit-tested)
+    │   └── common.py            # helpers shared by the tabs
     ├── core/
-    │   ├── execution.py         # place/cancel/status, Kelly sizing, monitor loop, fees
+    │   ├── execution/           # order execution, split by concern; import everything from trade.core.execution
+    │   │   ├── constants.py     # fee fallbacks, poll cadence, order lifetime, statuses
+    │   │   ├── sizing.py        # EV after fees, partial Kelly, exact-fee go/no-go
+    │   │   ├── orders.py        # place / cancel / verify / status / list resting
+    │   │   ├── account.py       # cash, portfolio value, positions marked to market
+    │   │   ├── market_data.py   # prices, depth, rest price on the tick grid
+    │   │   ├── order_mgmt.py    # requote, cross-and-cancel, extend, resize, re-rest
+    │   │   └── monitor.py       # per-order monitor loop
+    │   ├── balance_feed.py      # background Cash/Portfolio/API-usage poller for the top bar
     │   ├── positions.py         # live open-position dedup, opposite-leg blocking
     │   ├── pricing.py           # Kalshi price grid: rest price, tick math
     │   ├── actionserver.py      # loopback HTTP channel for the live boards
@@ -216,6 +233,17 @@ K_P_Cross_Mkt_Arb/
     ├── scripts/                 # one-time data migrations
     └── logs/                    # CSV logs and app.log (see below)
 ```
+
+**Extending it**
+- *New Kalshi endpoint:* `from KALSHI import client as kalshi`, then `kalshi.get('/path', params)` / `kalshi.post(...)` /
+  `kalshi.delete(...)`. Signing, rate limiting, connection reuse and timeouts are handled there — never call
+  `requests` against Kalshi directly.
+- *New execution helper:* add it to the matching `trade/core/execution/` module and re-export it in that package's
+  `__init__.py`.
+- *New dashboard area:* add a `trade/ui/<name>.py` with a `render()` function, call it from `trade/web_app.py`, and add
+  the module to the reload list there.
+- *Tests:* `python -m pytest tests` — runs offline in a few seconds; the smoke test renders every tab with all trading
+  calls faked.
 
 ---
 
