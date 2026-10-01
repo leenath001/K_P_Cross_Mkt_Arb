@@ -23,6 +23,8 @@ MODULES = [
     'trade.core.actionserver', 'trade.core.logging_io', 'trade.settle', 'trade.clv',
     'trade.strategies.kp_arb', 'trade.strategies.nothing', 'trade.strategies.prospect',
     'trade.mm.engine', 'trade.mm.ledger', 'trade.mm.ui', 'trade.pinboard.board', 'trade.pinboard.ui',
+    'KALSHI.client', 'trade.ui.common', 'trade.ui.analytics', 'trade.ui.startup', 'trade.ui.chrome',
+    'trade.ui.trade_tab', 'trade.ui.review_tab',
 ]
 
 

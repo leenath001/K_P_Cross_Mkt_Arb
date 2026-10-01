@@ -79,3 +79,18 @@ def test_mm_quote_targets():
     assert compute_targets([(48, 10)], [(49, 10)], 50.3, None) == \
         {'bid': 48.0, 'ask': 51.0, 'bid_top': 48, 'ask_top': 49, 'tick': 1.0}
     assert compute_targets([], [], 50, None)['bid'] is None
+
+
+def test_open_trade_outcomes():
+    import numpy as np
+    import pandas as pd
+    from trade.ui.analytics import open_trade_outcomes
+    # two trades @ 50c x 5 contracts, no fee: -5 / 0 / +5 at 25 / 50 / 25 %
+    live = pd.DataFrame({'contracts': [5, 5], 'entry_price': [0.5, 0.5], 'fee_rate': [0, 0], 'fair_prob': [0.5, 0.5]})
+    vals, probs, exp = open_trade_outcomes(live)
+    nz = probs > 0
+    assert list(vals[nz]) == [-5.0, 0.0, 5.0] and list(probs[nz]) == [0.25, 0.5, 0.25] and exp == 0.0
+    # entry fee comes off every outcome (5 x 0.07 x 0.5 x 0.5 = 0.0875 per trade)
+    vals, probs, _ = open_trade_outcomes(live.assign(fee_rate=0.07))
+    assert np.allclose(vals[probs > 0], [-5.175, -0.175, 4.825])
+    assert open_trade_outcomes(pd.DataFrame()) is None
