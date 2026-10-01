@@ -17,12 +17,12 @@ after a one-sided fill (the quote just re-centres on the new fair); size per sid
 import os, sys, json, math, time, uuid, threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-import requests
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
-from KALSHI.k_helpers import kalshi_headers, fee_rate_for, kalshi_fee_dollars, kalshi_odds, BASE_URL
+from KALSHI import client as kalshi
+from KALSHI.k_helpers import fee_rate_for, kalshi_fee_dollars, kalshi_odds
 import theODDS.p_helpers as _pin
 from theODDS.p_helpers import pinnacle_odds
 from trade.core.execution import (place_order, cancel_order, ensure_canceled, get_order_status,
@@ -77,8 +77,7 @@ def compute_targets(bids, asks, fair_c, ranges) -> dict:
 
 
 def _get(path, params=None):
-    return requests.get(f'{BASE_URL}{path}', headers=kalshi_headers('GET', '/trade-api/v2' + path),
-                        params=params, timeout=8)
+    return kalshi.get(path, params, timeout=8)
 
 
 def fetch_book(ticker: str, full: bool = False) -> dict:

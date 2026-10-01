@@ -20,12 +20,12 @@ import os, sys
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from KALSHI.k_helpers import kalshi_headers
+from KALSHI import client as kalshi
 from applog import get_logger
 
 log = get_logger(__name__)
 
-BASE_URL = 'https://api.elections.kalshi.com/trade-api/v2'
+BASE_URL = kalshi.BASE_URL
 
 
 def _open_position_tickers():
@@ -41,14 +41,12 @@ def _open_position_tickers():
     """
     tickers = set()
     cursor = None
-    path = '/trade-api/v2/portfolio/positions'
     while True:
         params = {'count_filter': 'position', 'limit': 200}
         if cursor:
             params['cursor'] = cursor
         try:
-            resp = requests.get(f'{BASE_URL}/portfolio/positions',
-                                headers=kalshi_headers('GET', path), params=params, timeout=15)
+            resp = kalshi.get('/portfolio/positions', params=params)
         except requests.exceptions.RequestException:
             log.exception('_open_position_tickers: network failure')
             return None
@@ -71,11 +69,8 @@ def _open_position_tickers():
 def _resting_order_tickers():
     """Tickers with a currently-resting order (GET /portfolio/orders?status=resting). None (not an empty set) if the
     call failed — see _open_position_tickers' docstring for why that distinction matters here."""
-    path = '/trade-api/v2/portfolio/orders'
     try:
-        resp = requests.get(f'{BASE_URL}/portfolio/orders',
-                            headers=kalshi_headers('GET', path),
-                            params={'status': 'resting', 'limit': 200}, timeout=15)
+        resp = kalshi.get('/portfolio/orders', params={'status': 'resting', 'limit': 200})
     except requests.exceptions.RequestException:
         log.exception('_resting_order_tickers: network failure')
         return None
@@ -129,10 +124,8 @@ def is_two_way_event(event_ticker: str) -> bool:
     """True if the Kalshi event has exactly 2 markets. Fails CLOSED (True) if it can't be checked."""
     if event_ticker in _EVENT_MARKET_COUNT:
         return _EVENT_MARKET_COUNT[event_ticker] == 2
-    path = '/trade-api/v2/markets'
     try:
-        resp = requests.get(f'{BASE_URL}/markets', headers=kalshi_headers('GET', path),
-                            params={'event_ticker': event_ticker, 'limit': 20}, timeout=15)
+        resp = kalshi.get('/markets', params={'event_ticker': event_ticker, 'limit': 20})
         if not resp.ok:
             log.warning('is_two_way_event %s failed: %s', event_ticker, resp.status_code)
             return True

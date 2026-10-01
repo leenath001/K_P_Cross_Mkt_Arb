@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import requests
 import pandas as pd
 from rich.console import Console
-from KALSHI.k_helpers import kalshi_headers
+from KALSHI import client as kalshi
 from trade.core.positions import _open_position_tickers
 from applog import get_logger
 
@@ -32,7 +32,7 @@ LOG_PATH             = os.path.join(LOG_DIR, 'trades.csv')
 NO_LOG_PATH          = os.path.join(LOG_DIR, 'no_trades.csv')
 NOTHING_LOG_PATH     = os.path.join(LOG_DIR, 'nothing_trades.csv')
 PROSPECT_LOG_PATH    = os.path.join(LOG_DIR, 'prospect_trades.csv')
-BASE_URL    = 'https://api.elections.kalshi.com/trade-api/v2'
+BASE_URL    = kalshi.BASE_URL
 
 console = Console()
 
@@ -42,10 +42,8 @@ TERMINAL_ORDER_STATUSES = {'executed', 'filled', 'canceled', 'expired'}
 
 def fetch_order_status(order_id: str) -> Optional[dict]:
     """Fetch one order directly. Returns the order dict or None on error (logged)."""
-    path = f'/trade-api/v2/portfolio/orders/{order_id}'
     try:
-        resp = requests.get(f'{BASE_URL}/portfolio/orders/{order_id}',
-                            headers=kalshi_headers('GET', path), timeout=15)
+        resp = kalshi.get(f'/portfolio/orders/{order_id}')
     except requests.exceptions.RequestException:
         log.exception('fetch_order_status network failure for %s', order_id)
         return None
@@ -114,10 +112,8 @@ def fetch_market_result(ticker: str) -> dict:
     be anywhere up to a full settle cycle later). Falls back to updated_time
     or close_time if a specific market lacks settlement_ts.
     """
-    path = f'/trade-api/v2/markets/{ticker}'
     try:
-        resp = requests.get(f'{BASE_URL}/markets/{ticker}',
-                            headers=kalshi_headers('GET', path), timeout=15)
+        resp = kalshi.get(f'/markets/{ticker}')
     except requests.exceptions.RequestException:
         log.exception('fetch_market_result network failure for %s', ticker)
         return {'result': None, 'settled_at': None}
@@ -146,11 +142,8 @@ def fetch_realized_pnl_from_fills(ticker: str, side: str) -> Optional[dict]:
     position was only partially sold (still has an open remainder — leave it
     PENDING rather than guess).
     """
-    path = '/trade-api/v2/portfolio/fills'
     try:
-        resp = requests.get(f'{BASE_URL}/portfolio/fills',
-                            headers=kalshi_headers('GET', path),
-                            params={'ticker': ticker, 'limit': 200}, timeout=15)
+        resp = kalshi.get('/portfolio/fills', params={'ticker': ticker, 'limit': 200})
     except requests.exceptions.RequestException:
         log.exception('fetch_realized_pnl_from_fills network failure for %s', ticker)
         return None
@@ -196,10 +189,8 @@ def fetch_scalar_settlement_value(ticker: str) -> Optional[float]:
     dollars (0–1). Kalshi settles these at the last traded price.
     Returns None if the value cannot be determined.
     """
-    path = f'/trade-api/v2/markets/{ticker}'
     try:
-        resp = requests.get(f'{BASE_URL}/markets/{ticker}',
-                            headers=kalshi_headers('GET', path), timeout=15)
+        resp = kalshi.get(f'/markets/{ticker}')
     except requests.exceptions.RequestException:
         log.exception('fetch_scalar_settlement_value network failure for %s', ticker)
         return None

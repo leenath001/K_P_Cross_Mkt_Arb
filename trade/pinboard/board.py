@@ -11,11 +11,11 @@ an event feed. Card actions (drag to re-price, resize, cancel) come back over a 
 import os, sys, time, threading
 from concurrent.futures import ThreadPoolExecutor
 
-import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
-from KALSHI.k_helpers import kalshi_headers, BASE_URL, MAKER_FEE_BASE
+from KALSHI import client as kalshi
+from KALSHI.k_helpers import MAKER_FEE_BASE
 from trade.core.actionserver import ActionServer
 from trade.core.execution import ensure_canceled, get_order_status, list_resting_orders, resize_resting_order, _ev
 from trade.core.pricing import parse_ranges, step_at
@@ -37,7 +37,7 @@ LABELS = {'resting': 'RESTING', 'executed': 'FILLED', 'filled': 'FILLED', 'cance
 
 
 def _get(path, params=None):
-    return requests.get(f'{BASE_URL}{path}', headers=kalshi_headers('GET', '/trade-api/v2' + path), params=params, timeout=8)
+    return kalshi.get(path, params, timeout=8)
 
 
 def _fetch_book(ticker, full=False):

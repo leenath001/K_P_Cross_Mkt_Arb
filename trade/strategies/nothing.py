@@ -45,7 +45,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config  # read-only: SPORTS_CONFIG for sports-series blocklist
 from trade.nothing_config import NOTHING_SERIES, tickers as _nothing_tickers
-from KALSHI.k_helpers import kalshi_headers
+from KALSHI import client as kalshi
 from trade.core.execution import (
     place_order as _core_place_order, get_order_status, get_balance,
     ensure_canceled, TAKER_FEE, MAKER_FEE,
@@ -58,7 +58,7 @@ log = get_logger(__name__)
 LOG_DIR  = os.path.join(os.path.dirname(_HERE), 'logs')
 LOG_PATH = os.path.join(LOG_DIR, 'nothing_trades.csv')
 
-BASE_URL = 'https://api.elections.kalshi.com/trade-api/v2'
+BASE_URL = kalshi.BASE_URL
 
 SPORTS_SERIES = {cfg['ticker'] for cfg in config.SPORTS_CONFIG.values()}
 
@@ -74,17 +74,13 @@ FIELDS = [
 
 def fetch_series_markets(series: str) -> list:
     """All open markets under a series_ticker."""
-    path = '/trade-api/v2/markets'
-    resp = requests.get(f'{BASE_URL}/markets',
-                        headers=kalshi_headers('GET', path),
-                        params={'series_ticker': series, 'status': 'open', 'limit': 500})
+    resp = kalshi.get('/markets', params={'series_ticker': series, 'status': 'open', 'limit': 500})
     resp.raise_for_status()
     return resp.json().get('markets', [])
 
 
 def fetch_ticker(ticker: str) -> Optional[dict]:
-    path = f'/trade-api/v2/markets/{ticker}'
-    resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=kalshi_headers('GET', path))
+    resp = kalshi.get(f'/markets/{ticker}')
     if not resp.ok:
         return None
     return resp.json().get('market')
@@ -213,8 +209,7 @@ def place_no_order(ticker: str, no_price_cents: int, count: int,
 
 def get_no_ask_cents(ticker: str) -> Optional[int]:
     """Current NO ask in cents for a market. Returns None if unavailable."""
-    path = f'/trade-api/v2/markets/{ticker}'
-    resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=kalshi_headers('GET', path))
+    resp = kalshi.get(f'/markets/{ticker}')
     if resp.ok:
         na = resp.json().get('market', {}).get('no_ask_dollars')
         return round(float(na) * 100) if na else None
@@ -357,10 +352,7 @@ def monitor_orders(tracked: list, stop_event: threading.Event, state: dict,
 
 
 def list_my_open_orders() -> list:
-    path = '/trade-api/v2/portfolio/orders'
-    resp = requests.get(f'{BASE_URL}/portfolio/orders',
-                        headers=kalshi_headers('GET', path),
-                        params={'status': 'resting', 'limit': 200})
+    resp = kalshi.get('/portfolio/orders', params={'status': 'resting', 'limit': 200})
     resp.raise_for_status()
     return resp.json().get('orders', [])
 

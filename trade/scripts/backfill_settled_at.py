@@ -26,9 +26,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import pandas as pd
 import requests
-from KALSHI.k_helpers import kalshi_headers
+from KALSHI import client as kalshi
 
-BASE_URL = 'https://api.elections.kalshi.com/trade-api/v2'
+BASE_URL = kalshi.BASE_URL
 LOG_PATHS = [
     os.path.join('trade', 'logs', 'trades.csv'),
     os.path.join('trade', 'logs', 'no_trades.csv'),
@@ -37,9 +37,8 @@ LOG_PATHS = [
 
 
 def fetch_settlement_ts(ticker: str):
-    path = f'/trade-api/v2/markets/{ticker}'
     try:
-        resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=kalshi_headers('GET', path))
+        resp = kalshi.get(f'/markets/{ticker}')
     except requests.exceptions.RequestException as exc:
         print(f'    network error for {ticker}: {exc}')
         return None

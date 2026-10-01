@@ -16,14 +16,15 @@ from math import floor
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from KALSHI.k_helpers import kalshi_headers, fee_rate_for, kalshi_fee_dollars
+from KALSHI import client as kalshi
+from KALSHI.k_helpers import fee_rate_for, kalshi_fee_dollars
 from theODDS.p_helpers import pinnacle_odds, get_api_usage
 from applog import get_logger
 from trade.core.pricing import rest_price_cents, to_cents, parse_ranges
 
 log = get_logger(__name__)
 
-BASE_URL          = 'https://api.elections.kalshi.com/trade-api/v2'
+BASE_URL          = kalshi.BASE_URL   # kept for importers; requests go through KALSHI/client.py
 # Fallback-only defaults, used if a series' live fee lookup fails. Real fee rates are
 # fetched per-series via fee_rate_for() (KALSHI/k_helpers.py) — verified to genuinely
 # vary: e.g. KXMLBGAME has a 0.5x fee_multiplier, several soccer/boxing series charge
@@ -165,7 +166,6 @@ def place_order(ticker: str, price_cents: float, count: int,
     V2 quotes everything in YES terms: buying NO is submitted as `ask` (sell YES) at
     the complementary price, since selling YES at P is economically buying NO at 1-P.
     """
-    path = '/trade-api/v2/portfolio/events/orders'
     # Kalshi V2 always quotes from the YES side.
     # For NO orders the yes-equivalent price is the complement: 100 - no_price_cents.
     yes_price_cents = round(100 - price_cents, 3) if side == 'no' else price_cents
@@ -184,11 +184,7 @@ def place_order(ticker: str, price_cents: float, count: int,
         body['post_only'] = True
     log.debug('place_order body=%s', body)
     try:
-        resp = requests.post(
-            f'{BASE_URL}/portfolio/events/orders',
-            headers={**kalshi_headers('POST', path), 'Content-Type': 'application/json'},
-            json=body,
-        )
+        resp = kalshi.post('/portfolio/events/orders', json=body)
     except requests.exceptions.RequestException as exc:
         log.error('place_order network failure for %s: %s', ticker, exc)
         raise
@@ -219,10 +215,8 @@ def get_balance() -> float:
     Fetch available balance from Kalshi portfolio (returns dollars).
     Raises RuntimeError with a clear message on auth failure or network error.
     """
-    path = '/trade-api/v2/portfolio/balance'
     try:
-        resp = requests.get(f'{BASE_URL}/portfolio/balance',
-                            headers=kalshi_headers('GET', path), timeout=15)
+        resp = kalshi.get('/portfolio/balance')
     except requests.exceptions.RequestException as exc:
         log.error('get_balance network failure: %s', exc)
         raise RuntimeError(f'Could not reach Kalshi to fetch balance: {exc}') from exc
@@ -251,8 +245,7 @@ def get_portfolio_snapshot() -> dict:
     so a total account value is cash + positions_value. `balance_dollars` is used for cash when present: the integer
     `balance` field is truncated to whole cents.
     """
-    path = '/trade-api/v2/portfolio/balance'
-    resp = requests.get(f'{BASE_URL}/portfolio/balance', headers=kalshi_headers('GET', path), timeout=15)
+    resp = kalshi.get('/portfolio/balance')
     resp.raise_for_status()
     body = resp.json()
     cash = float(body['balance_dollars']) if body.get('balance_dollars') else body.get('balance', 0) / 100
@@ -301,12 +294,10 @@ def get_position_marks() -> list:
     Returns [{'ticker', 'side' ('YES'/'NO'), 'qty', 'mark_dollars', 'cost_dollars', 'unrealized_dollars',
     'status', 'result'}, ...]. Raises on a failed positions read (caller decides what to show).
     """
-    path = '/trade-api/v2/portfolio/positions'
     positions, cursor = [], None
     while True:
         params = {'count_filter': 'position', 'limit': 200, **({'cursor': cursor} if cursor else {})}
-        resp = requests.get(f'{BASE_URL}/portfolio/positions', headers=kalshi_headers('GET', path),
-                            params=params, timeout=15)
+        resp = kalshi.get('/portfolio/positions', params=params)
         resp.raise_for_status()
         body = resp.json()
         positions.extend(p for p in body.get('market_positions', []) if abs(float(p.get('position_fp') or 0)) > 1e-9)
@@ -316,12 +307,10 @@ def get_position_marks() -> list:
 
     markets = {}
     tickers = [p['ticker'] for p in positions]
-    m_path = '/trade-api/v2/markets'
     for i in range(0, len(tickers), 100):
         chunk = tickers[i:i + 100]
         try:
-            m_resp = requests.get(f'{BASE_URL}/markets', headers=kalshi_headers('GET', m_path),
-                                  params={'tickers': ','.join(chunk), 'limit': len(chunk)}, timeout=15)
+            m_resp = kalshi.get('/markets', params={'tickers': ','.join(chunk), 'limit': len(chunk)})
             m_resp.raise_for_status()
             markets.update({m['ticker']: m for m in m_resp.json().get('markets', [])})
         except Exception:
@@ -363,12 +352,9 @@ def cancel_order(ticker: str, order_id: str, max_retries: int = 4) -> bool:
     cancel_order returned False and the order stayed open, silently, even though the
     user believed "Cancel all" had closed it.
     """
-    path = f'/trade-api/v2/portfolio/events/orders/{order_id}'
     for attempt in range(max_retries + 1):
         try:
-            resp = requests.delete(f'{BASE_URL}/portfolio/events/orders/{order_id}',
-                                   headers=kalshi_headers('DELETE', path),
-                                   params={'market_ticker': ticker})
+            resp = kalshi.delete(f'/portfolio/events/orders/{order_id}', params={'market_ticker': ticker})
         except requests.exceptions.RequestException as exc:
             log.error('cancel_order network failure for %s (%s): %s', order_id, ticker, exc)
             return False
@@ -408,10 +394,8 @@ def cancel_order(ticker: str, order_id: str, max_retries: int = 4) -> bool:
 
 def _is_resting(ticker: str, order_id: str) -> bool:
     """True if order_id is among `ticker`'s resting orders — or if that can't be checked (fail safe: assume it is)."""
-    path = '/trade-api/v2/portfolio/orders'
     try:
-        resp = requests.get(f'{BASE_URL}/portfolio/orders', headers=kalshi_headers('GET', path),
-                            params={'ticker': ticker, 'status': 'resting', 'limit': 200}, timeout=15)
+        resp = kalshi.get('/portfolio/orders', params={'ticker': ticker, 'status': 'resting', 'limit': 200})
         resp.raise_for_status()
     except requests.exceptions.RequestException:
         log.exception('_is_resting: could not list resting orders for %s', ticker)
@@ -455,10 +439,8 @@ def ensure_canceled(ticker: str, order_id: str, max_attempts: int = 5,
 
 def get_market_price(ticker: str) -> Optional[int]:
     """Fetch the current yes_ask for a Kalshi market in cents. Returns None if unavailable (logged)."""
-    path = f'/trade-api/v2/markets/{ticker}'
     try:
-        resp = requests.get(f'{BASE_URL}/markets/{ticker}',
-                            headers=kalshi_headers('GET', path), timeout=15)
+        resp = kalshi.get(f'/markets/{ticker}')
     except requests.exceptions.RequestException as exc:
         log.warning('get_market_price network failure for %s: %s', ticker, exc)
         return None
@@ -475,10 +457,8 @@ def get_market_prices(ticker: str) -> dict:
     Fetch current yes_ask, yes_bid, no_ask, no_bid for a market in cents.
     Returns a dict with whichever keys are available, or {} on failure (logged).
     """
-    path = f'/trade-api/v2/markets/{ticker}'
     try:
-        resp = requests.get(f'{BASE_URL}/markets/{ticker}',
-                            headers=kalshi_headers('GET', path), timeout=15)
+        resp = kalshi.get(f'/markets/{ticker}')
     except requests.exceptions.RequestException as exc:
         log.warning('get_market_prices network failure for %s: %s', ticker, exc)
         return {}
@@ -517,11 +497,8 @@ def get_orderbook_depth(ticker: str, levels: int = 2) -> dict:
     any failure (network/HTTP/malformed body) returns {} (logged) — callers
     should treat that as "depth unavailable right now", not a fatal error.
     """
-    path = f'/trade-api/v2/markets/{ticker}/orderbook'
     try:
-        resp = requests.get(f'{BASE_URL}/markets/{ticker}/orderbook',
-                            headers=kalshi_headers('GET', path),
-                            params={'depth': max(levels, 5)}, timeout=15)
+        resp = kalshi.get(f'/markets/{ticker}/orderbook', params={'depth': max(levels, 5)})
     except requests.exceptions.RequestException as exc:
         log.warning('get_orderbook_depth network failure for %s: %s', ticker, exc)
         return {}
@@ -556,9 +533,8 @@ def get_orderbook_depth(ticker: str, levels: int = 2) -> dict:
         log.exception('get_orderbook_depth: malformed orderbook response for %s', ticker)
         return {}
 
-    m_path = f'/trade-api/v2/markets/{ticker}'
     try:
-        m_resp = requests.get(f'{BASE_URL}/markets/{ticker}', headers=kalshi_headers('GET', m_path), timeout=15)
+        m_resp = kalshi.get(f'/markets/{ticker}')
         if m_resp.ok:
             lp = m_resp.json().get('market', {}).get('last_price_dollars')
             if lp is not None:
@@ -876,10 +852,7 @@ def list_resting_orders() -> list:
     Orders" panic button, which both cancel EVERYTHING resting regardless of
     which strategy or session placed it.
     """
-    path = '/trade-api/v2/portfolio/orders'
-    resp = requests.get(f'{BASE_URL}/portfolio/orders',
-                        headers=kalshi_headers('GET', path),
-                        params={'status': 'resting', 'limit': 200}, timeout=15)
+    resp = kalshi.get('/portfolio/orders', params={'status': 'resting', 'limit': 200})
     resp.raise_for_status()
     orders = resp.json().get('orders', [])
     return [o for o in orders if o.get('status') in OPEN_ORDER_STATUSES]
@@ -915,17 +888,12 @@ def get_order_status(order_id: str) -> dict:
     """
     try:
         # 1. Try direct lookup
-        path = f'/trade-api/v2/portfolio/orders/{order_id}'
-        resp = requests.get(f'{BASE_URL}/portfolio/orders/{order_id}',
-                            headers=kalshi_headers('GET', path), timeout=15)
+        resp = kalshi.get(f'/portfolio/orders/{order_id}')
         if resp.ok:
             return resp.json().get('order', {})
 
         # 2. Fallback: scan all recent orders for this order_id
-        list_path = '/trade-api/v2/portfolio/orders'
-        resp2 = requests.get(f'{BASE_URL}/portfolio/orders',
-                             headers=kalshi_headers('GET', list_path),
-                             params={'limit': 100}, timeout=15)
+        resp2 = kalshi.get('/portfolio/orders', params={'limit': 100})
         if resp2.ok:
             for o in resp2.json().get('orders', []):
                 if o.get('order_id') == order_id:

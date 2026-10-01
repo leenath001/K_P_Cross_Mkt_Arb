@@ -1,53 +1,24 @@
-import sys, os, threading, time
+import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-import pandas as pd
 import config
-import json
-import base64
+import math
 import requests
 import pandas as pd
-from dotenv import load_dotenv
-from datetime import datetime, timezone, date
+from datetime import datetime, date
 from difflib import SequenceMatcher
 from typing import Optional
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from applog import get_logger
 from trade.core.pricing import rest_price_cents, parse_ranges
+from KALSHI import client as kalshi
+# Credentials, request signing and read pacing live in KALSHI/client.py; re-exported here for existing importers.
+from KALSHI.client import kalshi_headers, _secret, API_KEY, API_PRIVATE, BASE_URL  # noqa: F401
 
 log = get_logger(__name__)
-
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
-load_dotenv(dotenv_path=_env_path, override=True)
-
-def _secret(key: str) -> Optional[str]:
-    """Read from env first, fall back to st.secrets (Streamlit Cloud)."""
-    val = os.getenv(key)
-    if not val:
-        try:
-            import streamlit as st
-            val = st.secrets.get(key)
-        except Exception:
-            pass
-    return val
 
 # -- Global Variables -------
 SPORTS = config.SPORTS
 SPORTS_C = config.SPORTS_CONFIG
-API_KEY     = _secret('API_KEY')
-API_PRIVATE = _secret('API_PRIVATE')
-BASE_URL    = 'https://api.elections.kalshi.com/trade-api/v2'
 PATH        = '/trade-api/v2/markets'
-
-assert API_PRIVATE, f'API_PRIVATE not found — set it in .env or Streamlit Cloud secrets'
-
-# API_PRIVATE is a raw base64-encoded DER key — wrap in PEM headers to load it
-_pem_bytes = (
-    b'-----BEGIN RSA PRIVATE KEY-----\n' +
-    API_PRIVATE.strip().encode() +
-    b'\n-----END RSA PRIVATE KEY-----\n'
-)
-_private_key = serialization.load_pem_private_key(_pem_bytes, password=None)
 # ---------------------------
 
 _DRAW_ALIASES = {'draw', 'tie', 'draw/tie', 'x'}
@@ -82,53 +53,6 @@ def _best_match(query: str, candidates: pd.Series) -> tuple:
             best_score, best_idx = score, idx
     return best_idx, best_score
 
-# Process-wide pacing for Kalshi READS. The MM engine (parallel book reads every 2s, even while quoting is off), the
-# pin board, the Cash/Portfolio feed and the order monitors all share one API key, and their combined bursts tripped
-# Kalshi's per-second read limit (429 Too Many Requests on everything, balance included). Every authenticated call
-# signs through kalshi_headers() right before sending, so throttling GETs here paces all of them at once. Writes
-# (orders / cancels) are not throttled: they're latency-sensitive and cancel_order() already backs off on 429.
-KALSHI_READS_PER_SEC = 15      # Kalshi Basic tier allows 20 reads/s; headroom for clock jitter
-KALSHI_READ_BURST    = 5
-_read_lock    = threading.Lock()
-_read_tokens  = float(KALSHI_READ_BURST)
-_read_last    = time.monotonic()
-
-
-def _pace_read():
-    """Token bucket: take one read token, sleeping (outside the lock) until one is available."""
-    global _read_tokens, _read_last
-    while True:
-        with _read_lock:
-            now = time.monotonic()
-            _read_tokens = min(KALSHI_READ_BURST, _read_tokens + (now - _read_last) * KALSHI_READS_PER_SEC)
-            _read_last = now
-            if _read_tokens >= 1:
-                _read_tokens -= 1
-                return
-            wait = (1 - _read_tokens) / KALSHI_READS_PER_SEC
-        time.sleep(wait)
-
-
-def kalshi_headers(method: str, path: str) -> dict:
-    if method.upper() == 'GET':
-        _pace_read()
-    ts  = str(int(datetime.now(timezone.utc).timestamp() * 1000))
-    msg = (ts + method.upper() + path).encode()
-    sig = _private_key.sign(
-        msg,
-        asym_padding.PSS(
-            mgf=asym_padding.MGF1(hashes.SHA256()),
-            salt_length=asym_padding.PSS.MAX_LENGTH
-        ),
-        hashes.SHA256()
-    )
-    return {
-        'KALSHI-ACCESS-KEY':       API_KEY,
-        'KALSHI-ACCESS-TIMESTAMP': ts,
-        'KALSHI-ACCESS-SIGNATURE': base64.b64encode(sig).decode(),
-    }
-
-
 # ---------------------------------------------------------------------------
 # Trading fees
 #
@@ -144,7 +68,6 @@ def kalshi_headers(method: str, path: str) -> dict:
 # 'quadratic' with NO maker fee at all) — so a single hardcoded global rate is wrong.
 # ---------------------------------------------------------------------------
 
-import math
 
 TAKER_FEE_BASE       = 0.07
 MAKER_FEE_BASE       = 0.0175   # 0.25x TAKER_FEE_BASE
@@ -164,7 +87,7 @@ def get_series_fee_info(series_ticker: str) -> tuple:
     if series_ticker in _series_fee_cache:
         return _series_fee_cache[series_ticker]
     try:
-        resp = requests.get(f'{BASE_URL}/series/{series_ticker}', timeout=15)
+        resp = kalshi.get(f'/series/{series_ticker}', auth=False)
         if resp.ok:
             s = resp.json().get('series', {})
             info = (s.get('fee_type') or 'quadratic_with_maker_fees',
@@ -208,10 +131,7 @@ def kalshi_fee_dollars(contracts: int, price: float, series_ticker: str, maker: 
 
 def load_all_mkts(SERIES_TICKER: str):
     try:
-        resp = requests.get(
-            f'{BASE_URL}/markets',
-            headers=kalshi_headers('GET', '/trade-api/v2/markets'),
-            params={'series_ticker': SERIES_TICKER, 'status': 'open', 'limit': 500}, timeout=15)
+        resp = kalshi.get('/markets', params={'series_ticker': SERIES_TICKER, 'status': 'open', 'limit': 500})
         resp.raise_for_status()
     except requests.exceptions.RequestException:
         log.exception('load_all_mkts failed for series %s', SERIES_TICKER)
