@@ -135,3 +135,35 @@ def test_failed_first_read_is_not_retried_in_a_loop_and_old_client_still_works(m
         assert len(primes) == len(set(primes)) <= 5      # at most ONE fast attempt per market, never re-queued
     finally:
         b.stop()
+
+
+def test_card_never_reverts_to_resting_after_a_recorded_close(board):
+    b, dash, calls, pb = board
+    dash.add('o1', 'KX-SJ')
+    dash.pos['o1']['status'] = 'canceled'                          # the monitor cancelled it
+    b.live['o1'] = {'filled': 0.0, 'avg_c': None, 'status': 'resting'}   # a stale poll still says resting
+    card = b._card('KX-SJ', b._groups()['KX-SJ'], False)
+    assert card['status'] == 'closed' and card['status_label'] == 'CANCELED'
+
+
+def test_order_kalshi_no_longer_returns_is_treated_as_closed(monkeypatch):
+    import trade.pinboard.board as pb
+    monkeypatch.setattr(pb, '_fetch_book', lambda t, full=False, priority=False: {'bids': [], 'asks': []})
+    monkeypatch.setattr(pb, '_fetch_meta', lambda t: {'ranges': None, 'last_c': None})
+    monkeypatch.setattr(pb, 'POLL_SEC', 60.0)
+    monkeypatch.setattr(pb, 'list_resting_orders', lambda: [])                                         # not resting
+    monkeypatch.setattr(pb, 'get_order_status', lambda oid: {'status': 'unknown', 'order_id': oid})   # Kalshi can't find it
+    dash = FakeDash()
+    b = pb.PinBoard(dash)
+    try:
+        dash.add('o2', 'KX-GONE')
+        b._first_polled['o2'] = time.time() - 60          # past the new-order grace period
+        b._poll_fills(b._groups())
+        assert b.live['o2']['status'] == 'canceled'
+        assert b._card('KX-GONE', b._groups()['KX-GONE'], False)['status'] == 'closed'
+        # ...but a brand-new order Kalshi hasn't listed yet keeps its grace period
+        dash.add('o3', 'KX-NEW')
+        b._poll_fills(b._groups())
+        assert b.live['o3']['status'] == 'unknown'
+    finally:
+        b.stop()

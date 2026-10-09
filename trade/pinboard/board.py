@@ -71,6 +71,7 @@ class PinBoard:
         self.visible = set()     # tickers whose cards are on screen right now (sent by the board), refreshed every cycle
         self._primed = set()     # markets whose instant first read has been attempted (once each — see _watch_new)
         self._closed_at = {}   # ticker -> time.time() when we first saw it close, for POST_CLOSE_WATCH_SEC
+        self._first_polled = {}   # order_id -> first time _poll_fills looked at it (grace for Kalshi's listing lag)
         self.notes, self._busy = {}, set()
         self._act_seen, self._act_lock = [], threading.Lock()
         self._stop = threading.Event()
@@ -94,11 +95,20 @@ class PinBoard:
         return out
 
     def _entry_fill(self, pos):
+        """(filled, avg ¢, status) for one order, merging Kalshi (self.live, polled here) with the dashboard (kept by the
+        order's monitor). A close either side has seen is final — a stale or 'unknown' poll must never put a card back
+        to RESTING after its monitor recorded the cancel/fill — and fill counts only ever go up."""
+        avg_d = pos.get('avg_fill_price')
+        filled_d, avg_d, status_d = pos.get('filled') or 0, (avg_d * 100 if avg_d is not None else None), pos['status']
         lv = self.live.get(pos['order_id'])
-        if lv:
-            return lv['filled'], lv['avg_c'], lv['status']
-        avg = pos.get('avg_fill_price')
-        return pos.get('filled', 0), (avg * 100 if avg is not None else None), pos['status']
+        if not lv:
+            return filled_d, avg_d, status_d
+        status = lv['status']
+        if status in OPEN and status_d not in OPEN:
+            status = status_d
+        if lv['filled'] >= filled_d:
+            return lv['filled'], lv['avg_c'], status
+        return filled_d, avg_d, status
 
     def _card(self, ticker, entries, focus):
         act = entries[-1]
@@ -249,7 +259,8 @@ class PinBoard:
         """Fills straight from Kalshi so they show within seconds, not on the monitor's 10 s cadence. One call lists every
         resting order (with its fill count); an order that has left that list is looked up individually once."""
         todo = [e['order_id'] for es in groups.values() for e in es
-                if self.live.get(e['order_id'], {}).get('status', 'resting') in OPEN]   # until Kalshi says it is closed
+                if e['status'] in OPEN                                                  # monitor hasn't closed it
+                and self.live.get(e['order_id'], {}).get('status', 'resting') in OPEN]   # until Kalshi says it is closed
         if not todo:
             return
         try:
@@ -262,11 +273,22 @@ class PinBoard:
             cost = float(st.get('maker_fill_cost_dollars') or 0) + float(st.get('taker_fill_cost_dollars') or 0)
             return {'filled': f, 'avg_c': (cost / f * 100) if f else None, 'status': st.get('status', 'unknown')}
 
+        now = time.time()
+        for oid in todo:
+            self._first_polled.setdefault(oid, now)
+
         def _one(oid):
             try:
                 if resting is not None and oid in resting:
                     return oid, _view(resting[oid])
-                return oid, _view(get_order_status(oid))
+                v = _view(get_order_status(oid))
+                # Not in the (complete, paginated) resting list and Kalshi can't find it: it's gone — Kalshi drops a
+                # cancelled/expired order that never filled. 'unknown' would otherwise count as open forever. The grace
+                # period covers Kalshi's list lagging a brand-new order.
+                if v['status'] == 'unknown' and resting is not None and now - self._first_polled[oid] > 20:
+                    prev = self.live.get(oid, {})
+                    v = {'filled': prev.get('filled', 0.0), 'avg_c': prev.get('avg_c'), 'status': 'canceled'}
+                return oid, v
             except Exception:
                 return oid, None
         with ThreadPoolExecutor(max_workers=6) as pool:
