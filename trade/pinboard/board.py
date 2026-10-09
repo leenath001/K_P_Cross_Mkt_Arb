@@ -38,7 +38,9 @@ LABELS = {'resting': 'RESTING', 'executed': 'FILLED', 'filled': 'FILLED', 'cance
 
 
 def _get(path, params=None, priority=False):
-    return kalshi.get(path, params, timeout=8, priority=priority)
+    if priority:                                   # reserved read lane (KALSHI/client.py)
+        return kalshi.get(path, params, timeout=8, priority=True)
+    return kalshi.get(path, params, timeout=8)     # plain call, so normal polling never depends on the newer argument
 
 
 def _fetch_book(ticker, full=False, priority=False):
@@ -67,7 +69,7 @@ class PinBoard:
         self.events, self._ev_id, self._seen = [], 0, {}
         self.focus, self.ack, self._rr = None, None, 0
         self.visible = set()     # tickers whose cards are on screen right now (sent by the board), refreshed every cycle
-        self._priming = set()    # new markets whose first book read is in flight
+        self._primed = set()     # markets whose instant first read has been attempted (once each — see _watch_new)
         self._closed_at = {}   # ticker -> time.time() when we first saw it close, for POST_CLOSE_WATCH_SEC
         self.notes, self._busy = {}, set()
         self._act_seen, self._act_lock = [], threading.Lock()
@@ -216,8 +218,11 @@ class PinBoard:
         while not self._stop.is_set():
             try:
                 for t in self._groups():
-                    if t not in self.books and t not in self._priming:
-                        self._priming.add(t)
+                    if t not in self.books and t not in self._primed:
+                        # ONE fast attempt per market. If it fails, the regular poll loop keeps retrying on its normal
+                        # cadence (it always reads unloaded markets) — retrying here every 0.25 s turned one failure
+                        # into a flood of reads and log lines.
+                        self._primed.add(t)
                         self._primer.submit(self._prime, t)
             except Exception:
                 log.exception('pinboard: new-market watch failed')
@@ -233,8 +238,6 @@ class PinBoard:
                 self.books[t].update(m)
         except Exception as exc:
             log.info('pinboard: first read for %s failed (%s) — the poll loop will retry', t, exc)
-        finally:
-            self._priming.discard(t)
 
     def _read_book(self, t):
         try:

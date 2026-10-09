@@ -25,7 +25,7 @@ import re
 import socket
 from logging.handlers import RotatingFileHandler
 
-_LOG_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trade', 'logs')
+_LOG_DIR  = os.environ.get('KPARB_LOG_DIR') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trade', 'logs')   # tests redirect this
 _LOG_PATH = os.path.join(_LOG_DIR, 'app.log')
 
 _FORMAT   = '%(asctime)s  %(levelname)-8s  %(name)-24s  %(message)s'

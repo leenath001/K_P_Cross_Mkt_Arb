@@ -100,3 +100,38 @@ def test_list_resting_orders_paginates(monkeypatch):
 
     monkeypatch.setattr(orders.kalshi, 'get', lambda path, params=None, **k: R(pages[params.get('cursor')]))
     assert len(orders.list_resting_orders()) == 237
+
+
+def test_failed_first_read_is_not_retried_in_a_loop_and_old_client_still_works(monkeypatch):
+    """Regression: a hot-reload left an older KALSHI.client without `priority`; every first read failed and was retried
+    every 0.25 s per market, flooding app.log. Now: one fast attempt per market, and normal polling (which never
+    passes `priority`) still loads the books."""
+    import trade.pinboard.board as pb
+    attempts = {}
+
+    def old_client_get(path, params=None, *, timeout=15, auth=True):        # the pre-`priority` signature
+        ticker = path.split('/')[2]
+        attempts[ticker] = attempts.get(ticker, 0) + 1
+
+        class R:
+            def raise_for_status(self): pass
+            def json(self): return {'orderbook_fp': {'yes_dollars': [['0.49', '10']], 'no_dollars': [['0.49', '10']]},
+                                    'market': {}}
+        return R()
+
+    monkeypatch.setattr(pb.kalshi, 'get', old_client_get)
+    monkeypatch.setattr(pb.PinBoard, '_poll_fills', lambda self, groups: None)
+    monkeypatch.setattr(pb, 'POLL_SEC', 0.2)
+    primes = []
+    real_prime = pb.PinBoard._prime
+    monkeypatch.setattr(pb.PinBoard, '_prime', lambda self, t: (primes.append(t), real_prime(self, t)))
+    dash = FakeDash()
+    for i in range(5):
+        dash.add(f'o{i}', f'KX-{i}')
+    b = pb.PinBoard(dash)
+    try:
+        time.sleep(1.5)
+        assert all('bids' in b.books.get(f'KX-{i}', {}) for i in range(5)), 'normal polling should load every book'
+        assert len(primes) == len(set(primes)) <= 5      # at most ONE fast attempt per market, never re-queued
+    finally:
+        b.stop()

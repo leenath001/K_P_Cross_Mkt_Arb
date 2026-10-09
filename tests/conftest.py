@@ -3,7 +3,12 @@ import os
 import socket
 import sys
 
+import tempfile
+
 import pytest
+
+# Keep test runs out of the real trade/logs/app.log (must be set before anything imports applog).
+os.environ.setdefault('KPARB_LOG_DIR', tempfile.mkdtemp(prefix='kparb-test-logs-'))
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for p in (ROOT, os.path.join(ROOT, 'trade')):      # web_app.py imports `dashboard` / `settle` from trade/ directly
