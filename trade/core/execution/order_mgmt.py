@@ -193,7 +193,11 @@ def extend_resting_order(ticker: str, order_id: str, commence_str: str,
     if new_exp <= cur_exp:
         return {'action': 'skipped', 'ticker': ticker, 'reason': 'already at the pre-event cutoff'}
     side = 'yes' if order.get('book_side') != 'ask' and order.get('outcome_side') != 'no' else 'no'
-    price_cents = round(float(order['yes_price_dollars']) * 100, 3)
+    # place_order() takes the price in the order's OWN side (it converts NO to the YES-equivalent itself). Passing the
+    # YES price for a NO order re-rested it at 100 − price: a NO bid at 58¢ came back at 42¢ (and one that would then
+    # cross is rejected as post-only, leaving the order cancelled and not replaced).
+    price_field = 'no_price_dollars' if side == 'no' else 'yes_price_dollars'
+    price_cents = round(float(order[price_field]) * 100, 3)
     total = round(float(order.get('initial_count_fp') or 0))
     res = resize_resting_order(ticker, order_id, side, total, price_cents, expiration_ts=int(new_exp.timestamp()))
     if res['action'] == 'resized':
