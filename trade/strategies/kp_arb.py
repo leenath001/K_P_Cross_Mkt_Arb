@@ -7,7 +7,7 @@ trade/core/ for execution, dedup, and logging — see trade/strategies/base.py f
 the shared contract.
 """
 
-import os, sys, csv, time, signal, threading
+import os, sys, csv, signal, threading
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -299,6 +299,9 @@ def run_trade(signal_row: pd.Series, bankroll: float,
             return {'status': 'skipped', 'reason': 'event_too_soon',
                     'ticker': ticker, 'order_id': None, 'contracts': 0}
 
+        if stop_event is not None and stop_event.is_set():   # Cancel was pressed while this order was being prepared
+            return {'status': 'skipped', 'reason': 'canceled_before_send',
+                    'ticker': ticker, 'order_id': None, 'contracts': 0}
         if not force_cross:
             order, order_price, price_cents, contracts, ev = place_rest_with_requote(
                 ticker, 'no', price_cents, contracts, order_price, ev, int(expiry_dt.timestamp()),
@@ -441,6 +444,9 @@ def run_trade(signal_row: pd.Series, bankroll: float,
                 'ticker': ticker, 'order_id': None, 'contracts': 0}
 
     _post_only = order_type == 'rest' or limit_only
+    if stop_event is not None and stop_event.is_set():   # Cancel was pressed while this order was being prepared
+        return {'status': 'skipped', 'reason': 'canceled_before_send',
+                'ticker': ticker, 'order_id': None, 'contracts': 0}
     if _post_only:
         order, order_price, price_cents, contracts, ev = place_rest_with_requote(
             ticker, 'yes', price_cents, contracts, order_price, ev, int(expiry_dt.timestamp()),
@@ -628,21 +634,36 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
         for i, (_, row) in enumerate(rows_list)
     ]
 
+    started: list = []
     try:
         # Fire each batch then immediately move on — don't wait for monitors to finish.
         # All threads run concurrently once started; we join ALL at the end.
+        # Cancel (stop_event) between waves stops the run: orders already sent are cancelled by their monitors, and
+        # the waves not yet fired are never sent — the wait below wakes the moment Cancel is pressed.
         for batch_start in range(0, len(threads), BATCH_SIZE):
+            if stop_event.is_set():
+                break
             batch   = threads[batch_start : batch_start + BATCH_SIZE]
             n_total = len(threads)
             log.info('[batch] firing %d order(s)  (%d/%d sent so far)',
                      len(batch), batch_start, n_total)
             for t in batch:
                 t.start()
+                started.append(t)
             if batch_start + BATCH_SIZE < len(threads):
-                time.sleep(BATCH_DELAY)
+                stop_event.wait(BATCH_DELAY)
 
-        # Wait for every thread (all batches) to complete
-        for t in threads:
+        unsent = len(threads) - len(started)
+        if unsent:
+            log.warning('[batch] cancelled — %d queued order(s) not sent', unsent)
+            for i in range(len(started), len(threads)):
+                row = rows_list[i][1]
+                results[i] = {'status': 'skipped', 'reason': 'canceled_before_send',
+                              'ticker': row.get('k_ticker', ''), 'outcome': row.get('outcome', ''),
+                              'order_id': None, 'contracts': 0}
+
+        # Wait for every started thread (all batches) to complete
+        for t in started:
             t.join()
 
     except KeyboardInterrupt:
@@ -651,7 +672,7 @@ def run_all_signals(signals_df: pd.DataFrame, bankroll: float,
         prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             stop_event.set()
-            for t in threads:
+            for t in started:
                 t.join(timeout=15)
         finally:
             signal.signal(signal.SIGINT, prev_handler)

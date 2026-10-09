@@ -296,6 +296,11 @@ def render():
                             if st.button('Cancel All Orders', key=f'_cancel_all_orders_{side}',
                                         help='Cancel every currently resting order on Kalshi '
                                              '(not just orders from this session).'):
+                                # Stop a batch that's still firing first, so its remaining waves are never sent
+                                # (and its monitors cancel what they placed), then sweep everything resting.
+                                _running_stop = st.session_state.get('_trade_stop')
+                                if _running_stop is not None:
+                                    _running_stop.set()
                                 with st.spinner('Canceling all resting orders...'):
                                     _cxl_result = cancel_all_resting_orders()
                                 if _cxl_result['total'] == 0:
@@ -710,7 +715,8 @@ def render():
                     if _last_action:
                         _atype, _ats = _last_action['type'], _last_action['ts']
                         if _atype == 'cancel_all':
-                            st.warning(f'[{_ats}] Cancellation requested — monitors will close orders.')
+                            st.warning(f'[{_ats}] Cancelled — live orders are being closed by their monitors; '
+                                       f'any orders still queued in this batch will not be sent.')
                         elif _atype == 'cross_cancel_empty':
                             st.info(f'[{_ats}] No resting orders to process.')
                         elif _atype == 'keep_rest_empty':
