@@ -8,7 +8,7 @@ PinBoard reads the session's StreamlitDashboard (which the monitor threads keep 
 top of it: order books (every 2 s), order fills straight from Kalshi (every 2.5 s, instead of the monitor's 10 s cadence) and
 an event feed. Card actions (drag to re-price, resize, cancel) come back over a loopback HTTP channel — no Streamlit rerun.
 """
-import os, sys, time, threading
+import os, sys, time, queue, threading
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -78,13 +78,14 @@ class PinBoard:
         self.server = ActionServer(self.snapshot, self.handle_action)
         self._thread = threading.Thread(target=self._loop, name='pin-board', daemon=True)
         self._thread.start()
-        self._primer = ThreadPoolExecutor(max_workers=4, thread_name_prefix='pin-prime')
+        self._prime_q = queue.Queue()          # first reads run on daemon threads: pool workers are joined at exit
+        for i in range(4):
+            threading.Thread(target=self._prime_worker, name=f'pin-prime-{i}', daemon=True).start()
         threading.Thread(target=self._watch_new, name='pin-board-new', daemon=True).start()
 
     def stop(self):
         self._stop.set()
         self.server.stop()
-        self._primer.shutdown(wait=False)
 
     # ── aggregation ────────────────────────────────────────────────────────
     def _groups(self):
@@ -233,10 +234,18 @@ class PinBoard:
                         # cadence (it always reads unloaded markets) — retrying here every 0.25 s turned one failure
                         # into a flood of reads and log lines.
                         self._primed.add(t)
-                        self._primer.submit(self._prime, t)
+                        self._prime_q.put(t)
             except Exception:
                 log.exception('pinboard: new-market watch failed')
             self._stop.wait(NEW_WATCH_SEC)
+
+    def _prime_worker(self):
+        while not self._stop.is_set():
+            try:
+                t = self._prime_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            self._prime(t)
 
     def _prime(self, t):
         try:

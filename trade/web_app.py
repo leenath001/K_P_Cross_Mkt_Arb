@@ -27,6 +27,9 @@ for _m in (common, analytics, startup, chrome, trade_tab, review_tab):
 
 st.set_page_config(page_title='K/P Arb Dashboard', layout='wide')
 
+from trade.core.shutdown import install_exit_watchdog
+install_exit_watchdog()          # Ctrl+C always quits, even if a network call is stuck (see trade/core/shutdown.py)
+
 chrome.render_head()
 if 'active_sports' not in st.session_state or 'balance' not in st.session_state:
     startup.run()

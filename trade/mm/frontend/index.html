@@ -118,6 +118,10 @@ async function directPost(a){
 function act(a){a.nonce=Date.now()+Math.random();
   if(direct&&directFails<3){directPost(a).then(()=>{directFails=0}).catch(()=>{directFails++;queue.push(a);pump()})}
   else{queue.push(a);pump()}}
+let fullAsked=false;
+function noteFail(){   // the loopback channel is unreachable (e.g. page opened from another device): ask Streamlit for full data
+  directFails++; if(directFails>=3&&!fullAsked){fullAsked=true; act({action:'need_full'})}
+}
 let lastTs=0;
 function takeState(s){if(!s||s.ts<lastTs)return; lastTs=s.ts; state=s; render(); handleEvents(state.events||[])}
 
@@ -142,7 +146,7 @@ function startWorkerPoll(){
   const w=new Worker(URL.createObjectURL(new Blob([src],{type:'application/javascript'})));
   w.onmessage=(e)=>{
     if(e.data.type==='snap'){directFails=0;takeState(e.data.data)}
-    else{directFails++}
+    else{noteFail()}
   };
   w.onerror=()=>{poller=null;startMainThreadPoll()};   // Worker blocked (e.g. sandboxed embed) — fall back
   return w;
@@ -151,7 +155,7 @@ function startMainThreadPoll(){
   setInterval(async()=>{
     if(!direct||directFails>=3)return;
     try{const r=await fetch(directUrl('/snap?token='+direct.token)); if(!r.ok)throw 0; directFails=0; takeState(await r.json())}
-    catch(e){directFails++}
+    catch(e){noteFail()}
   },1000);
 }
 try{poller=startWorkerPoll()}catch(e){startMainThreadPoll()}
@@ -441,7 +445,7 @@ window.addEventListener('message',e=>{
     if(th.base==='light'){r.setProperty('--line','#d5d9e0');r.setProperty('--muted','#5b6472')}}
   const s=e.data.args.state; if(s&&s.act&&s.act.port){const changed=!direct||direct.port!==s.act.port||direct.token!==s.act.token; direct=s.act; if(changed)pollerCfg()}
   if(inflight&&s.ack===inflight.nonce){queue.shift();inflight=null}
-  pump(); takeState(s);
+  pump(); if(!(s&&s.lite))takeState(s);      // lite args carry no data: the board polls its own channel for that
 });
 // ---- fill announcements: the card flashes red and a toast appears top-right of the page for 5s
 let evSeen=null;

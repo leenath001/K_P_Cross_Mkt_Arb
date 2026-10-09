@@ -104,7 +104,8 @@ def cancel_order(ticker: str, order_id: str, max_retries: int = 4) -> bool:
     """
     for attempt in range(max_retries + 1):
         try:
-            resp = kalshi.delete(f'/portfolio/events/orders/{order_id}', params={'market_ticker': ticker})
+            resp = kalshi.delete(f'/portfolio/events/orders/{order_id}', params={'market_ticker': ticker},
+                                 timeout=15)   # safe to bound: callers verify the cancel (ensure_canceled / 404 check)
         except requests.exceptions.RequestException as exc:
             log.error('cancel_order network failure for %s (%s): %s', order_id, ticker, exc)
             return False

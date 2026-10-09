@@ -80,6 +80,15 @@ def _screen_if_needed(eng, hrs: int):
     eng.screen_async(sports, int(hrs))
 
 
+def _board_args(eng):
+    """Lightweight args when the engine's loopback channel is up (the board polls the snapshot itself) — see
+    trade/pinboard/ui.board_args. This fragment runs every second, so sending the full engine snapshot here kept the
+    whole page busy."""
+    if getattr(eng, 'action_port', None) and not getattr(eng, 'need_full', False):
+        return {'lite': True, 'ts': time.time(), 'act': {'port': eng.action_port, 'token': eng._token}, 'ack': eng.ack}
+    return eng.snapshot()
+
+
 def render_trade():
     eng = get_engine()
 
@@ -139,10 +148,13 @@ def render_trade():
     # ── live board ────────────────────────────────────────────────────────
     @st.fragment(run_every='1s')
     def _live_board():
-        act = _board(state=eng.snapshot(), key='mm_board', default=None)
+        act = _board(state=_board_args(eng), key='mm_board', default=None)
         # Actions from the board (queued client-side); the nonce de-dupes re-delivery, `ack` releases the queue.
         if act and act.get('nonce') != eng.ack:
-            eng.handle_action(act)
+            if act.get('action') == 'need_full':
+                eng.need_full = True
+            else:
+                eng.handle_action(act)
             eng.ack = act.get('nonce')
 
     _live_board()
