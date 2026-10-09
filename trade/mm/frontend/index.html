@@ -459,8 +459,11 @@ function showToast(ev){
   const net=ev.inv, inv=(net>0?'long YES ':(net<0?'long NO ':'flat '))+(net?Math.abs(net):'');
   d.innerHTML=`<b style="color:#fff">${act}</b> ${fmt(ev.qty,0)} @ ${fmt(ev.price_c,1)}¢${ev.fee_usd?` <span style="color:#9aa3b2;font-size:12px">(fee $${ev.fee_usd.toFixed(2)})</span>`:''}<br>${esc(ev.title)} · ${esc(ev.outcome)}<br>`+
     `<span style="color:#9aa3b2;font-size:12px">market ${fmt(ev.bid,1)} / ${fmt(ev.ask,1)} · bought ${fmt(ev.bought,0)} · sold ${fmt(ev.sold,0)} · net ${inv}</span>`;
+  const meta={ticker:ev.ticker, board:'mm'};
+  d.style.cursor='pointer'; d.title='Go to this market';
+  d.addEventListener('click',()=>{try{window.parent.__jumpToCard && window.parent.__jumpToCard(meta)}catch(e){}});
   h.appendChild(d);
-  try{window.parent.__notifCenter && window.parent.__notifCenter.push(d.innerHTML)}catch(e){}
+  try{window.parent.__notifCenter && window.parent.__notifCenter.push(d.innerHTML, meta)}catch(e){}
   setTimeout(()=>{d.style.opacity='0'; setTimeout(()=>d.remove(),450)},5000);
 }
 function handleEvents(evs){
@@ -472,6 +475,14 @@ function handleEvents(evs){
     showToast(ev);
   });
 }
+// Called by the page's notification center (trade/ui/chrome.py) to bring one market's card into view.
+window.__showCard=function(t){
+  if(expanded&&expanded!==t){expanded=null;act({action:'focus',ticker:null});render()}
+  const c=board.querySelector(`[data-t="${CSS.escape(t)}"]`); if(!c)return null;
+  c.style.transition='outline-color .3s'; c.style.outline='2px solid #f5b301'; c.style.outlineOffset='2px';
+  clearTimeout(c._jumpT); c._jumpT=setTimeout(()=>{c.style.outline=''},1800);
+  return c;
+};
 window.addEventListener('resize',setHeight);
 send('streamlit:componentReady',{apiVersion:1});
 </script>

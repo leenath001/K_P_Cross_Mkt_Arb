@@ -194,10 +194,20 @@ def list_resting_orders() -> list:
     own logs, ask Kalshi. Used by cancel_all.py and the web UI's "Cancel All
     Orders" panic button, which both cancel EVERYTHING resting regardless of
     which strategy or session placed it.
+
+    Paginated: a single page caps at 200, and a big batch can leave more than that resting — the panic button must
+    see every one of them.
     """
-    resp = kalshi.get('/portfolio/orders', params={'status': 'resting', 'limit': 200})
-    resp.raise_for_status()
-    orders = resp.json().get('orders', [])
+    orders, cursor = [], None
+    for _ in range(50):
+        params = {'status': 'resting', 'limit': 200, **({'cursor': cursor} if cursor else {})}
+        resp = kalshi.get('/portfolio/orders', params=params)
+        resp.raise_for_status()
+        body = resp.json()
+        orders.extend(body.get('orders', []))
+        cursor = body.get('cursor')
+        if not cursor:
+            break
     return [o for o in orders if o.get('status') in OPEN_ORDER_STATUSES]
 
 

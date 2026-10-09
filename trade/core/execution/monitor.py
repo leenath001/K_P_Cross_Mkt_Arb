@@ -9,9 +9,9 @@ from theODDS.p_helpers import pinnacle_odds, get_api_usage
 from applog import get_logger
 from trade.core.execution.constants import KALSHI_POLL, MAX_DURATION, MIN_CROSS_EV, PINNACLE_POLL, PRE_EVENT_BUFFER, TAKER_FEE, _CLOSED_STATUSES
 from trade.core.execution.sizing import _ev
-from trade.core.execution.orders import ensure_canceled, get_order_status
-from trade.core.execution.market_data import get_market_price
+from trade.core.execution.orders import ensure_canceled
 from trade.core.execution.order_mgmt import cross_and_cancel_order
+from trade.core.execution import live_cache
 
 log = get_logger('trade.core.execution')   # one logger name for the whole package, as before the split
 
@@ -19,6 +19,26 @@ log = get_logger('trade.core.execution')   # one logger name for the whole packa
 # ---------------------------------------------------------------------------
 # Signal Re-validation
 # ---------------------------------------------------------------------------
+
+PINNACLE_SHARE_SEC = 30      # monitors re-check every PINNACLE_POLL (120 s); sharing a sport's odds this long is fresh enough
+_pin_cache: dict = {}        # sport -> (fetched_at, DataFrame)
+_pin_locks: dict = {}
+_pin_guard = threading.Lock()
+
+
+def _pinnacle_shared(sport: str):
+    """pinnacle_odds() for one sport, shared across every monitor for PINNACLE_SHARE_SEC. A 200-order batch otherwise
+    made 200 separate Odds API calls (credits) every 2 minutes for the same handful of sports."""
+    with _pin_guard:
+        lock = _pin_locks.setdefault(sport, threading.Lock())
+    with lock:
+        hit = _pin_cache.get(sport)
+        if hit and time.time() - hit[0] < PINNACLE_SHARE_SEC:
+            return hit[1]
+        fresh = pinnacle_odds(sports=[sport], hrs=72, live=False)   # errors propagate: caller treats them as no-signal
+        _pin_cache[sport] = (time.time(), fresh)
+        return fresh
+
 
 def _recheck_signal(event_id: str, sport: str, outcome: str,
                     order_price: float, fee_rate: float,
@@ -32,7 +52,7 @@ def _recheck_signal(event_id: str, sport: str, outcome: str,
     Conservative: any fetch error returns (False, None).
     """
     try:
-        fresh = pinnacle_odds(sports=[sport], hrs=72, live=False)
+        fresh = _pinnacle_shared(sport)
 
         if dashboard is not None:
             used, remaining = get_api_usage()
@@ -98,7 +118,7 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
             now_utc = datetime.now(timezone.utc)
 
             # ── Kalshi ping (every kalshi_poll seconds) ──────────────────────
-            order      = get_order_status(order_id)
+            order      = live_cache.order_status(order_id)    # shared snapshot, not one GET per order (see live_cache)
             status     = order.get('status', 'unknown')
             fill_fp    = order.get('fill_count_fp')
             filled     = round(float(fill_fp)) if fill_fp is not None else None
@@ -121,7 +141,7 @@ def _monitor(order_id: str, ticker: str, event_id: str, sport: str, outcome: str
                 except (TypeError, ValueError):
                     log.debug('_monitor: could not compute avg fill price for order %s', order_id)
 
-            market_ask = get_market_price(ticker)
+            market_ask = live_cache.market_ask(ticker)
             if dashboard:
                 dashboard.update(
                     order_id,

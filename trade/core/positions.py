@@ -21,6 +21,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from KALSHI import client as kalshi
+from trade.core.execution.orders import list_resting_orders
 from applog import get_logger
 
 log = get_logger(__name__)
@@ -70,14 +71,11 @@ def _resting_order_tickers():
     """Tickers with a currently-resting order (GET /portfolio/orders?status=resting). None (not an empty set) if the
     call failed — see _open_position_tickers' docstring for why that distinction matters here."""
     try:
-        resp = kalshi.get('/portfolio/orders', params={'status': 'resting', 'limit': 200})
+        orders = list_resting_orders()          # paginated — a single page stopped at 200 and missed the rest
     except requests.exceptions.RequestException:
-        log.exception('_resting_order_tickers: network failure')
+        log.exception('_resting_order_tickers: could not list resting orders')
         return None
-    if not resp.ok:
-        log.warning('_resting_order_tickers failed: %s %s', resp.status_code, resp.reason)
-        return None
-    return {o['ticker'] for o in resp.json().get('orders', []) if o.get('ticker')}
+    return {o['ticker'] for o in orders if o.get('ticker')}
 
 
 def open_tickers():

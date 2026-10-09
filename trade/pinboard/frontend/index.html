@@ -124,7 +124,7 @@ function applyPending(ms){ms.forEach(m=>{
 // ---- pieces
 function ladder(m,n,compact){
   const tick=m.tick_c||1, bb=m.bids.length?m.bids[0][0]:null, ba=m.asks.length?m.asks[0][0]:null;
-  if(bb==null||ba==null)return '<div class="empty">no book</div>';
+  if(bb==null||ba==null)return '<div class="empty">'+(m.book_loaded===false?'loading book…':'no book')+'</div>';
   const K=p=>(+p).toFixed(3), sizes=new Map();
   m.bids.forEach(b=>sizes.set(K(b[0]),b[1])); m.asks.forEach(a=>sizes.set(K(a[0]),a[1]));
   const our={}; m.orders.forEach(o=>{our[K(o.price_c)]=o});
@@ -150,7 +150,7 @@ function compactBook(m,S){
   // share of S and the outer levels are trimmed / extended to fill the rest.
   const tick=m.tick_c||1, K=p=>(+p).toFixed(3), sizes=new Map();
   const bb=m.bids.length?m.bids[0][0]:null, ba=m.asks.length?m.asks[0][0]:null;
-  if(bb==null||ba==null)return '<div class="empty" style="height:'+(S*17+30)+'px">no book</div>';
+  if(bb==null||ba==null)return '<div class="empty" style="height:'+(S*17+30)+'px">'+(m.book_loaded===false?'loading book…':'no book')+'</div>';
   m.bids.forEach(b=>sizes.set(K(b[0]),b[1])); m.asks.forEach(a=>sizes.set(K(a[0]),a[1]));
   const our={}; m.orders.forEach(o=>{our[K(o.price_c)]=o});
   const gap=Math.round((ba-bb)/tick);
@@ -189,7 +189,7 @@ function fullBook(m){
   // (bids: price x size; asks: they are NO bids, so the cash is (100 - price) x size).
   const tick=m.tick_c||1, K=p=>(+p).toFixed(3), sizes=new Map();
   const bb=m.bids.length?m.bids[0][0]:null, ba=m.asks.length?m.asks[0][0]:null;
-  if(bb==null||ba==null)return '<div class="empty">no book</div>';
+  if(bb==null||ba==null)return '<div class="empty">'+(m.book_loaded===false?'loading book…':'no book')+'</div>';
   m.bids.forEach(b=>sizes.set(K(b[0]),b[1])); m.asks.forEach(a=>sizes.set(K(a[0]),a[1]));
   const our={}; m.orders.forEach(o=>{our[K(o.price_c)]=o});
   const prices=new Set(); for(let i=1;i*tick<=99+1e-9;i++)prices.add(K(Math.round(i*tick*1000)/1000));
@@ -207,7 +207,7 @@ function fullBook(m){
 function centerScroll(sc){const r=sc.querySelector('.row.bid'); if(r)sc.scrollTop=Math.max(0,r.offsetTop-sc.clientHeight/2)}
 function depth(m,w,h){
   const bids=m.bids, asks=m.asks;
-  if(!bids.length||!asks.length)return '<div class="empty">no book</div>';
+  if(!bids.length||!asks.length)return '<div class="empty">'+(m.book_loaded===false?'loading book…':'no book')+'</div>';
   const mid=m.mid_c, own=m.orders.map(o=>o.price_c), ref=[mid,m.fair_c,...own].filter(v=>v!=null);
   const half=Math.max(6,Math.max(...ref.map(v=>Math.abs(v-mid)))+2), lo=mid-half, hi=mid+half, X=p=>(p-lo)/(hi-lo)*w;
   const bv=bids.filter(b=>b[0]>=lo), av=asks.filter(a=>a[0]<=hi);
@@ -284,6 +284,7 @@ function makeCard(t){
   const el=document.createElement('div'); el.className='card'; el.dataset.t=t;
   el.innerHTML='<div class="hd"></div><div class="dyn"></div><div class="ctl"><label>Contracts</label><input class="sz" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" autocomplete="off" spellcheck="false" title="Total contracts for this order; changing it cancels and re-rests the unfilled part"><span class="sp"></span><button class="cancel">Cancel</button></div>';
   board.appendChild(el);
+  try{visObs.observe(el)}catch(e){}
   el.addEventListener('dragover',e=>{if(!dragging||dragging===el||expanded)return;e.preventDefault();el.classList.add('over');
     const r=el.getBoundingClientRect(),after=(e.clientX-r.left)>r.width/2;board.insertBefore(dragging,after?el.nextSibling:el)});
   el.addEventListener('dragleave',()=>el.classList.remove('over'));
@@ -382,6 +383,12 @@ window.addEventListener('message',e=>{
   if(inflight&&s.ack===inflight.nonce){queue.shift();inflight=null}
   pump(); takeState(s);
 });
+// ---- on-screen cards: the backend refreshes their books every cycle and rotates through the rest
+const onScreen=new Set(); let visT=null;
+const visObs=new IntersectionObserver(es=>{
+  es.forEach(e=>{const t=e.target.dataset.t; if(e.isIntersecting)onScreen.add(t); else onScreen.delete(t)});
+  clearTimeout(visT); visT=setTimeout(()=>act({action:'visible',tickers:[...onScreen]}),250);
+},{root:null,rootMargin:'200px'});
 // ---- fill announcements: the card flashes red and a toast appears top-right of the page for 5s
 let evSeen=null;
 function toastHost(){
@@ -397,8 +404,11 @@ function showToast(ev){
   const side=ev.side==='yes'?'YES':'NO', grey='<span style="color:#9aa3b2;font-size:12px">';
   const head=fill?`<b style="color:#fff">ORDER FILLED</b> ${fmt(ev.qty,0)} ${side} @ ${fmt(ev.price_c,1)}¢`:`<b style="color:#fff">ORDER ${esc(ev.label)}</b> ${side} @ ${fmt(ev.price_c,1)}¢`;
   d.innerHTML=`${head}<br>${esc(ev.title)} · ${esc(ev.outcome)}<br>${grey}market ${fmt(ev.bid,1)} / ${fmt(ev.ask,1)} (YES) · filled ${fmt(ev.filled,0)} of ${ev.contracts}</span>`;
+  const meta={ticker:ev.ticker, board:'pin'};
+  d.style.cursor='pointer'; d.title='Go to this market';
+  d.addEventListener('click',()=>{try{window.parent.__jumpToCard && window.parent.__jumpToCard(meta)}catch(e){}});
   h.appendChild(d);
-  try{window.parent.__notifCenter && window.parent.__notifCenter.push(d.innerHTML)}catch(e){}
+  try{window.parent.__notifCenter && window.parent.__notifCenter.push(d.innerHTML, meta)}catch(e){}
   setTimeout(()=>{d.style.opacity='0'; setTimeout(()=>d.remove(),450)},5000);
 }
 function handleEvents(evs){
@@ -410,6 +420,14 @@ function handleEvents(evs){
     showToast(ev);
   });
 }
+// Called by the page's notification center (trade/ui/chrome.py) to bring one market's card into view.
+window.__showCard=function(t){
+  if(expanded&&expanded!==t){expanded=null;act({action:'focus',ticker:null});render()}
+  const c=board.querySelector(`[data-t="${CSS.escape(t)}"]`); if(!c)return null;
+  c.style.transition='outline-color .3s'; c.style.outline='2px solid #f5b301'; c.style.outlineOffset='2px';
+  clearTimeout(c._jumpT); c._jumpT=setTimeout(()=>{c.style.outline=''},1800);
+  return c;
+};
 window.addEventListener('resize',setHeight);
 send('streamlit:componentReady',{apiVersion:1});
 </script>

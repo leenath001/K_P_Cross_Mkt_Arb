@@ -28,7 +28,8 @@ BOOK_LEVELS = 15
 POLL_SEC = 2.0
 FILL_POLL_SEC = 2.5
 META_SEC = 30
-BOOKS_PER_CYCLE = 10          # order books read per 2 s cycle, shared by recently-closed tickers only (see _loop)
+BOOKS_PER_CYCLE = 12          # order books read per 2 s cycle (visible + expanded cards first, the rest round-robin)
+NEW_WATCH_SEC = 0.25          # how often to look for a market whose order just fired (loaded at once, reserved read lane)
 POST_CLOSE_WATCH_SEC = 15 * 60  # keep refreshing a filled/closed market's book this long after it closes ("where's it going")
 OPEN = {'resting', 'open', 'pending', 'unknown'}
 LABELS = {'resting': 'RESTING', 'executed': 'FILLED', 'filled': 'FILLED', 'canceled': 'CANCELED', 'expired': 'EXPIRED',
@@ -36,12 +37,12 @@ LABELS = {'resting': 'RESTING', 'executed': 'FILLED', 'filled': 'FILLED', 'cance
           'skipped': 'SKIPPED'}
 
 
-def _get(path, params=None):
-    return kalshi.get(path, params, timeout=8)
+def _get(path, params=None, priority=False):
+    return kalshi.get(path, params, timeout=8, priority=priority)
 
 
-def _fetch_book(ticker, full=False):
-    r = _get(f'/markets/{ticker}/orderbook', {'depth': 0 if full else BOOK_LEVELS})
+def _fetch_book(ticker, full=False, priority=False):
+    r = _get(f'/markets/{ticker}/orderbook', {'depth': 0 if full else BOOK_LEVELS}, priority=priority)
     r.raise_for_status()
     ob = r.json().get('orderbook_fp') or {}
     yes = [(round(float(p) * 100, 3), float(q)) for p, q in (ob.get('yes_dollars') or [])]
@@ -65,6 +66,8 @@ class PinBoard:
         self.books, self.live, self.px_override = {}, {}, {}
         self.events, self._ev_id, self._seen = [], 0, {}
         self.focus, self.ack, self._rr = None, None, 0
+        self.visible = set()     # tickers whose cards are on screen right now (sent by the board), refreshed every cycle
+        self._priming = set()    # new markets whose first book read is in flight
         self._closed_at = {}   # ticker -> time.time() when we first saw it close, for POST_CLOSE_WATCH_SEC
         self.notes, self._busy = {}, set()
         self._act_seen, self._act_lock = [], threading.Lock()
@@ -72,10 +75,13 @@ class PinBoard:
         self.server = ActionServer(self.snapshot, self.handle_action)
         self._thread = threading.Thread(target=self._loop, name='pin-board', daemon=True)
         self._thread.start()
+        self._primer = ThreadPoolExecutor(max_workers=4, thread_name_prefix='pin-prime')
+        threading.Thread(target=self._watch_new, name='pin-board-new', daemon=True).start()
 
     def stop(self):
         self._stop.set()
         self.server.stop()
+        self._primer.shutdown(wait=False)
 
     # ── aggregation ────────────────────────────────────────────────────────
     def _groups(self):
@@ -142,7 +148,7 @@ class PinBoard:
             'cost_usd': round(sum(self._entry_fill(e)[0] * (self._entry_fill(e)[1] or 0) for e in entries) / 100, 2),
             'to_win_usd': None if avg is None else round(filled * (100 - avg) / 100, 2),
             'last_ping': act.get('last_ping'), 'fair_c': fair_yes,
-            'bids': bids[:n], 'asks': asks[:n], 'tick_c': tick, 'last_c': bk.get('last_c'), 'mid_c': mid,
+            'bids': bids[:n], 'asks': asks[:n], 'book_loaded': 'bids' in bk, 'tick_c': tick, 'last_c': bk.get('last_c'), 'mid_c': mid,
             'orders': orders, 'can_cancel': open_now and remaining > 0,
             'note': note[0] if note and note[1] > time.time() else '',
             'stats': {'spread_c': None if (bb is None or ba is None) else round(ba - bb, 3),
@@ -165,24 +171,21 @@ class PinBoard:
             try:
                 groups = self._groups()
                 now = time.time()
-                # Always fetched, no budget cap: anything open, the expanded card, and any ticker we've never looked at
-                # yet — that last one matters because an order can fill INSTANTLY (a cross, or a rest that gets hit
-                # right away), faster than our own poll cycle; without this, that market's book (and so its fill
-                # notification) would show blank forever since it never had an "open" cycle to get fetched in.
-                always = {t for t, es in groups.items() if es[-1]['status'] in OPEN or t not in self._seen}
-                if self.focus in groups:
-                    always.add(self.focus)
-                # Recently-closed tickers keep refreshing for a while after the fill so the card can show where the
-                # market moved next — nice to have, not safety-critical, so these share a fixed round-robin budget
-                # instead of growing unbounded over a long session.
-                recent = [t for t, ts in self._closed_at.items()
-                         if t in groups and t not in always and now - ts < POST_CLOSE_WATCH_SEC]
+                # Every cycle: the expanded card, cards on screen, and any market never read yet (normally already
+                # loaded by _watch_new the moment its order fired — this is the fallback if that read failed).
+                # Everything else shares the rest of a fixed budget, round-robin: a 200-order batch re-reading every
+                # book each cycle swamped the shared read budget and new cards sat on "no book".
+                always = {t for t in groups if t == self.focus or t in self.visible or 'bids' not in self.books.get(t, {})}
+                # then open markets, then recently-closed ones (kept fresh a while to show where the market went next)
+                rest = [t for t, es in groups.items() if t not in always and es[-1]['status'] in OPEN]
+                rest += [t for t, ts in self._closed_at.items()
+                         if t in groups and t not in always and t not in rest and now - ts < POST_CLOSE_WATCH_SEC]
                 picked = list(always)
-                if recent:
+                if rest:
                     room = max(0, BOOKS_PER_CYCLE - len(always))
-                    start = self._rr % len(recent)
-                    picked += (recent[start:] + recent[:start])[:room]
-                    self._rr = (start + room) % len(recent)
+                    start = self._rr % len(rest)
+                    picked += (rest[start:] + rest[:start])[:room]
+                    self._rr = (start + room) % len(rest)
                 live_t = picked   # meta refresh below piggybacks on the same eligibility
                 if picked:
                     with ThreadPoolExecutor(max_workers=6) as pool:
@@ -206,6 +209,32 @@ class PinBoard:
             except Exception:
                 log.exception('pinboard: loop error')
             self._stop.wait(max(0.3, POLL_SEC - (time.time() - t0)))
+
+    def _watch_new(self):
+        """Load a market's book the moment its order shows up, instead of on the next poll cycle behind every other
+        read: first read on the reserved lane (KALSHI/client.py), market metadata right after."""
+        while not self._stop.is_set():
+            try:
+                for t in self._groups():
+                    if t not in self.books and t not in self._priming:
+                        self._priming.add(t)
+                        self._primer.submit(self._prime, t)
+            except Exception:
+                log.exception('pinboard: new-market watch failed')
+            self._stop.wait(NEW_WATCH_SEC)
+
+    def _prime(self, t):
+        try:
+            bk = _fetch_book(t, priority=True)
+            with self.lock:
+                self.books.setdefault(t, {}).update(bk)
+            m = _fetch_meta(t)
+            with self.lock:
+                self.books[t].update(m)
+        except Exception as exc:
+            log.info('pinboard: first read for %s failed (%s) — the poll loop will retry', t, exc)
+        finally:
+            self._priming.discard(t)
 
     def _read_book(self, t):
         try:
@@ -283,6 +312,8 @@ class PinBoard:
         try:
             if a == 'focus':
                 self.focus = t
+            elif a == 'visible':
+                self.visible = set(act.get('tickers') or [])
             elif a == 'cancel_market':
                 self._cancel(t)
             elif a == 'set_quote':

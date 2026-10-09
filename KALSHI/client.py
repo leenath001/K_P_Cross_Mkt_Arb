@@ -60,26 +60,41 @@ _private_key = serialization.load_pem_private_key(
 
 # ── read pacing ──────────────────────────────────────────────────────────────
 # Writes (orders / cancels) are not paced: they're latency-sensitive and cancel_order() already backs off on 429.
-KALSHI_READS_PER_SEC = 15      # Kalshi Basic tier allows 20 reads/s; headroom for clock jitter
+# Two buckets. Background polling shares the normal one; `priority=True` reads (the live board loading a market whose
+# order just fired) draw on a small reserved one, so they never queue behind background polling. Together they stay
+# under Kalshi Basic's 20 reads/s.
+KALSHI_READS_PER_SEC = 15      # normal reads; headroom for clock jitter
 KALSHI_READ_BURST    = 5
-_read_lock   = threading.Lock()
-_read_tokens = float(KALSHI_READ_BURST)
-_read_last   = time.monotonic()
+PRIORITY_READS_PER_SEC = 4     # reserved lane for latency-sensitive UI reads
+PRIORITY_READ_BURST    = 4
 
 
-def _pace_read():
-    """Token bucket: take one read token, sleeping (outside the lock) until one is available."""
-    global _read_tokens, _read_last
-    while True:
-        with _read_lock:
-            now = time.monotonic()
-            _read_tokens = min(KALSHI_READ_BURST, _read_tokens + (now - _read_last) * KALSHI_READS_PER_SEC)
-            _read_last = now
-            if _read_tokens >= 1:
-                _read_tokens -= 1
-                return
-            wait = (1 - _read_tokens) / KALSHI_READS_PER_SEC
-        time.sleep(wait)
+class _Bucket:
+    def __init__(self, rate, burst):
+        self.rate, self.burst = rate, burst
+        self.tokens, self.last = float(burst), time.monotonic()
+        self.lock = threading.Lock()
+
+    def take(self):
+        """Take one token, sleeping (outside the lock) until one is available."""
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                self.tokens = min(self.burst, self.tokens + (now - self.last) * self.rate)
+                self.last = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                wait = (1 - self.tokens) / self.rate
+            time.sleep(wait)
+
+
+_reads = _Bucket(KALSHI_READS_PER_SEC, KALSHI_READ_BURST)
+_priority_reads = _Bucket(PRIORITY_READS_PER_SEC, PRIORITY_READ_BURST)
+
+
+def _pace_read(priority: bool = False):
+    (_priority_reads if priority else _reads).take()
 
 
 def kalshi_headers(method: str, path: str) -> dict:
@@ -87,6 +102,10 @@ def kalshi_headers(method: str, path: str) -> dict:
     GETs are paced here, so even code that still builds its own requests shares the read budget."""
     if method.upper() == 'GET':
         _pace_read()
+    return _sign(method, path)
+
+
+def _sign(method: str, path: str) -> dict:
     ts  = str(int(datetime.now(timezone.utc).timestamp() * 1000))
     sig = _private_key.sign((ts + method.upper() + path).encode(),
                             asym_padding.PSS(mgf=asym_padding.MGF1(hashes.SHA256()),
@@ -105,22 +124,21 @@ _session = requests.Session()
 _session.mount('https://', HTTPAdapter(pool_connections=4, pool_maxsize=32))
 
 
-def request(method: str, path: str, *, params=None, json=None, timeout=None, auth: bool = True) -> requests.Response:
+def request(method: str, path: str, *, params=None, json=None, timeout=None, auth: bool = True,
+            priority: bool = False) -> requests.Response:
     """One Kalshi call. `path` is relative to the API root, e.g. '/markets/KX-TICKER/orderbook'."""
     method = method.upper()
-    if auth:
-        headers = kalshi_headers(method, API_PREFIX + path)
-    else:
-        headers = {}
-        if method == 'GET':
-            _pace_read()
+    if method == 'GET':
+        _pace_read(priority)
+    headers = _sign(method, API_PREFIX + path) if auth else {}
     if json is not None:
         headers['Content-Type'] = 'application/json'
     return _session.request(method, BASE_URL + path, headers=headers, params=params, json=json, timeout=timeout)
 
 
-def get(path: str, params=None, *, timeout=READ_TIMEOUT, auth: bool = True) -> requests.Response:
-    return request('GET', path, params=params, timeout=timeout, auth=auth)
+def get(path: str, params=None, *, timeout=READ_TIMEOUT, auth: bool = True, priority: bool = False) -> requests.Response:
+    """priority=True: use the reserved read lane — only for reads a person is actively waiting on."""
+    return request('GET', path, params=params, timeout=timeout, auth=auth, priority=priority)
 
 
 def post(path: str, json=None, *, timeout=None) -> requests.Response:

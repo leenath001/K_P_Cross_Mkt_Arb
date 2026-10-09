@@ -95,7 +95,9 @@ TAB_MEMORY_JS = """<script>
 NOTIFICATIONS_JS = """<script>
 (function(){
   const P=window.parent, D=P.document;
-  if(P.__notifCenter) return;   // idempotent across reruns — build the DOM once, keep it across script reruns
+  const VER=2;   // bump when this changes, so an already-open tab rebuilds instead of keeping the old one
+  if(P.__notifCenter && P.__notifCenter.ver===VER) return;   // idempotent across reruns — build the DOM once
+  if(P.__notifCenter){ ['nc-bell','nc-panel'].forEach(id=>{const el=D.getElementById(id); if(el) el.remove()}); }
   const css=D.createElement('style');
   css.textContent=`
     #nc-bell{position:fixed;top:8px;right:14px;z-index:999999;cursor:pointer;width:34px;height:34px;
@@ -111,6 +113,8 @@ NOTIFICATIONS_JS = """<script>
     #nc-panel .nc-item:last-child{border-bottom:none}
     #nc-panel .nc-empty{padding:18px;text-align:center;color:#8b93a1;font:12px system-ui,sans-serif}
     #nc-panel .nc-time{color:#8b93a1;font-size:10px;margin-top:3px}
+    #nc-panel .nc-item.go{cursor:pointer}
+    #nc-panel .nc-item.go:hover{background:rgba(255,255,255,.05)}
   `;
   D.head.appendChild(css);
 
@@ -123,7 +127,7 @@ NOTIFICATIONS_JS = """<script>
   const state={items:[], unread:0};
   function renderPanel(){
     panel.innerHTML = state.items.length
-      ? state.items.map(it=>`<div class="nc-item">${it.html}<div class="nc-time">${new Date(it.ts).toLocaleTimeString()}</div></div>`).join('')
+      ? state.items.map((it,i)=>`<div class="nc-item${it.meta&&it.meta.ticker?' go':''}" data-i="${i}"${it.meta&&it.meta.ticker?' title="Go to this market"':''}>${it.html}<div class="nc-time">${new Date(it.ts).toLocaleTimeString()}</div></div>`).join('')
       : '<div class="nc-empty">No notifications yet</div>';
   }
   function setUnread(n){ state.unread=n; dot.style.display = n>0 ? 'block' : 'none'; }
@@ -135,11 +139,65 @@ NOTIFICATIONS_JS = """<script>
     if(opening) setUnread(0);   // seeing the list clears the marker, whether or not it's scrolled through
   });
   D.addEventListener('click', ()=>{panel.style.display='none'});
-  panel.addEventListener('click', e=>e.stopPropagation());
+  panel.addEventListener('click', e=>{
+    e.stopPropagation();
+    const row=e.target.closest('.nc-item.go'); if(!row) return;
+    const it=state.items[+row.dataset.i]; if(!it||!it.meta) return;
+    panel.style.display='none';
+    P.__jumpToCard(it.meta);
+  });
+
+  // ── jump to a market's card: open its board's Trade tab, then scroll the card to the middle of the screen ──
+  const BOARD_TABS={pin:'Pinnacle', mm:'Market Making'};
+  const visible=el=>!!(el && el.offsetParent!==null);
+  function clickTab(label){
+    for(const l of D.querySelectorAll('[data-baseweb="tab-list"]')){
+      if(!visible(l)) continue;
+      const t=[...l.querySelectorAll('[data-baseweb="tab"]')].find(x=>x.innerText.trim()===label);
+      if(t){ if(t.getAttribute('aria-selected')!=='true') t.click(); return true; }
+    }
+    return false;
+  }
+  function scroller(el){       // nearest scrollable ancestor in the page (Streamlit scrolls an inner container)
+    for(let n=el.parentElement; n; n=n.parentElement){
+      const oy=P.getComputedStyle(n).overflowY;
+      if((oy==='auto'||oy==='scroll') && n.scrollHeight>n.clientHeight) return n;
+    }
+    return D.scrollingElement || D.documentElement;
+  }
+  function findCard(meta){
+    for(const f of D.querySelectorAll('iframe')){
+      if(!visible(f)) continue;
+      let w; try{ w=f.contentWindow; if(!w || !w.__showCard) continue; }catch(e){ continue; }   // only our boards
+      const card=w.document.querySelector(`[data-t="${CSS.escape(meta.ticker)}"]`);
+      if(card) return {f, w};
+    }
+    return null;
+  }
+  P.__jumpToCard=function(meta){
+    if(!meta || !meta.ticker) return;
+    clickTab(BOARD_TABS[meta.board]||'Pinnacle');
+    let tries=0;
+    (function step(){
+      clickTab('Trade');                                    // the inner tab, once the board's panel is showing
+      const hit=findCard(meta);
+      if(!hit){ if(++tries<30) setTimeout(step,100); return; }   // tab panels can take a moment to render
+      const card=hit.w.__showCard(meta.ticker);
+      if(!card) return;
+      setTimeout(()=>{                                      // after a collapse re-layout, measure and scroll
+        const fr=hit.f.getBoundingClientRect(), cr=card.getBoundingClientRect();
+        const delta=fr.top+cr.top+cr.height/2-P.innerHeight/2;
+        const sc=scroller(hit.f);
+        if(sc===D.scrollingElement || sc===D.documentElement) P.scrollBy({top:delta, behavior:'smooth'});
+        else sc.scrollBy({top:delta, behavior:'smooth'});
+      }, 60);
+    })();
+  };
 
   P.__notifCenter = {
-    push(html){
-      state.items.unshift({html, ts: Date.now()});
+    ver: VER,
+    push(html, meta){
+      state.items.unshift({html, meta: meta||null, ts: Date.now()});
       state.items.length = Math.min(state.items.length, 50);
       setUnread(state.unread+1);
       renderPanel();
