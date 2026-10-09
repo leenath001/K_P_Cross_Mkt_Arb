@@ -64,14 +64,16 @@ def render():
             # settled (see settle.py's fetch_realized_pnl_from_fills) — a real, completed
             # outcome with a real PnL, so it belongs in the settled stats alongside
             # WIN/LOSS, not silently dropped as if still pending.
-            settled = filled[filled['result'].isin(['WIN', 'LOSS', 'CLOSED_EARLY'])].copy()
+            # SCALAR settles at a fractional value with a real PnL too (settle.compute_scalar_pnl), so it counts.
+            settled = filled[filled['result'].isin(['WIN', 'LOSS', 'CLOSED_EARLY', 'SCALAR'])].copy()
             settled['actual_pnl'] = pd.to_numeric(settled['actual_pnl'], errors='coerce')
             # is_win is PnL-based, not label-based, so a profitable early close counts as
             # a win and a losing one counts as a loss — same rule WIN/LOSS already follow
             # by construction (compute_pnl() only labels WIN when pnl >= 0).
             settled['is_win'] = (settled['actual_pnl'] >= 0).astype(int)
 
-            total_ev   = filled['ev_total'].sum()      if not filled.empty  else 0
+            # Same trades as Actual PnL (settled ones) so the two are comparable — open trades' EV isn't realized yet.
+            total_ev   = pd.to_numeric(settled['ev_total'], errors='coerce').sum() if not settled.empty else 0
             actual_pnl = settled['actual_pnl'].sum()   if not settled.empty else 0
             win_rate   = settled['is_win'].mean() if not settled.empty else None
             total_cost = filled['total_cost'].sum()    if not filled.empty  else 0
@@ -81,7 +83,8 @@ def render():
             c1.metric('Total placed',  len(log_df2))
             c2.metric('Filled',        len(filled))
             c3.metric('Settled',       len(settled))
-            c4.metric('Projected EV',  f'${total_ev:+.2f}')
+            c4.metric('Projected EV',  f'${total_ev:+.2f}',
+                      help='Expected PnL at entry for the settled trades — the same trades as Actual PnL.')
             c5.metric('Actual PnL',    f'${actual_pnl:+.2f}',
                       delta_color='normal' if actual_pnl >= 0 else 'inverse')
 
@@ -217,7 +220,7 @@ def render():
                                 st.session_state[f'_bar_sel_{name}'] = None
                                 _fragment_rerun()
                         _pnl = pd.to_numeric(sub['actual_pnl'], errors='coerce')
-                        _done = sub[_pnl.notna() & sub['result'].isin(['WIN', 'LOSS', 'CLOSED_EARLY'])] \
+                        _done = sub[_pnl.notna() & sub['result'].isin(['WIN', 'LOSS', 'CLOSED_EARLY', 'SCALAR'])] \
                                 if 'result' in sub.columns else sub.iloc[0:0]
                         _dp   = pd.to_numeric(_done['actual_pnl'], errors='coerce')
                         _ev   = pd.to_numeric(_done['ev_total'], errors='coerce').sum() if 'ev_total' in _done else 0
@@ -457,7 +460,9 @@ def render():
                         fig4 = go.Figure()
                         calib = pd.DataFrame()
                         if not settled.empty and 'sport' in settled.columns and 'fair_prob' in settled.columns:
-                            calib_src = settled.copy()
+                            # predicted probability vs how often it happened: only real resolutions count (an early
+                            # close or a scalar settlement isn't a win/lose outcome of the event)
+                            calib_src = settled[settled['result'].isin(['WIN', 'LOSS'])].copy()
                             calib_src['sport_group'] = calib_src['sport'].apply(_sport_group)
                             calib = calib_src.groupby('sport_group', observed=True).agg(
                                 n=('is_win', 'size'), win_rate=('is_win', 'mean'),
@@ -605,21 +610,33 @@ def render():
                                 eop_src['eop_quartile'] = pd.qcut(
                                     eop_src['edge_over_price'], 4,
                                     labels=['Q1 (smallest)', 'Q2', 'Q3', 'Q4 (largest)'], duplicates='drop')
+                                # Quartiles split the trades into four EQUAL-size groups, so n is the same in each bar
+                                # by construction; what differs is the edge÷price range each one covers (shown).
                                 q = eop_src.groupby('eop_quartile', observed=True).agg(
-                                    n=('is_win', 'size'), win_rate=('is_win', 'mean'))
-                                _bcolors = ['#2ecc71' if wr >= 0.5 else '#e74c3c' for wr in q['win_rate']]
-                                _txt = [f'{wr:.0%}<br>n={n}' for wr, n in zip(q['win_rate'], q['n'])]
+                                    n=('is_win', 'size'), win_rate=('is_win', 'mean'),
+                                    predicted=('fair_prob', 'mean'),
+                                    lo=('edge_over_price', 'min'), hi=('edge_over_price', 'max'))
+                                # Bars: actual win rate. Diamonds: what the model predicted for the same trades. High
+                                # edge÷price usually means a cheap longshot, which SHOULD lose most of the time — the
+                                # gap between bar and diamond, not the bar alone, says whether a quartile underperforms.
+                                _txt = [f'{wr:.0%} won vs {pr:.0%} predicted<br>edge÷price {lo:.3f}–{hi:.3f}<br>n={n}'
+                                        for wr, pr, n, lo, hi in zip(q['win_rate'], q['predicted'], q['n'], q['lo'], q['hi'])]
+                                _bcolors = ['#2ecc71' if wr >= pr else '#e74c3c' for wr, pr in zip(q['win_rate'], q['predicted'])]
                                 fig6.add_trace(go.Bar(x=q.index.astype(str), y=q['win_rate'],
                                                       marker_color=_bcolors, text=_txt,
                                                       textposition='outside', hoverinfo='text',
-                                                      hovertext=_txt))
-                                fig6.add_hline(y=0.5, line_dash='dash', line_color='#888')
-                                fig6.update_layout(yaxis_tickformat='.0%', yaxis_range=[0, 1.25])
+                                                      hovertext=_txt, name='actual win rate'))
+                                fig6.add_trace(go.Scatter(x=q.index.astype(str), y=q['predicted'], mode='markers',
+                                                          marker=dict(symbol='diamond', size=12, color='#f5b301',
+                                                                      line=dict(width=1, color='white')),
+                                                          name='predicted (avg fair_prob)',
+                                                          hovertemplate='predicted %{y:.1%}<extra></extra>'))
+                                fig6.update_layout(yaxis_tickformat='.0%', yaxis_range=[0, 1.4])
                             except ValueError:
                                 fig6.add_annotation(text='Not enough spread to quartile', **_NO_DATA)
                         else:
                             fig6.add_annotation(text='Not enough settled trades yet', **_NO_DATA)
-                        fig6.update_layout(title='Win Rate by Edge÷Price Quartile',
+                        fig6.update_layout(title='Win Rate vs Predicted by Edge÷Price Quartile',
                                           showlegend=False, **_CHART_LAYOUT)
                         _ev6 = st.plotly_chart(fig6, width='stretch', theme='streamlit',
                                                on_select='rerun', selection_mode=['points'],
