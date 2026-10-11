@@ -53,12 +53,13 @@ def render():
         if log_df2.empty:
             st.info('No trade log found yet.')
         else:
-            # Hide canceled / expired / resting rows AND anything closed via
-            # user_canceled reason — these aren't real completed trades for stats.
-            _reason = log_df2['close_reason'].fillna('') if 'close_reason' in log_df2.columns else ''
+            # A trade counts if it actually FILLED: executed/filled, or cancelled after a partial fill (contracts = what
+            # filled). The close reason doesn't matter — a cross that filled and was then swept by "Cancel all" is
+            # still a real position (it used to be hidden by its 'user_canceled' reason, and left out of PnL).
+            _ct = pd.to_numeric(log_df2['contracts'], errors='coerce') if 'contracts' in log_df2.columns else 0
             filled  = log_df2[
-                log_df2['final_status'].isin(['executed', 'filled']) &
-                ~_reason.str.contains('canceled|cancelled|user_', case=False, regex=True)
+                log_df2['final_status'].isin(['executed', 'filled']) |
+                ((log_df2['final_status'] == 'canceled') & (_ct > 0))
             ]
             # CLOSED_EARLY = a position manually sold back on Kalshi before the market
             # settled (see settle.py's fetch_realized_pnl_from_fills) — a real, completed

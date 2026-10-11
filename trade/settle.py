@@ -274,6 +274,21 @@ def compute_scalar_pnl(contracts: int, entry_price: float, fee_rate: float,
     return round(contracts * gain_per, 4)
 
 
+def _filled_qty(ticker: str, order_id) -> Optional[float]:
+    """Exact contracts filled on one order, summed from Kalshi's fills (None if unavailable). Used for orders that
+    were cancelled after a partial fill, where the single-order lookup may no longer return the order."""
+    if not order_id or pd.isna(order_id):
+        return None
+    try:
+        resp = kalshi.get('/portfolio/fills', params={'ticker': ticker, 'limit': 200})
+        resp.raise_for_status()
+    except requests.exceptions.RequestException:
+        log.warning('_filled_qty: could not read fills for %s', ticker)
+        return None
+    total = sum(float(f.get('count_fp') or 0) for f in resp.json().get('fills', []) if f.get('order_id') == order_id)
+    return round(total, 4) or None
+
+
 def _settle_file(path: str, side: str, dry_run: bool,
                  side_col: Optional[str] = None) -> int:
     """
@@ -287,9 +302,12 @@ def _settle_file(path: str, side: str, dry_run: bool,
         return 0
 
     df = pd.read_csv(path)
+    # A cancelled order that filled PART of its size before the cancel is a real position too (contracts = what
+    # filled). These used to be skipped, so their markets settled and the result never reached the PnL.
+    _partial = (df['final_status'] == 'canceled') & (pd.to_numeric(df['contracts'], errors='coerce') > 0)
     pending = df[
         (df['result'] == 'PENDING') &
-        (df['final_status'].isin(['executed', 'filled']))
+        (df['final_status'].isin(['executed', 'filled']) | _partial)
     ]
 
     if pending.empty:
@@ -314,6 +332,13 @@ def _settle_file(path: str, side: str, dry_run: bool,
                                      pd.notna(row.get(side_col))) else side
 
         win_result  = 'no' if row_side == 'no' else 'yes'
+        # contracts actually held: the logged count, or for a partial fill the exact (possibly fractional) quantity
+        # from Kalshi's fills — the log rounds 0.64 to 1
+        qty = int(row['contracts'])
+        if row['final_status'] == 'canceled':
+            exact = _filled_qty(ticker, row.get('order_id'))
+            if exact:
+                qty = exact
         loss_result = 'yes' if row_side == 'no' else 'no'
         label_map   = {win_result: 'WIN', loss_result: 'LOSS', 'void': 'VOID'}
 
@@ -354,7 +379,7 @@ def _settle_file(path: str, side: str, dry_run: bool,
             if sv is None:
                 console.print('[yellow]SCALAR — settlement value unavailable, skipping[/yellow]')
                 continue
-            pnl = compute_scalar_pnl(int(row['contracts']),
+            pnl = compute_scalar_pnl(qty,
                                      float(row['entry_price']),
                                      float(row['fee_rate']),
                                      sv, side=row_side)
@@ -378,7 +403,7 @@ def _settle_file(path: str, side: str, dry_run: bool,
 
         result_label = label_map[k_result]
         pnl = compute_pnl(k_result,
-                          int(row['contracts']),
+                          qty,
                           float(row['entry_price']),
                           float(row['fee_rate']),
                           side=row_side)
