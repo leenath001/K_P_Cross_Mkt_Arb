@@ -249,19 +249,20 @@ K_P_Cross_Mkt_Arb/
 
 ## Usage
 
-### One-click setup (macOS)
+### One-click run (macOS and Windows)
 
-1. Double-click **`Setup.command`** in Finder. It finds Python 3.10+, creates `.venv`, installs `requirements.txt`,
-   then asks for your keys:
-   - **The Odds API key** — from https://the-odds-api.com/account/
-   - **Kalshi API key ID** — Kalshi → Account & security → API keys
-   - **Kalshi private key file** — pick the `.key` / `.pem` file Kalshi gave you in the file dialog
-   It writes `.env` (readable only by you, git-ignored), checks both keys against the live APIs, and offers to start
-   the app. Re-run it any time to change keys.
-2. After that, double-click **`Start.command`** to open the dashboard. Keep its Terminal window open while trading.
+Double-click **`KP-Arb.command`** (macOS) or **`KP-Arb.bat`** (Windows). That one file does everything:
 
-If macOS blocks the file ("unidentified developer", usually only for a downloaded zip): right-click it → **Open** →
-**Open**, once. No Python yet? Setup offers to open the python.org installer page.
+- **First run:** finds Python 3.10+, creates `.venv`, installs `requirements.txt`, then asks for your keys —
+  **The Odds API key** (https://the-odds-api.com/account/), **Kalshi API key ID** (Kalshi → Account & security →
+  API keys), and your **Kalshi private key file** (picked in a file dialog). It writes `.env` (only readable by you,
+  git-ignored), checks both keys against the live APIs, and starts the dashboard.
+- **Every run after that:** starts the dashboard straight away. Press **K** within 3 seconds to change your keys.
+  Packages are reinstalled only when `requirements.txt` changes.
+
+Keep the window open while trading; Ctrl+C (or closing it) stops the app. If macOS blocks the file
+("unidentified developer", usually only for a downloaded zip): right-click it → **Open** → **Open**, once. No Python
+yet? It offers to open the python.org installer (on Windows, tick **Add python.exe to PATH**).
 
 ### Manual
 

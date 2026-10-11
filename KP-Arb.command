@@ -53,7 +53,7 @@ fi
 if [ -n "$mode" ]; then
   arg=""; [ "$mode" = "--change" ] && arg="--change"
   until "$VPY" tools/setup_keys.py $arg; do
-    echo; read -r -p "Re-enter the keys? [Y/n] " again
+    echo; read -r -p "Re-enter the keys? [Y/n] " again || again=n     # no input left (window closed): stop, don't loop
     [[ "$again" =~ ^[Nn] ]] && fail "Not starting until the keys check out. Double-click KP-Arb.command to try again."
     arg="--change"
   done
